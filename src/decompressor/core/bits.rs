@@ -1,12 +1,22 @@
-//! Backward bit reader for Huffman and FSE bitstreams.
+//! Backward bit readers for Huffman and FSE bitstreams, and the forward
+//! reader for table descriptions.
 //!
 //! Zstandard writes these streams forward and ends them with a single `1` bit
 //! followed by zero padding up to the byte boundary, so the decoder starts at
 //! the last byte, skips the padding and the marker bit, and reads towards the
-//! first byte. Reading past the start yields zero bits and is remembered:
-//! [`ReverseBitReader::overflowed`] reports it and
-//! [`ReverseBitReader::is_exhausted`] only holds when every bit was consumed
-//! exactly, which is how the reference decoder validates stream ends.
+//! first byte. A stream is valid only when every bit is consumed exactly.
+//!
+//! [`BitContainer`] is the hot-path reader, a port of the reference's
+//! `BIT_DStream_t`: a 64-bit container that callers refill with
+//! [`BitContainer::reload`] at the points the reference does, so the bits
+//! they read are the reference's. Reading past the first byte is not checked
+//! per read; it leaves the consumed count above 64, which
+//! [`BitContainer::is_exhausted`] then rejects, exactly as the reference's
+//! `BIT_endOfDStream` does.
+//!
+//! [`ReverseBitReader`] reloads on every read and reads zeros past the start;
+//! the Huffman weight decoder relies on its [`ReverseBitReader::overflowed`]
+//! test, which mirrors the reference's FSE overflow handling.
 
 use crate::shared::format::highbit32;
 
@@ -91,8 +101,237 @@ impl<'a> ReverseBitReader<'a> {
     }
 
     /// Whether every bit was consumed, and no more.
+    #[cfg(test)]
     pub(crate) const fn is_exhausted(&self) -> bool {
         self.position == 0
+    }
+}
+
+/// Width of the bit container in bits.
+const CONTAINER_BITS: u32 = 64;
+
+/// Loads the eight bytes at `src[pos..]` as a little-endian word; zero when
+/// they are not all there, which callers never ask for.
+///
+/// Streams are block parts, far below 2^32 bytes, so masking `pos` to 32
+/// bits changes nothing but lets the compiler see that `pos + 8` cannot
+/// overflow, leaving one compare in front of the load.
+#[inline(always)]
+fn read64(src: &[u8], pos: usize) -> u64 {
+    let pos = pos & u32::MAX as usize;
+    match src.get(pos..pos + 8) {
+        Some(word) => u64::from_le_bytes(word.try_into().unwrap_or([0; 8])),
+        None => 0,
+    }
+}
+
+/// A backward reader with a 64-bit container, refilled on request.
+///
+/// The container holds the stream bytes `[pos, pos + 8)`; its low `avail`
+/// bits are unread. Counting the unread bits rather than the read ones
+/// makes a read a subtraction, a shift and a mask, with no negation. Reads
+/// past the start of the stream make `avail` wrap below zero, where it
+/// stays: [`BitContainer::is_exhausted`] then fails. Streams shorter than eight bytes are
+/// loaded once, with their missing high bytes counted as consumed. The
+/// stream slice is passed to each reload rather than held, so the reader is
+/// a small `Copy` value the hot loops keep in registers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BitContainer {
+    container: u64,
+    avail: u32,
+    pos: usize,
+}
+
+impl BitContainer {
+    /// Opens `src`, or returns `None` when it is empty or its last byte holds
+    /// no end marker.
+    #[inline]
+    pub(crate) fn new(src: &[u8]) -> Option<Self> {
+        let &last = src.last()?;
+        if last == 0 {
+            return None;
+        }
+        let marker = 8 - highbit32(u32::from(last));
+        if src.len() >= 8 {
+            let pos = src.len() - 8;
+            return Some(Self {
+                container: read64(src, pos),
+                avail: CONTAINER_BITS - marker,
+                pos,
+            });
+        }
+        let container = src
+            .iter()
+            .rev()
+            .fold(0u64, |word, &byte| (word << 8) | u64::from(byte));
+        Some(Self {
+            container,
+            avail: CONTAINER_BITS - marker - (8 - src.len() as u32) * 8,
+            pos: 0,
+        })
+    }
+
+    /// The next `count` bits without consuming them; `count <= 56`, and may
+    /// be zero.
+    #[inline(always)]
+    pub(crate) const fn look(&self, count: u32) -> u64 {
+        // The reference's `BIT_getMiddleBits`: a shift and, with BMI2, a
+        // `bzhi`. A zero count masks everything away whatever the shift.
+        let start = self.avail.wrapping_sub(count);
+        (self.container >> (start & 63)) & ((1u64 << count) - 1)
+    }
+
+    /// [`Self::look`] for `1 <= count <= 56`, one shift shorter.
+    #[inline(always)]
+    pub(crate) const fn look_nonzero(&self, count: u32) -> u64 {
+        let consumed = CONTAINER_BITS.wrapping_sub(self.avail);
+        (self.container << (consumed & 63)) >> ((CONTAINER_BITS - count) & 63)
+    }
+
+    /// Consumes `count` bits.
+    #[inline(always)]
+    pub(crate) const fn skip(&mut self, count: u32) {
+        self.avail = self.avail.wrapping_sub(count);
+    }
+
+    /// Reads and consumes `count` bits; `count <= 56`, and may be zero.
+    #[inline(always)]
+    pub(crate) const fn read(&mut self, count: u32) -> u64 {
+        let value = self.look(count);
+        self.skip(count);
+        value
+    }
+
+    /// Whether the fast refill applies: the container can move a whole
+    /// word towards the start.
+    #[inline(always)]
+    pub(crate) const fn can_reload_fast(&self) -> bool {
+        self.pos >= 8
+    }
+
+    /// Refills the container when [`Self::can_reload_fast`] holds; the
+    /// reference's `BIT_reloadDStreamFast`.
+    #[inline(always)]
+    pub(crate) fn reload_fast(&mut self, src: &[u8]) {
+        debug_assert!(self.can_reload_fast() && self.avail <= CONTAINER_BITS);
+        let bytes = (CONTAINER_BITS - self.avail) >> 3;
+        self.pos -= bytes as usize;
+        self.avail += bytes * 8;
+        self.container = read64(src, self.pos);
+    }
+
+    /// Refills the container as far as the stream allows; the reference's
+    /// `BIT_reloadDStream`. Returns whether at least 57 bits are now
+    /// available (`BIT_DStream_unfinished`).
+    #[inline(always)]
+    pub(crate) fn reload(&mut self, src: &[u8]) -> bool {
+        // While a whole word can be refilled, every refill so far was a
+        // full one, and callers read at most 57 bits between refills, so
+        // nothing can have been read past the start yet.
+        if self.can_reload_fast() {
+            self.reload_fast(src);
+            return true;
+        }
+        if self.avail > CONTAINER_BITS {
+            // Read past the start: corrupt, and caught by `is_exhausted`.
+            return false;
+        }
+        let (next, full) = self.reload_tail(src);
+        *self = next;
+        full
+    }
+
+    /// The cautious end of [`Self::reload`], near the start of the stream.
+    ///
+    /// Out of line and by value: a reference would make the hot loops keep
+    /// the container in memory rather than in registers.
+    #[cold]
+    #[inline(never)]
+    fn reload_tail(mut self, src: &[u8]) -> (Self, bool) {
+        if self.pos == 0 {
+            return (self, false);
+        }
+        let wanted = ((CONTAINER_BITS - self.avail) >> 3) as usize;
+        let step = wanted.min(self.pos);
+        self.pos -= step;
+        self.avail += (step as u32) * 8;
+        self.container = read64(src, self.pos);
+        (self, step == wanted)
+    }
+
+    /// Whether every bit was consumed, and no more.
+    #[inline]
+    pub(crate) const fn is_exhausted(&self) -> bool {
+        self.pos == 0 && self.avail == 0
+    }
+}
+
+/// A backward reader for the Huffman fast loops, the reference's
+/// `HUF_DecompressFastArgs` streams: the container keeps unread bits at its
+/// top and a sentinel `1` below them, shifted up with every read, so the
+/// consumed count is implicit — the sentinel's position — and a lookup is a
+/// single shift.
+///
+/// `pos` indexes the buffer that holds all four streams. Each refill moves
+/// back by whole consumed bytes; callers bound the rounds so that `pos`
+/// stays at least seven bytes into its stream, and read at most 57 bits
+/// between refills, which keeps the sentinel in the container.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sentinel {
+    bits: u64,
+    pos: usize,
+}
+
+impl Sentinel {
+    /// Converts a container refilled with [`BitContainer::reload_fast`],
+    /// at most seven bits consumed, over the stream that starts at `start`
+    /// in `src`.
+    #[inline(always)]
+    pub(crate) fn from_container(bits: BitContainer, src: &[u8], start: usize) -> Self {
+        let consumed = CONTAINER_BITS - bits.avail;
+        debug_assert!(consumed <= 7);
+        let pos = start + bits.pos;
+        Self {
+            bits: (read64(src, pos) | 1) << (consumed & 7),
+            pos,
+        }
+    }
+
+    /// The container again, for the stream that starts at `start` in
+    /// `src`.
+    #[inline(always)]
+    pub(crate) fn into_container(self, src: &[u8], start: usize) -> BitContainer {
+        BitContainer {
+            container: read64(src, self.pos),
+            avail: CONTAINER_BITS - self.bits.trailing_zeros(),
+            pos: self.pos - start,
+        }
+    }
+
+    /// Bytes of the stream left below the container's start.
+    #[inline(always)]
+    pub(crate) const fn remaining(&self, start: usize) -> usize {
+        self.pos - start
+    }
+
+    /// Moves back by the consumed whole bytes and refills.
+    #[inline(always)]
+    pub(crate) fn reload(&mut self, src: &[u8]) {
+        let consumed = self.bits.trailing_zeros();
+        self.pos -= (consumed >> 3) as usize;
+        self.bits = (read64(src, self.pos) | 1) << (consumed & 7);
+    }
+
+    /// The next `64 - shift` bits.
+    #[inline(always)]
+    pub(crate) const fn peek(&self, shift: u32) -> usize {
+        (self.bits >> shift) as usize
+    }
+
+    /// Consumes `count` bits.
+    #[inline(always)]
+    pub(crate) const fn skip(&mut self, count: u32) {
+        self.bits <<= count & 63;
     }
 }
 

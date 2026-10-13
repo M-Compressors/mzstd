@@ -34,3 +34,4 @@ fuzz/afl/findings/
 fuzz/afl/target/
 # Seeds are materialised from the vendored zstd test data.
 fuzz/afl/seeds/
+.claude/worktrees/

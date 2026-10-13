@@ -6,10 +6,10 @@
 //! against `Frame_Content_Size` and hashing the output for the optional
 //! content checksum.
 
-use alloc::vec::Vec;
-
+use super::BlockError;
 use super::block::{BlockDecoder, BlockHeader};
 use super::sequences::BlockContext;
+use crate::Backend;
 use crate::decompressor::{DecodeError, DecodeLimits, InvalidDataKind};
 use crate::shared::format::{
     BLOCK_SIZE_MAX, CHECKSUM_SIZE, FRAME_HEADER_SIZE_MAX, WINDOW_LOG_ABSOLUTE_MIN,
@@ -186,27 +186,39 @@ impl FrameDecoder {
         self.header.is_some_and(|header| header.checksum)
     }
 
-    /// Regenerates one block onto `out`, whose bytes from `history_start`
-    /// are this frame's retained history.
+    /// Regenerates one block into `out[op..]` on `backend`, returning the
+    /// end of its output; `out[history_start..op]` is this frame's retained
+    /// history.
+    ///
+    /// Callers that grow their buffer give it room for
+    /// [`Self::block_max`] bytes plus
+    /// [`WILDCOPY_OVERLENGTH`](super::copy::WILDCOPY_OVERLENGTH); a block that
+    /// does not fit a caller-sized buffer fails with
+    /// [`DecodeError::OutputTooSmall`].
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
     pub(crate) fn decode_block(
         &mut self,
+        backend: Backend,
         block: &BlockHeader,
         content: &[u8],
-        out: &mut Vec<u8>,
+        out: &mut [u8],
+        op: usize,
         history_start: usize,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<usize, DecodeError> {
         let header = self.header.ok_or(DecodeError::InvalidState)?;
-        out.try_reserve(self.block_max)
-            .map_err(|_| DecodeError::AllocationFailed)?;
-        let start = out.len();
         let context = BlockContext {
             history_start,
             window: header.window_size,
             block_max: self.block_max,
         };
-        self.blocks.decode(block, content, out, context)?;
-        let produced = &out[start..];
+        let end = self
+            .blocks
+            .decode(backend, block, content, out, op, context)
+            .map_err(|error| match error {
+                BlockError::Invalid(kind) => DecodeError::from(kind),
+                BlockError::OutputFull => DecodeError::OutputTooSmall { written: op },
+            })?;
+        let produced = &out[op..end];
         if header.checksum {
             self.hasher.update(produced);
         }
@@ -219,7 +231,7 @@ impl FrameDecoder {
                 decoded: self.produced,
             });
         }
-        Ok(())
+        Ok(end)
     }
 
     /// Checks the stored content checksum against the frame's output.
@@ -238,6 +250,7 @@ impl FrameDecoder {
 mod tests {
     use super::*;
     use crate::decompressor::core::block::BlockKind;
+    use alloc::vec::Vec;
 
     #[test]
     fn header_sizes_follow_the_descriptor() {
@@ -311,6 +324,21 @@ mod tests {
         assert_eq!(frame.header(), Some(&empty));
     }
 
+    /// Decodes a block after `out` and appends its output.
+    fn decode(
+        frame: &mut FrameDecoder,
+        block: &BlockHeader,
+        content: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DecodeError> {
+        let start = out.len();
+        let mut buffer = out.clone();
+        buffer.resize(start + (1 << 17) + 32, 0);
+        let end = frame.decode_block(Backend::default(), block, content, &mut buffer, start, 0)?;
+        out.extend_from_slice(&buffer[start..end]);
+        Ok(())
+    }
+
     #[test]
     fn blocks_are_checked_against_the_declared_size_and_checksum() {
         let limits = DecodeLimits::default();
@@ -322,17 +350,15 @@ mod tests {
             size,
         };
         assert!(matches!(
-            frame.decode_block(&raw(true, 1), b"a", &mut out, 0),
+            decode(&mut frame, &raw(true, 1), b"a", &mut out),
             Err(DecodeError::InvalidState)
         ));
         frame
             .begin(FrameHeader::parse(&[0x24, 3]).expect("valid"), &limits)
             .expect("valid");
-        frame
-            .decode_block(&raw(false, 2), b"ab", &mut out, 0)
-            .expect("fits");
+        decode(&mut frame, &raw(false, 2), b"ab", &mut out).expect("fits");
         assert!(matches!(
-            frame.decode_block(&raw(true, 0), b"", &mut out, 0),
+            decode(&mut frame, &raw(true, 0), b"", &mut out),
             Err(DecodeError::ContentSizeMismatch {
                 declared: 3,
                 decoded: 2
@@ -342,9 +368,7 @@ mod tests {
             .begin(FrameHeader::parse(&[0x24, 3]).expect("valid"), &limits)
             .expect("valid");
         out.clear();
-        frame
-            .decode_block(&raw(true, 3), b"abc", &mut out, 0)
-            .expect("fits");
+        decode(&mut frame, &raw(true, 3), b"abc", &mut out).expect("fits");
         // XXH64("abc") = 0x44BC2CF5AD770999.
         frame
             .verify_checksum(0xAD77_0999u32.to_le_bytes())
@@ -361,11 +385,11 @@ mod tests {
             .begin(FrameHeader::parse(&[0x20, 1]).expect("valid"), &limits)
             .expect("valid");
         assert!(matches!(
-            frame.decode_block(&raw(false, 1), b"a", &mut out, 0),
+            decode(&mut frame, &raw(false, 1), b"a", &mut out),
             Ok(())
         ));
         assert!(matches!(
-            frame.decode_block(&raw(false, 1), b"b", &mut out, 0),
+            decode(&mut frame, &raw(false, 1), b"b", &mut out),
             Err(DecodeError::ContentSizeMismatch {
                 declared: 1,
                 decoded: 2

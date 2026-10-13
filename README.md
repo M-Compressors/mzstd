@@ -25,7 +25,7 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
 
 ```toml
 [dependencies]
-mzstd = "0.1"
+mzstd = "0.2"
 ```
 
 ## Usage

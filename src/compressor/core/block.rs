@@ -17,6 +17,7 @@ use super::opt;
 use super::params::{ParamSwitch, Strategy};
 use super::seq_store::SeqStore;
 use super::window::Segments;
+use crate::Backend;
 use crate::shared::format::{BLOCK_HEADER_SIZE, LONG_NB_SEQ};
 
 /// Blocks shorter than this are stored without an attempt
@@ -92,6 +93,7 @@ pub(crate) fn build_seq_store(
     }
     engine.seq_store.reset();
     let ms = &mut engine.ms;
+    ms.backend = engine.backend;
     ms.opt.literal_compression = engine.applied.literal_compression;
 
     // Limited update after a very long match.
@@ -111,6 +113,7 @@ pub(crate) fn build_seq_store(
         window: *view,
         start,
         end,
+        backend: engine.backend,
     };
     let last_ll_size = if engine.applied.ldm.enable == ParamSwitch::Enable {
         let store = &mut engine.ldm_store;
@@ -120,9 +123,14 @@ pub(crate) fn build_seq_store(
         let block_addr = ms.window.base.add(i64::from(start));
         let ldm_start = engine.ldm.window.index_of(block_addr);
         let ldm_end = ldm_start + (end - start);
-        engine
-            .ldm
-            .generate_sequences(segments, store, &engine.applied.ldm, ldm_start, ldm_end);
+        engine.ldm.generate_sequences(
+            segments,
+            store,
+            &engine.applied.ldm,
+            ldm_start,
+            ldm_end,
+            engine.backend,
+        );
         ldm::block_compress(
             store,
             ms,
@@ -151,6 +159,7 @@ fn entropy_compress_internal(
     next: &mut Tables,
     engine_params: &super::cctx::AppliedParams,
     dst: &mut [u8],
+    backend: Backend,
 ) -> Result<usize, CoreError> {
     let strategy = engine_params.cparams.strategy;
     let nb_seq = store.nb_seq();
@@ -165,6 +174,7 @@ fn entropy_compress_internal(
             strategy,
             disable_compression: engine_params.literals_compression_disabled(),
             suspect_uncompressible: suspect,
+            backend,
         },
     )?;
 
@@ -194,7 +204,7 @@ fn entropy_compress_internal(
     dst[seq_head] =
         ((stats.ll_type as u8) << 6) + ((stats.of_type as u8) << 4) + ((stats.ml_type as u8) << 2);
     op += stats.size;
-    let bitstream_size = sequences::encode(&mut dst[op..], &next.fse, store)?;
+    let bitstream_size = sequences::encode(&mut dst[op..], &next.fse, store, backend)?;
     op += bitstream_size;
     if stats.last_count_size != 0 && stats.last_count_size + bitstream_size < 4 {
         return Ok(0);
@@ -213,9 +223,10 @@ pub(crate) fn entropy_compress(
     params: &super::cctx::AppliedParams,
     dst: &mut [u8],
     block_size: usize,
+    backend: Backend,
 ) -> Result<usize, CoreError> {
     let capacity = dst.len();
-    let c_size = match entropy_compress_internal(store, prev, next, params, dst) {
+    let c_size = match entropy_compress_internal(store, prev, next, params, dst, backend) {
         Ok(0) => return Ok(0),
         Err(CoreError::DstSizeTooSmall) if block_size <= capacity => return Ok(0),
         other => other?,
@@ -258,6 +269,7 @@ pub(crate) fn compress_block_internal(
                 &params,
                 dst,
                 src.len(),
+                engine.backend,
             )?;
             if frame && !engine.is_first_block && c_size < RLE_MAX_LENGTH && is_rle(src) {
                 c_size = 1;

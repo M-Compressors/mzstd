@@ -1,0 +1,250 @@
+# Decoder fast paths
+
+How `decompressor::core` regenerates blocks at speed: SIMD dispatch, the
+bit readers, the Huffman and sequence loops, the copies, and the output
+paths. Every fast path decodes exactly the bits the reference decoder
+(zstd 1.5.7) reads, in the same order, so it accepts and rejects the same
+streams as the straightforward port it replaced; only refill timing and
+copy granularity differ. The crate stays `forbid(unsafe_code)`: bounds are
+checked, and the code is shaped so the compiler can drop most of the
+checks (see [index masks](#index-masks)).
+
+## Dispatch
+
+```mermaid
+sequenceDiagram
+    participant D as Decompressor (Backend)
+    participant S as Stream
+    participant F as FrameDecoder
+    participant B as BlockDecoder::decode
+    participant H as HuffmanTable::decode_streams
+    participant Q as SequenceTables::execute
+    D->>S: Stream::new(config, backend)
+    S->>F: decode_block(backend, ...)
+    F->>B: decode(backend, ...)
+    alt raw / RLE block
+        B->>B: copy_from_slice / fill
+    else compressed block
+        B->>B: MatchCopy from backend.has_fast_shuffle()
+        B->>B: fearless_simd::dispatch!(backend.0, simd => ...)
+        B->>H: #[simd] kernel: literals
+        B->>Q: #[simd] kernel: sequences
+    end
+```
+
+`Backend` (public, `src/backend.rs`) wraps a `fearless_simd::Level`
+detected once when the decoder is built (`DecompressorBuilder::with_backend`
+overrides it). `BlockDecoder::decode` dispatches once per compressed
+block. The two hot loops are separate `#[fearless_simd_macros::simd]`
+functions: each is compiled per level with that level's target features
+(on AVX2 that includes BMI2, so bit reads use `shrx`/`bzhi`), and keeping
+them apart keeps each loop's register allocation independent.
+`MatchCopy::Shuffle` is chosen on levels with a native byte shuffle
+(SSSE3 and up, NEON, WASM SIMD); `sse2` and `fallback` use
+`MatchCopy::Scalar`.
+
+## Bit readers
+
+```mermaid
+classDiagram
+    class BitContainer {
+        container: u64
+        consumed: u32
+        pos: usize
+        +new(src) Option
+        +look(n) / look_nonzero(n) / read(n) / skip(n)
+        +reload_fast(src)
+        +reload(src) bool
+        +is_exhausted() bool
+    }
+    class Sentinel {
+        bits: u64
+        pos: usize
+        +from_container(BitContainer, src, start)
+        +into_container(src, start) BitContainer
+        +reload(src)
+        +peek(shift) / skip(n)
+    }
+    class ReverseBitReader {
+        reads zeros past the start
+        +overflowed() bool
+    }
+    BitContainer <--> Sentinel : Huffman fast loops
+```
+
+- **`BitContainer`** is `BIT_DStream_t`: the eight stream bytes at `pos`,
+  `consumed` bits read from the top. `look` is `BIT_getMiddleBits`.
+  `reload` is `BIT_reloadDStream`: a full refill while `pos >= 8`, the
+  cautious refill near the start (`#[cold]`, by value so the container
+  stays in registers), and no change once more than 64 bits were consumed.
+  While `pos >= 8` every refill so far was full and callers read at most
+  57 bits between refills, so the overflow test only runs on the cautious
+  path. A stream is valid only when `pos == 0 && consumed == 64`; once
+  reads pass the start, `consumed` stays above 64, so corrupt streams are
+  rejected exactly as by `BIT_endOfDStream`.
+- **`Sentinel`** is the reference's fast-loop stream
+  (`HUF_DecompressFastArgs`): unread bits at the top, a `1` below them
+  shifted up with every read, so the consumed count is the sentinel's
+  position (`trailing_zeros`) and a 12-bit lookup is one shift. Positions
+  index the buffer holding all four streams.
+- **`ReverseBitReader`** keeps the old per-read semantics for Huffman
+  weight streams, whose overflow test mirrors the reference's FSE decoder.
+
+## Huffman literals
+
+```mermaid
+flowchart TD
+    Read[HuffmanTable::read: weights, rows at 12 bits] --> Kind{four streams?}
+    Kind -->|no| Tail1[decode_tail: HUF_decodeStreamX1]
+    Kind -->|yes| Open[open four BitContainers]
+    Open --> Fast{every pos >= 8?}
+    Fast -->|no| Tails
+    Fast -->|yes| Sel{prefers_pairs: HUF_selectDecoder}
+    Sel -->|X1| Single[single_rounds: 5 symbols per stream per round, 4 if 12-bit tree]
+    Sel -->|X2| Pairs[build_pairs if stale; pair_rounds: 4 lookups per stream per round]
+    Single --> Back[Sentinels back to containers]
+    Pairs --> Back
+    Back --> Tails[decode_tail per stream: exact end check]
+```
+
+- Rows are built for 12-bit lookups whatever the tree depth (each code's
+  rows repeated `1 << (12 - log)` times), so lookups need no mask.
+- The fast loops count the rounds every stream can afford up front (each
+  refill moves back at most seven bytes and must stay seven bytes into its
+  stream; outputs need room for the round's stores), run them without
+  per-stream tests, then recount.
+- Pair rows (`HUF_DEltX2`) are derived from the single-symbol rows: a row
+  pairs the code at the top of its index with the next one when both fit
+  in 12 bits. A round gathers each stream's symbols in one word and stores
+  eight bytes; bytes past the symbols stay inside the stream's own segment.
+  They are rebuilt only after a new tree.
+- Every stream finishes with the single-symbol table in the reference's
+  cautious loop and must be consumed exactly; the pair decoder never
+  decides how a stream ends.
+
+## Sequences
+
+```mermaid
+flowchart TD
+    Header[read_header: TableSlot::update per symbol type] --> Init[initial states, reload]
+    Init --> Next{sequences left?}
+    Next -->|yes| Dec[SequenceDecoder::decode: ZSTD_decodeSequence]
+    Dec -->|zero repeat offset| EOff[Offset]
+    Dec --> Exe[Executor::execute: ZSTD_execSequence]
+    Exe -->|literals overrun| ELit[LiteralsOverrun]
+    Exe -->|match_end + 32 <= out.len| Wild[offset check; wildcopy literals; wildcopy match]
+    Exe -->|else| Exact[execute_exactly, cold: BlockSize / Offset / OutputFull; exact copies]
+    Wild --> Next
+    Exact --> Next
+    Next -->|no| End{bitstream exhausted?}
+    End -->|no| ESeq[SequenceStream]
+    End -->|yes| Last[copy remaining literals; save repeat offsets]
+```
+
+- `SeqTable` rows are `ZSTD_seqSymbol`: baseline, next-state base,
+  extra-bit and state-bit counts. The loop holds references to rows and
+  reads fields as needed. Slots are allocated on first use and rebuilt in
+  place; the predefined tables are kept while no other table replaces
+  them.
+- Decoding refills once per sequence and once more when the sequence's
+  extra bits exceed `64 - 7 - (9 + 9 + 8)`, as the reference does.
+- Errors keep the old order: literal overrun, block size, offset (and
+  output room for caller-sized buffers).
+
+### Copies
+
+`copy.rs` holds the wildcopies (`ZSTD_wildcopy`, `ZSTD_overlapCopy8`):
+
+| Case | Copy |
+| --- | --- |
+| literals | one 16-byte chunk, then 32-byte chunks |
+| match, offset >= 32 | 32-byte chunks |
+| match, 16 <= offset < 32 | 16-byte chunks |
+| match, offset < 16, `Shuffle` | `PERIOD[offset]` spreads the period over a `u8x16`; `ROTATE[offset]` turns each chunk's vector into the next's |
+| match, offset < 16, `Scalar` | the reference's offset spreading (`dec32table`/`dec64table`), then 8-byte chunks |
+| end of buffer | `execute_exactly`: exact literal copy, `exact_match` doubling copies |
+
+Fast copies write up to `WILDCOPY_OVERLENGTH` (32) bytes past a sequence
+and read as far past its source; the executor uses them only when the
+output has that room, and literals always carry 32 readable bytes after
+their end (`Literals`): raw literals are borrowed in place when the block
+holds 32 more bytes after them, and copied otherwise.
+
+### Index masks
+
+Release-mode `usize` additions may wrap, so `out[i..i + 16]` normally
+costs an overflow test and a bounds test. The sequence executor cuts the
+output to start at `max(history_start, op - window)` — no valid match
+reaches further back — so every index is below `2^31 + 2^19`
+(compile-time asserted against `DecodeLimits::MAX_WINDOW_LOG`), and
+`copy::idx` masks operands to 32 bits. The masked sums provably do not
+wrap, which lets the compiler relate the executor's room tests to the
+copies' bounds checks and drop many of them. The masks never change a
+valid index.
+
+## Output paths
+
+```mermaid
+flowchart LR
+    ToSlice[decompress_to_slice] --> Direct{decode_to_slice: every frame declares a size that fits?}
+    Direct -->|yes| Slice[SliceOutput: frame cut at its declared end]
+    Direct -->|no, or any error| Session[incremental session over History]
+    Into[decompress / decompress_into] --> Vec[VecOutput: grow_zeroed per block]
+    Process[DecoderSession::process] --> History[History: prepare / commit]
+```
+
+- `Stream::walk` is the one-shot frame grammar over an `Output`:
+  `VecOutput` grows the caller's vector with initialized slack per block
+  (`grow_zeroed`: a fresh buffer is zero-allocated, an existing one grows
+  in place), then truncates to the output; `SliceOutput` cuts the caller's
+  slice at each frame's declared end, so chunked copies never touch bytes
+  past the output and the rest of `dst` stays unchanged.
+- `decompress_to_slice` tries the direct path and, when a frame has no
+  content size, does not fit, or anything fails, reruns the whole input
+  through the incremental session, which defines the method's results and
+  errors.
+- `History` keeps an initialized buffer with a fill mark; `prepare`
+  compacts as before and ensures room for a block plus the overlength,
+  `commit` records the block's end.
+- The literal buffer only grows, so blocks of varying sizes zero nothing
+  but its new tail.
+
+## Measurements
+
+`cargo bench --bench decompress -- --warm-up-time 1 --measurement-time 3`,
+pinned to one core of an i7-13700KF (AVX2 backend). Frames are written by
+zstd 1.5.7 from `zstd_ffi::corpus` inputs and decoded with reused contexts,
+`decompress_to_slice` against `ZSTD_decompressDCtx`. Times are Criterion
+medians; "before" is the scalar port this replaced.
+
+| Case | before | now | zstd 1.5.7 | ratio |
+| --- | --- | --- | --- | --- |
+| text 4 MiB, level 1 | 5.96 ms | 2.14 ms | 1.81 ms | 1.18 |
+| text 4 MiB, level 3 | 4.47 ms | 1.86 ms | 1.64 ms | 1.13 |
+| text 4 MiB, level 19 | 2.70 ms | 1.10 ms | 1.05 ms | 1.05 |
+| binary 4 MiB, level 1 | 18.89 ms | 2.13 ms | 2.28 ms | 0.93 |
+| binary 4 MiB, level 3 | 14.37 ms | 3.52 ms | 3.28 ms | 1.07 |
+| binary 4 MiB, level 19 | 15.98 ms | 4.73 ms | 4.34 ms | 1.09 |
+| random 1 MiB, levels 1-19 | 64.5 µs | 19.8-21.3 µs | 19.6-21.4 µs | 0.99-1.04 |
+| text+binary+text 12 MiB, LDM | 18.02 ms | 5.06 ms | 4.79 ms | 1.06 |
+| mixed 4 MiB, streaming | 7.26 ms | 2.48 ms | — | — |
+
+Both decoders run near five instructions per cycle on these inputs, so
+instruction counts (callgrind) track time closely; the remaining gap is in
+the sequence loop (about 140 instructions per sequence against the
+reference's 125, mostly bounds checks and bit-count masks) and the pair
+Huffman loop.
+
+XXH64 checksums are not vectorized: each of its four lanes is a serial
+multiply-rotate-multiply chain, and AVX2 has no 64-bit vector multiply. A
+`u64x4` kernel measured 11.8 GB/s against 20.9 GB/s for the scalar code,
+which already matches the reference's 21 GB/s.
+
+## Known gaps
+
+- Text at levels 1-3 decodes about 1.1x slower than the reference: the
+  sequence loop still executes more instructions per sequence.
+- `decompress_to_slice` takes the incremental path, with its extra copies,
+  for frames without a content size.
+- No prefetching variant for long offsets (`ZSTD_decompressSequencesLong`)
+  and no split literal buffer.

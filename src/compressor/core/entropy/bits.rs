@@ -46,7 +46,7 @@ impl<'a> BitWriter<'a> {
     }
 
     /// Appends the low `nb_bits` bits of `value`; `nb_bits` is below 32.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
         debug_assert!(nb_bits < 32);
         debug_assert!(nb_bits + self.bit_pos < 64);
@@ -56,7 +56,7 @@ impl<'a> BitWriter<'a> {
     }
 
     /// Appends `nb_bits` bits of a value with no bits above them.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn add_bits_fast(&mut self, value: u64, nb_bits: u32) {
         debug_assert!(value >> nb_bits == 0);
         debug_assert!(nb_bits + self.bit_pos < 64);
@@ -68,7 +68,7 @@ impl<'a> BitWriter<'a> {
     ///
     /// Past the end of the usable area the write position stops at its
     /// limit; the overflow surfaces in [`Self::close`].
-    #[inline]
+    #[inline(always)]
     pub(crate) fn flush(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
         debug_assert!(self.pos <= self.end);

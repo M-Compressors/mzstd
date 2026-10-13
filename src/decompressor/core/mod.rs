@@ -23,6 +23,7 @@
 
 mod bits;
 mod block;
+mod copy;
 mod frame;
 mod fse;
 mod history;
@@ -32,3 +33,21 @@ mod sequences;
 mod stream;
 
 pub(crate) use stream::Stream;
+
+use crate::decompressor::InvalidDataKind;
+
+/// Why a block could not be regenerated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockError {
+    /// The block is malformed.
+    Invalid(InvalidDataKind),
+    /// The output buffer ends before the block's output does; only a
+    /// caller-sized buffer can run out.
+    OutputFull,
+}
+
+impl From<InvalidDataKind> for BlockError {
+    fn from(kind: InvalidDataKind) -> Self {
+        Self::Invalid(kind)
+    }
+}

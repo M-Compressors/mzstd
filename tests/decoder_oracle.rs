@@ -9,7 +9,7 @@ use decoder_support::{
     Rng, compress, corpora, decode_fixed, decode_streaming, mixed, params, reference_decompress,
     skippable, text,
 };
-use mzstd::{DecodeError, DecodeLimits, DecoderConfig, Decompressor, FrameMode};
+use mzstd::{Backend, DecodeError, DecodeLimits, DecoderConfig, Decompressor, FrameMode};
 use zstd_ffi::oracle::{self, Directive, Params};
 
 /// Streams `input` through the reference in two steps, so the content size
@@ -69,6 +69,36 @@ fn reference_frames_decode_across_levels_sizes_and_flags() {
                     input,
                     "{label}: reference agrees"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_backend_decodes_reference_frames_alike() {
+    // Short-offset matches, literal-heavy and literal-light blocks, both
+    // Huffman decoders and raw blocks, on every SIMD level the host has.
+    for backend in Backend::available() {
+        let mut decoder = Decompressor::builder(DecoderConfig::default())
+            .with_backend(backend)
+            .build();
+        assert_eq!(decoder.backend(), backend);
+        for size in [17usize, 4_000, 140_000] {
+            for (name, input) in corpora(size, size as u64 + 7) {
+                for level in [-5, 1, 3, 9, 19] {
+                    if level == 19 && size > 4_000 && name != "text" {
+                        continue; // Slow at -O0; other levels cover these blocks.
+                    }
+                    let content_size = level != 3;
+                    let frame = compress(&input, &params(level, level == 9, content_size));
+                    let label = format!("{backend} {name} {size} level {level}");
+                    assert_one_shot(&mut decoder, &frame, &input, &label);
+                    assert_eq!(
+                        decode_streaming(&mut decoder, &frame, || 4096, 1000).expect(&label),
+                        input,
+                        "{label}: streaming"
+                    );
+                }
             }
         }
     }

@@ -417,14 +417,15 @@ impl CTable {
     /// Builds the table for a normalized distribution (`FSE_buildCTable_wksp`).
     pub(crate) fn build(&mut self, norm: &[i16], max_symbol_value: u32, table_log: u32) {
         let table_size: u32 = 1 << table_log;
-        let table_mask = table_size - 1;
         let step = table_step(table_size);
         let symbols = max_symbol_value as usize + 1;
         let mut cumul = [0u32; MAX_SYMBOLS + 1];
-        let mut table_symbol = [0u8; 1 << MAX_TABLE_LOG];
+        // Sized for the largest table this type holds rather than for
+        // MAX_TABLE_LOG: the array is zeroed on every build.
+        let mut table_symbol = [0u8; 1 << STATE_TABLE_LOG];
         let mut high_threshold = table_size - 1;
 
-        debug_assert!(table_log <= STATE_TABLE_LOG);
+        assert!(table_log <= STATE_TABLE_LOG);
         self.table_log = table_log;
         self.max_symbol_value = max_symbol_value;
 
@@ -441,17 +442,22 @@ impl CTable {
         cumul[symbols] = table_size + 1;
 
         // Spread symbols.
-        let mut position: u32 = 0;
-        for (symbol, &freq) in norm.iter().enumerate().take(symbols) {
-            for _ in 0..i32::from(freq).max(0) {
-                table_symbol[position as usize] = symbol as u8;
-                position = (position + step) & table_mask;
-                while position > high_threshold {
-                    position = (position + step) & table_mask;
-                }
-            }
+        if high_threshold == table_size - 1 {
+            spread_without_low_probability(
+                &mut table_symbol,
+                &norm[..symbols],
+                table_size as usize,
+                step as usize,
+            );
+        } else {
+            spread(
+                &mut table_symbol,
+                &norm[..symbols],
+                table_size,
+                step,
+                high_threshold,
+            );
         }
-        debug_assert_eq!(position, 0);
 
         // Build the state table.
         for u in 0..table_size {
@@ -508,6 +514,71 @@ impl CTable {
     }
 }
 
+/// Symbol spreading around the positions reserved for low-probability
+/// symbols above `high_threshold` (the general path of
+/// `FSE_buildCTable_wksp`).
+fn spread(
+    table_symbol: &mut [u8; 1 << STATE_TABLE_LOG],
+    norm: &[i16],
+    table_size: u32,
+    step: u32,
+    high_threshold: u32,
+) {
+    let table_mask = table_size - 1;
+    let mut position: u32 = 0;
+    for (symbol, &freq) in norm.iter().enumerate() {
+        for _ in 0..i32::from(freq).max(0) {
+            table_symbol[position as usize] = symbol as u8;
+            position = (position + step) & table_mask;
+            while position > high_threshold {
+                position = (position + step) & table_mask;
+            }
+        }
+    }
+    debug_assert_eq!(position, 0);
+}
+
+/// Symbol spreading for a distribution without low-probability (`-1`)
+/// symbols, the branch-light path of `FSE_buildCTable_wksp`.
+///
+/// The symbols are first laid out in order, `norm[s]` copies of each,
+/// eight bytes at a time; the `k`-th of them then lands at `k * step`
+/// modulo the table size, which is where the general spreading loop puts
+/// the `k`-th occurrence when no position is reserved for `-1` symbols.
+fn spread_without_low_probability(
+    table_symbol: &mut [u8; 1 << STATE_TABLE_LOG],
+    norm: &[i16],
+    table_size: usize,
+    step: usize,
+) {
+    const SLOTS: usize = 1 << STATE_TABLE_LOG;
+    let mut spread = [0u8; SLOTS + 8];
+    let mut pos = 0usize;
+    let mut value = 0u64;
+    for &n in norm {
+        let n = n.max(0) as usize;
+        let mut i = 0;
+        loop {
+            spread[pos + i..pos + i + 8].copy_from_slice(&value.to_le_bytes());
+            i += 8;
+            if i >= n {
+                break;
+            }
+        }
+        pos += n;
+        value = value.wrapping_add(0x0101_0101_0101_0101);
+    }
+    debug_assert_eq!(pos, table_size);
+    let mask = table_size - 1;
+    let mut position = 0usize;
+    for pair in spread[..table_size].as_chunks::<2>().0 {
+        table_symbol[position & mask & (SLOTS - 1)] = pair[0];
+        table_symbol[(position + step) & mask & (SLOTS - 1)] = pair[1];
+        position = (position + 2 * step) & mask;
+    }
+    debug_assert_eq!(position, 0);
+}
+
 /// An encoder state over one table (`FSE_CState_t`).
 #[derive(Debug)]
 pub(crate) struct CState<'t> {
@@ -530,13 +601,18 @@ impl<'t> CState<'t> {
     }
 
     /// `FSE_encodeSymbol`.
-    #[inline]
+    ///
+    /// Both table indices are masked to their table sizes: a symbol the
+    /// table was built for and the state it leads to are always in range,
+    /// so the masks change nothing and leave no bounds checks behind.
+    #[inline(always)]
     pub(crate) fn encode(&mut self, writer: &mut BitWriter<'_>, symbol: u32) {
-        let tt = self.table.symbol_tt[symbol as usize];
+        let tt = self.table.symbol_tt[symbol as usize & (MAX_SYMBOLS - 1)];
         let nb_bits_out = ((self.value + i64::from(tt.delta_nb_bits)) >> 16) as u32;
         writer.add_bits(self.value as u64, nb_bits_out);
         let index = (self.value >> nb_bits_out) + i64::from(tt.delta_find_state);
-        self.value = i64::from(self.table.state_table[index as usize]);
+        self.value =
+            i64::from(self.table.state_table[index as usize & ((1 << STATE_TABLE_LOG) - 1)]);
     }
 
     /// `FSE_flushCState`.
@@ -637,6 +713,31 @@ pub(crate) fn compress_small(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fast_spread_matches_the_general_one() {
+        for count in histograms() {
+            let max = count.len() as u32 - 1;
+            let total: usize = count.iter().map(|&c| c as usize).sum();
+            for table_log in [5, 6, 9] {
+                let mut norm = [0i16; MAX_SYMBOLS];
+                if normalize_count(&mut norm, table_log, &count, total, max, false).is_err() {
+                    continue;
+                }
+                let norm = &norm[..count.len()];
+                if norm.contains(&-1) {
+                    continue;
+                }
+                let table_size = 1u32 << table_log;
+                let step = table_step(table_size);
+                let mut general = [0u8; 1 << STATE_TABLE_LOG];
+                spread(&mut general, norm, table_size, step, table_size - 1);
+                let mut fast = [0u8; 1 << STATE_TABLE_LOG];
+                spread_without_low_probability(&mut fast, norm, table_size as usize, step as usize);
+                assert_eq!(fast, general, "{count:?} log {table_log}");
+            }
+        }
+    }
 
     /// Deterministic pseudo-random histograms of every shape the encoder
     /// meets: skewed, flat, sparse and with low-probability symbols.

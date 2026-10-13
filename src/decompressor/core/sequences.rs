@@ -4,19 +4,33 @@
 //! [`SequenceTables::read_header`] parses the sequence count and the three
 //! table descriptions, updating the tables that `Repeat_Mode` reuses.
 //! [`SequenceTables::execute`] then decodes the interleaved bitstream and
-//! executes every sequence as soon as it is decoded: literals are appended
-//! to the output, followed by a match copied from the frame's history.
+//! executes every sequence as soon as it is decoded: literals are copied to
+//! the output, followed by a match copied from the frame's history.
+//!
+//! The loop is the reference's `ZSTD_decompressSequences_body`: each table
+//! row carries its baseline and extra-bit count ([`SeqRow`]), the container
+//! is refilled once per sequence and once more in the middle when the
+//! sequence's extra bits could exhaust it, and sequences with room to spare
+//! in both buffers are executed with wildcopies.
 
-use alloc::vec::Vec;
+use alloc::boxed::Box;
 
-use super::bits::ReverseBitReader;
-use super::fse::{FseTable, read_distribution};
-use super::literals::encoding_type;
-use crate::decompressor::InvalidDataKind;
+use fearless_simd::Simd;
+
+use super::BlockError;
+use super::bits::BitContainer;
+use super::block::Target;
+use super::copy::{
+    INDEX_LIMIT, MatchCopy, WILDCOPY_OVERLENGTH, exact_match, idx, wildcopy_literals,
+    wildcopy_match,
+};
+use super::fse::{SEQ_TABLE_LOG_MAX, SEQ_TABLE_SIZE, SeqRow, SeqTable, read_distribution, seq_row};
+use super::literals::{Literals, encoding_type};
+use crate::decompressor::{DecodeLimits, InvalidDataKind};
 use crate::shared::format::{
-    EncodingType, LL_BITS, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, LONG_NB_SEQ, MAX_LL,
-    MAX_ML, MAX_OFF, MAX_SEQ, MIN_MATCH, ML_BITS, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG, ML_FSE_LOG,
-    OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG, OFF_FSE_LOG, REP_NUM,
+    BLOCK_SIZE_MAX, EncodingType, LL_BITS, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG,
+    LONG_NB_SEQ, MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, MIN_MATCH, ML_BITS, ML_DEFAULT_NORM,
+    ML_DEFAULT_NORM_LOG, ML_FSE_LOG, OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG, OFF_FSE_LOG, REP_NUM,
 };
 
 /// Baselines of a length code alphabet: each code starts where the range of
@@ -37,9 +51,57 @@ const fn baselines<const N: usize>(bits: &[u8; N], first: u32) -> [u32; N] {
 const LL_BASE: [u32; MAX_LL as usize + 1] = baselines(&LL_BITS, 0);
 /// Match length baselines per code.
 const ML_BASE: [u32; MAX_ML as usize + 1] = baselines(&ML_BITS, MIN_MATCH as u32);
+/// Offset code `n` reads `n` extra bits.
+const OF_BITS: [u8; MAX_OFF as usize + 1] = {
+    let mut bits = [0u8; MAX_OFF as usize + 1];
+    let mut code = 0;
+    while code < bits.len() {
+        bits[code] = code as u8;
+        code += 1;
+    }
+    bits
+};
+/// Offset baselines per code: `(1 << n) - 3` folds the three repeat codes
+/// of an offset value into the offset; codes 0 and 1 select repeat offsets
+/// and keep the reference's values.
+const OF_BASE: [u32; MAX_OFF as usize + 1] = {
+    let mut base = [0u32; MAX_OFF as usize + 1];
+    base[1] = 1;
+    let mut code = 2;
+    while code < base.len() {
+        base[code] = (1u32 << code) - 3;
+        code += 1;
+    }
+    base
+};
 
-// Every sequence symbol fits the `u8` symbols of an FSE table.
+// Every sequence symbol fits the `u8` symbols of an FSE table, and every
+// table fits a `SeqTable`.
 const _: () = assert!(MAX_LL <= MAX_SEQ && MAX_ML <= MAX_SEQ && MAX_OFF <= MAX_SEQ);
+const _: () = assert!(
+    LL_FSE_LOG <= SEQ_TABLE_LOG_MAX
+        && ML_FSE_LOG <= SEQ_TABLE_LOG_MAX
+        && OFF_FSE_LOG <= SEQ_TABLE_LOG_MAX
+);
+
+// The output is indexed with 32-bit masks (`copy::idx`): a block's offsets
+// reach at most a window back, windows are at most `2^MAX_WINDOW_LOG`
+// bytes, and a sequence's lengths come from baselines plus at most 16 extra
+// bits, so every index stays far below `INDEX_LIMIT`.
+const _: () = assert!(
+    (1u64 << DecodeLimits::MAX_WINDOW_LOG) + 8 * (BLOCK_SIZE_MAX as u64) < INDEX_LIMIT as u64
+);
+const _: () = assert!(
+    LL_BASE[MAX_LL as usize] < (1 << 17)
+        && ML_BASE[MAX_ML as usize] < (1 << 17)
+        && LL_BITS[MAX_LL as usize] <= 16
+        && ML_BITS[MAX_ML as usize] <= 16
+);
+
+/// Most extra bits a sequence can read between two refills without
+/// exhausting the container, given the state bits that follow: the
+/// reference's `64 - 7 - (LLFSELog + MLFSELog + OffFSELog)`.
+const MID_RELOAD_THRESHOLD: u32 = 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG);
 
 /// Static description of one symbol type's tables.
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +110,8 @@ struct SymbolKind {
     max_log: u32,
     default: &'static [i16],
     default_log: u32,
+    bases: &'static [u32],
+    extra_bits: &'static [u8],
 }
 
 const LITERAL_LENGTHS: SymbolKind = SymbolKind {
@@ -55,18 +119,24 @@ const LITERAL_LENGTHS: SymbolKind = SymbolKind {
     max_log: LL_FSE_LOG,
     default: &LL_DEFAULT_NORM,
     default_log: LL_DEFAULT_NORM_LOG,
+    bases: &LL_BASE,
+    extra_bits: &LL_BITS,
 };
 const OFFSETS: SymbolKind = SymbolKind {
     max_symbol: MAX_OFF,
     max_log: OFF_FSE_LOG,
     default: &OF_DEFAULT_NORM,
     default_log: OF_DEFAULT_NORM_LOG,
+    bases: &OF_BASE,
+    extra_bits: &OF_BITS,
 };
 const MATCH_LENGTHS: SymbolKind = SymbolKind {
     max_symbol: MAX_ML,
     max_log: ML_FSE_LOG,
     default: &ML_DEFAULT_NORM,
     default_log: ML_DEFAULT_NORM_LOG,
+    bases: &ML_BASE,
+    extra_bits: &ML_BITS,
 };
 
 /// Where the history a block may reference starts, and its limits.
@@ -80,81 +150,337 @@ pub(crate) struct BlockContext {
     pub(crate) block_max: usize,
 }
 
+/// What a [`TableSlot`] currently holds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SlotContent {
+    /// Nothing `Repeat_Mode` may reuse.
+    #[default]
+    Empty,
+    /// The predefined distribution, kept while no other table replaces it.
+    Predefined,
+    /// An RLE or a described distribution.
+    Custom,
+}
+
+/// One symbol type's table, allocated on first use and rebuilt in place.
+#[derive(Debug, Default)]
+struct TableSlot {
+    table: Option<Box<SeqTable>>,
+    content: SlotContent,
+}
+
+impl TableSlot {
+    /// The table to rebuild, allocating it on first use.
+    fn table_mut(&mut self) -> &mut SeqTable {
+        self.table.get_or_insert_with(Box::default)
+    }
+
+    /// Replaces the table as `mode` asks, returning the description's size.
+    fn update(
+        &mut self,
+        mode: EncodingType,
+        kind: SymbolKind,
+        src: &[u8],
+    ) -> Result<usize, InvalidDataKind> {
+        match mode {
+            EncodingType::Basic => {
+                if self.content != SlotContent::Predefined {
+                    self.table_mut().fill(
+                        kind.default,
+                        kind.default_log,
+                        kind.bases,
+                        kind.extra_bits,
+                    );
+                    self.content = SlotContent::Predefined;
+                }
+                Ok(0)
+            }
+            EncodingType::Rle => {
+                let &symbol = src.first().ok_or(InvalidDataKind::SequencesSection)?;
+                if u32::from(symbol) > kind.max_symbol {
+                    return Err(InvalidDataKind::SequencesSection);
+                }
+                let symbol = usize::from(symbol);
+                self.table_mut()
+                    .fill_rle(kind.bases[symbol], kind.extra_bits[symbol]);
+                self.content = SlotContent::Custom;
+                Ok(1)
+            }
+            EncodingType::Compressed => {
+                let (distribution, used) = read_distribution(src, kind.max_symbol)?;
+                if distribution.table_log > kind.max_log {
+                    return Err(InvalidDataKind::FseTable);
+                }
+                self.table_mut().fill(
+                    distribution.counts(),
+                    distribution.table_log,
+                    kind.bases,
+                    kind.extra_bits,
+                );
+                self.content = SlotContent::Custom;
+                Ok(used)
+            }
+            EncodingType::Repeat => {
+                if self.content == SlotContent::Empty {
+                    return Err(InvalidDataKind::SequencesSection);
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    /// The table `Repeat_Mode` and execution use, if any.
+    fn get(&self) -> Option<&SeqTable> {
+        match self.content {
+            SlotContent::Empty => None,
+            SlotContent::Predefined | SlotContent::Custom => self.table.as_deref(),
+        }
+    }
+
+    /// Heap bytes the slot holds.
+    fn retained_bytes(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.retained_bytes())
+    }
+}
+
 /// The decoding tables `Repeat_Mode` refers to, per frame.
 #[derive(Debug, Default)]
 pub(crate) struct SequenceTables {
-    literal_lengths: Option<FseTable>,
-    offsets: Option<FseTable>,
-    match_lengths: Option<FseTable>,
+    literal_lengths: TableSlot,
+    offsets: TableSlot,
+    match_lengths: TableSlot,
 }
 
-/// Replaces `slot` as `mode` asks, returning the description's size.
-fn update_table(
-    slot: &mut Option<FseTable>,
-    mode: EncodingType,
-    kind: SymbolKind,
-    src: &[u8],
-) -> Result<usize, InvalidDataKind> {
-    match mode {
-        EncodingType::Basic => {
-            *slot = Some(FseTable::from_distribution(kind.default, kind.default_log));
-            Ok(0)
-        }
-        EncodingType::Rle => {
-            let &symbol = src.first().ok_or(InvalidDataKind::SequencesSection)?;
-            if u32::from(symbol) > kind.max_symbol {
-                return Err(InvalidDataKind::SequencesSection);
+/// A block's sequences: how many, their bitstream, and the literals they
+/// copy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SequenceSection<'a> {
+    /// Number of sequences.
+    pub(crate) count: usize,
+    /// The interleaved FSE bitstream.
+    pub(crate) stream: &'a [u8],
+    /// The block's literals.
+    pub(crate) literals: Literals<'a>,
+}
+
+/// One decoded sequence.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sequence {
+    literal_length: u32,
+    match_length: u32,
+    offset: u32,
+}
+
+/// The decoding half of the sequence loop: the bitstream, the three FSE
+/// states and the repeat offsets.
+struct SequenceDecoder<'a> {
+    bits: BitContainer,
+    /// Literal length, offset and match length states.
+    states: [usize; 3],
+    repeat: [u32; REP_NUM],
+    /// Literal length, offset and match length rows.
+    rows: [&'a [SeqRow; SEQ_TABLE_SIZE]; 3],
+    stream: &'a [u8],
+}
+
+impl SequenceDecoder<'_> {
+    /// Decodes the next sequence, the reference's `ZSTD_decodeSequence`;
+    /// the states advance unless it is the block's `last`. Fails on a
+    /// repeat offset of zero.
+    #[inline(always)]
+    fn decode(&mut self, last: bool) -> Result<Sequence, InvalidDataKind> {
+        let [ll_rows, of_rows, ml_rows] = self.rows;
+        let [ll_state, of_state, ml_state] = self.states;
+        let ll_row = seq_row(ll_rows, ll_state);
+        let of_row = seq_row(of_rows, of_state);
+        let ml_row = seq_row(ml_rows, ml_state);
+        let bits = &mut self.bits;
+        let repeat = &mut self.repeat;
+
+        let of_bits = of_row.extra_bits();
+        let offset = if of_bits > 1 {
+            let offset = of_row
+                .base()
+                .wrapping_add(bits.look_nonzero(of_bits) as u32);
+            bits.skip(of_bits);
+            *repeat = [offset, repeat[0], repeat[1]];
+            offset
+        } else {
+            let ll_zero = ll_row.base() == 0;
+            if of_bits == 0 {
+                if ll_zero {
+                    repeat.swap(0, 1);
+                }
+                repeat[0]
+            } else {
+                let index = 1 + usize::from(ll_zero) + bits.read(1) as usize;
+                let offset = if index == REP_NUM {
+                    repeat[0].wrapping_sub(1)
+                } else {
+                    repeat[index]
+                };
+                if offset == 0 {
+                    return Err(InvalidDataKind::Offset);
+                }
+                if index != 1 {
+                    repeat[2] = repeat[1];
+                }
+                repeat[1] = repeat[0];
+                repeat[0] = offset;
+                offset
             }
-            *slot = Some(FseTable::rle(symbol));
-            Ok(1)
+        };
+        let ml_bits = ml_row.extra_bits();
+        let match_length = ml_row.base().wrapping_add(bits.read(ml_bits) as u32);
+        let ll_bits = ll_row.extra_bits();
+        if ll_bits + ml_bits + of_bits > MID_RELOAD_THRESHOLD {
+            bits.reload(self.stream);
         }
-        EncodingType::Compressed => {
-            let (distribution, used) = read_distribution(src, kind.max_symbol)?;
-            if distribution.table_log > kind.max_log {
-                return Err(InvalidDataKind::FseTable);
-            }
-            *slot = Some(FseTable::from_distribution(
-                &distribution.counts,
-                distribution.table_log,
-            ));
-            Ok(used)
+        let literal_length = ll_row.base().wrapping_add(bits.read(ll_bits) as u32);
+        if !last {
+            // The format's order: literal length, match length, offset.
+            let ll_state = ll_row.next_state() + bits.read(ll_row.nb_bits()) as usize;
+            let ml_state = ml_row.next_state() + bits.read(ml_row.nb_bits()) as usize;
+            let of_state = of_row.next_state() + bits.read(of_row.nb_bits()) as usize;
+            self.states = [ll_state, of_state, ml_state];
+            bits.reload(self.stream);
         }
-        EncodingType::Repeat => {
-            if slot.is_none() {
-                return Err(InvalidDataKind::SequencesSection);
-            }
-            Ok(0)
-        }
+        Ok(Sequence {
+            literal_length,
+            match_length,
+            offset,
+        })
     }
 }
 
-/// Appends a match of `length` bytes starting `offset` bytes back; the
-/// source may overlap the bytes being written.
-fn copy_match(out: &mut Vec<u8>, offset: usize, length: usize) {
-    let start = out.len() - offset;
-    let mut copied = 0;
-    // `copied` stays a multiple of `offset` until the last step, so copying
-    // from `start` repeats the period correctly while the source doubles.
-    while copied < length {
-        let step = (length - copied).min(offset + copied);
-        out.extend_from_within(start..start + step);
-        copied += step;
+/// The executing half of the sequence loop: literals and matches copied
+/// into the output, the reference's `ZSTD_execSequence`.
+struct Executor<'a, 'b> {
+    /// The output, from the lowest byte a match may reach, cut to the
+    /// block's maximum and the overlength.
+    out: &'a mut [u8],
+    op: usize,
+    /// The literals and exactly their slack.
+    lits: &'b [u8],
+    lp: usize,
+    block_limit: usize,
+    window: usize,
+}
+
+impl Executor<'_, '_> {
+    /// Executes one sequence, checking it as the reference does.
+    #[inline(always)]
+    fn execute<S: Simd>(
+        &mut self,
+        simd: S,
+        copy: MatchCopy,
+        sequence: Sequence,
+    ) -> Result<(), BlockError> {
+        let literal_length = sequence.literal_length as usize;
+        let match_length = sequence.match_length as usize;
+        let offset = sequence.offset as usize;
+        // Masked operands keep every sum below 2^34, so the compiler knows
+        // they do not wrap and can relate the tests below to the copies'
+        // own bounds checks.
+        let (op, lp) = (idx(self.op), idx(self.lp));
+        let lit_stop = lp + literal_length;
+        if lit_stop + WILDCOPY_OVERLENGTH > self.lits.len() {
+            return Err(InvalidDataKind::LiteralsOverrun.into());
+        }
+        let lit_end = op + literal_length;
+        let match_end = lit_end + match_length;
+        if match_end + WILDCOPY_OVERLENGTH <= self.out.len() {
+            // Within the block's maximum, with room for the overlength.
+            if offset > lit_end || offset > self.window {
+                return Err(InvalidDataKind::Offset.into());
+            }
+            wildcopy_literals(self.out, op, self.lits, lp, literal_length);
+            if offset >= 32 {
+                // The first chunk here, where the room test above bounds
+                // it; most matches need no other.
+                let src = lit_end - offset;
+                let chunk: [u8; 32] = self.out[src..src + 32].try_into().unwrap_or([0; 32]);
+                self.out[lit_end..lit_end + 32].copy_from_slice(&chunk);
+                if match_length > 32 {
+                    wildcopy_match(
+                        simd,
+                        copy,
+                        self.out,
+                        lit_end + 32,
+                        offset,
+                        match_length - 32,
+                    );
+                }
+            } else {
+                wildcopy_match(simd, copy, self.out, lit_end, offset, match_length);
+            }
+        } else {
+            execute_exactly(
+                self.out,
+                self.lits,
+                [op, lit_end, match_end],
+                [lp, lit_stop],
+                offset,
+                [self.block_limit, self.window],
+            )?;
+        }
+        self.op = match_end;
+        self.lp = lit_stop;
+        Ok(())
     }
+}
+
+/// Executes a sequence that ends too close to the end of the output for
+/// chunked copies, or past the block's maximum: the reference's
+/// `ZSTD_execSequenceEnd`. Out of line and cold, so the main loop keeps its
+/// registers. `ends` are the sequence's start, literal end and match end in
+/// the output; `lit_range` its literals; `limits` the block's end and the
+/// window.
+#[cold]
+#[inline(never)]
+fn execute_exactly(
+    out: &mut [u8],
+    lits: &[u8],
+    ends: [usize; 3],
+    lit_range: [usize; 2],
+    offset: usize,
+    limits: [usize; 2],
+) -> Result<(), BlockError> {
+    let [op, lit_end, match_end] = ends;
+    let [block_limit, window] = limits;
+    if match_end > block_limit {
+        return Err(InvalidDataKind::BlockSize.into());
+    }
+    if offset > lit_end || offset > window {
+        return Err(InvalidDataKind::Offset.into());
+    }
+    if match_end > out.len() {
+        return Err(BlockError::OutputFull);
+    }
+    out[op..lit_end].copy_from_slice(&lits[lit_range[0]..lit_range[1]]);
+    exact_match(out, lit_end, offset, match_end - lit_end);
+    Ok(())
 }
 
 impl SequenceTables {
     /// Heap bytes the tables hold.
     pub(crate) fn retained_bytes(&self) -> usize {
-        [&self.literal_lengths, &self.offsets, &self.match_lengths]
-            .into_iter()
-            .flatten()
-            .map(FseTable::retained_bytes)
-            .sum()
+        self.literal_lengths.retained_bytes()
+            + self.offsets.retained_bytes()
+            + self.match_lengths.retained_bytes()
     }
 
-    /// Forgets every table at a frame start.
+    /// Forgets every table at a frame start, keeping their allocations.
     pub(crate) fn reset(&mut self) {
-        *self = Self::default();
+        for slot in [
+            &mut self.literal_lengths,
+            &mut self.offsets,
+            &mut self.match_lengths,
+        ] {
+            slot.content = SlotContent::Empty;
+        }
     }
 
     /// Parses the sequences section header, returning the number of
@@ -188,35 +514,121 @@ impl SequenceTables {
         }
         used += 1;
         let rest = |used: usize| src.get(used..).unwrap_or(&[]);
-        used += update_table(
-            &mut self.literal_lengths,
-            encoding_type(modes >> 6),
-            LITERAL_LENGTHS,
-            rest(used),
-        )?;
-        used += update_table(
-            &mut self.offsets,
-            encoding_type(modes >> 4),
-            OFFSETS,
-            rest(used),
-        )?;
-        used += update_table(
-            &mut self.match_lengths,
-            encoding_type(modes >> 2),
-            MATCH_LENGTHS,
-            rest(used),
-        )?;
+        used +=
+            self.literal_lengths
+                .update(encoding_type(modes >> 6), LITERAL_LENGTHS, rest(used))?;
+        used += self
+            .offsets
+            .update(encoding_type(modes >> 4), OFFSETS, rest(used))?;
+        used += self
+            .match_lengths
+            .update(encoding_type(modes >> 2), MATCH_LENGTHS, rest(used))?;
         Ok((count, used))
     }
 
-    /// Decodes `count` sequences from `stream` and executes them, appending
-    /// the block's output to `out`.
+    /// Decodes `count` sequences from `stream` and executes them, writing
+    /// the block's output to `target.out[target.op..]`, whose prefix from
+    /// `target.context.history_start` is the frame's history. Returns the
+    /// end of the block's output.
     ///
     /// `reps` holds the repeat offsets on entry and is updated only when the
-    /// whole block succeeds.
-    #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
-    pub(crate) fn execute(
+    /// whole block succeeds. [`BlockError::OutputFull`] reports that `out`
+    /// ends before the block does.
+    #[fearless_simd_macros::simd]
+    pub(crate) fn execute<S: Simd>(
         &self,
+        simd: S,
+        copy: MatchCopy,
+        section: SequenceSection<'_>,
+        reps: &mut [u32; REP_NUM],
+        target: Target<'_>,
+    ) -> Result<usize, BlockError> {
+        let SequenceSection {
+            count,
+            stream,
+            literals,
+        } = section;
+        let Target { out, op, context } = target;
+        // Valid matches never reach before `base`: offsets are bounded by
+        // the history and by the window. Cutting the buffer there keeps
+        // every index below 2^32 (windows are at most 2^31 bytes), which
+        // the copies' index masks rely on.
+        let window = usize::try_from(context.window).unwrap_or(usize::MAX);
+        let base = context.history_start.max(op.saturating_sub(window));
+        let cut_end = out.len().min(base.saturating_add(INDEX_LIMIT));
+        let out = &mut out[base..cut_end];
+        let op = op - base;
+        let missing = InvalidDataKind::SequencesSection;
+        let ll_table = self.literal_lengths.get().ok_or(missing)?;
+        let of_table = self.offsets.get().ok_or(missing)?;
+        let ml_table = self.match_lengths.get().ok_or(missing)?;
+        let bits = BitContainer::new(stream).ok_or(InvalidDataKind::SequenceStream)?;
+        let mut decoder = SequenceDecoder {
+            bits,
+            states: [0; 3],
+            repeat: *reps,
+            rows: [ll_table.rows(), of_table.rows(), ml_table.rows()],
+            stream,
+        };
+        decoder.states = [
+            decoder.bits.read(ll_table.log()) as usize,
+            decoder.bits.read(of_table.log()) as usize,
+            decoder.bits.read(ml_table.log()) as usize,
+        ];
+        decoder.bits.reload(stream);
+
+        // Both buffers are cut so that the fast path's tests are close to
+        // the ones the copies' bounds checks make: the literals to exactly
+        // their slack, the output to the block's maximum and the
+        // overlength, where it is longer.
+        let lit_len = literals.len;
+        let lits = &literals.bytes[..lit_len + WILDCOPY_OVERLENGTH];
+        let block_limit = op + context.block_max;
+        let out_len = out.len().min(block_limit + WILDCOPY_OVERLENGTH);
+        let mut executor = Executor {
+            out: &mut out[..out_len],
+            op,
+            lits,
+            lp: 0,
+            block_limit,
+            window,
+        };
+        // The last sequence leaves the states alone; peeling it keeps that
+        // test out of the loop. Callers handle empty sections themselves.
+        debug_assert!(count > 0);
+        for _ in 1..count {
+            let sequence = decoder.decode(false)?;
+            executor.execute(simd, copy, sequence)?;
+        }
+        let sequence = decoder.decode(true)?;
+        executor.execute(simd, copy, sequence)?;
+        if !decoder.bits.is_exhausted() {
+            return Err(InvalidDataKind::SequenceStream.into());
+        }
+        let Executor { out, op, lp, .. } = executor;
+        let rest = lit_len - lp;
+        if op + rest > block_limit {
+            return Err(InvalidDataKind::BlockSize.into());
+        }
+        let end = op + rest;
+        let target = out.get_mut(op..end).ok_or(BlockError::OutputFull)?;
+        target.copy_from_slice(&lits[lp..lit_len]);
+        *reps = decoder.repeat;
+        Ok(base + end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Backend;
+    use crate::shared::format::REP_START;
+    use alloc::vec::Vec;
+
+    /// Executes `count` sequences after `out` on every backend and copy
+    /// mode, requiring them to agree, and appends the output.
+    fn run(
+        tables: &SequenceTables,
         count: usize,
         stream: &[u8],
         literals: &[u8],
@@ -224,91 +636,46 @@ impl SequenceTables {
         out: &mut Vec<u8>,
         context: BlockContext,
     ) -> Result<(), InvalidDataKind> {
-        let missing = InvalidDataKind::SequencesSection;
-        let ll_table = self.literal_lengths.as_ref().ok_or(missing)?;
-        let of_table = self.offsets.as_ref().ok_or(missing)?;
-        let ml_table = self.match_lengths.as_ref().ok_or(missing)?;
-        let mut bits = ReverseBitReader::new(stream).ok_or(InvalidDataKind::SequenceStream)?;
-        let mut ll_state = ll_table.initial_state(&mut bits);
-        let mut of_state = of_table.initial_state(&mut bits);
-        let mut ml_state = ml_table.initial_state(&mut bits);
-        let mut repeat = *reps;
-        let block_start = out.len();
-        let mut remaining = literals;
-        for index in 0..count {
-            let ll_code = usize::from(ll_table.entry(ll_state).symbol);
-            let of_code = u32::from(of_table.entry(of_state).symbol);
-            let ml_code = usize::from(ml_table.entry(ml_state).symbol);
-            let ll_zero = ll_code == 0;
-            let offset = if of_code > 1 {
-                let offset = (1u32 << of_code) - 3 + bits.read(of_code) as u32;
-                repeat = [offset, repeat[0], repeat[1]];
-                offset
-            } else if of_code == 0 {
-                if ll_zero {
-                    repeat.swap(0, 1);
-                }
-                repeat[0]
-            } else {
-                let index = 1 + usize::from(ll_zero) + bits.read(1) as usize;
-                let offset = if index == REP_NUM {
-                    repeat[0] - 1
-                } else {
-                    repeat[index]
+        let start = out.len();
+        let mut bytes = literals.to_vec();
+        bytes.resize(literals.len() + WILDCOPY_OVERLENGTH, 0xaa);
+        let literals = Literals {
+            bytes: &bytes,
+            len: literals.len(),
+        };
+        let mut results = Vec::new();
+        for backend in Backend::available() {
+            for copy in [MatchCopy::Scalar, MatchCopy::Shuffle] {
+                let mut buffer = out.clone();
+                buffer.resize(start + context.block_max + WILDCOPY_OVERLENGTH, 0);
+                let mut repeat = *reps;
+                let target = Target {
+                    out: &mut buffer,
+                    op: start,
+                    context,
                 };
-                if offset == 0 {
-                    return Err(InvalidDataKind::Offset);
-                }
-                if index != 1 {
-                    repeat[2] = repeat[1];
-                }
-                repeat[1] = repeat[0];
-                repeat[0] = offset;
-                offset
-            };
-            let ml_base = ML_BASE.get(ml_code).ok_or(missing)?;
-            let ml_bits = ML_BITS.get(ml_code).ok_or(missing)?;
-            let match_length = (*ml_base + bits.read(u32::from(*ml_bits)) as u32) as usize;
-            let ll_base = LL_BASE.get(ll_code).ok_or(missing)?;
-            let ll_bits = LL_BITS.get(ll_code).ok_or(missing)?;
-            let literal_length = (*ll_base + bits.read(u32::from(*ll_bits)) as u32) as usize;
-            if index + 1 < count {
-                ll_state = ll_table.next_state(ll_state, &mut bits);
-                ml_state = ml_table.next_state(ml_state, &mut bits);
-                of_state = of_table.next_state(of_state, &mut bits);
+                let section = SequenceSection {
+                    count,
+                    stream,
+                    literals,
+                };
+                let result = fearless_simd::dispatch!(backend.0, simd => tables.execute(
+                    simd, copy, section, &mut repeat, target
+                ));
+                results.push(result.map(|end| (buffer[start..end].to_vec(), repeat)));
             }
-
-            let (copy, rest) = remaining
-                .split_at_checked(literal_length)
-                .ok_or(InvalidDataKind::LiteralsOverrun)?;
-            if out.len() - block_start + literal_length + match_length > context.block_max {
-                return Err(InvalidDataKind::BlockSize);
+        }
+        assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+        match results.swap_remove(0) {
+            Ok((bytes, repeat)) => {
+                out.extend_from_slice(&bytes);
+                *reps = repeat;
+                Ok(())
             }
-            out.extend_from_slice(copy);
-            remaining = rest;
-            let history = out.len() - context.history_start;
-            let offset = offset as usize;
-            if offset > history || offset as u64 > context.window {
-                return Err(InvalidDataKind::Offset);
-            }
-            copy_match(out, offset, match_length);
+            Err(BlockError::Invalid(kind)) => Err(kind),
+            Err(BlockError::OutputFull) => panic!("the buffer holds a whole block"),
         }
-        if !bits.is_exhausted() {
-            return Err(InvalidDataKind::SequenceStream);
-        }
-        if out.len() - block_start + remaining.len() > context.block_max {
-            return Err(InvalidDataKind::BlockSize);
-        }
-        out.extend_from_slice(remaining);
-        *reps = repeat;
-        Ok(())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shared::format::REP_START;
 
     const CONTEXT: BlockContext = BlockContext {
         history_start: 0,
@@ -342,19 +709,6 @@ mod tests {
                 16387, 32771, 65539
             ]
         );
-    }
-
-    #[test]
-    fn overlapping_matches_repeat_their_period() {
-        let mut out = b"abc".to_vec();
-        copy_match(&mut out, 3, 8);
-        assert_eq!(out, b"abcabcabcab");
-        let mut out = b"x".to_vec();
-        copy_match(&mut out, 1, 5);
-        assert_eq!(out, b"xxxxxx");
-        let mut out = b"hello".to_vec();
-        copy_match(&mut out, 5, 2);
-        assert_eq!(out, b"hellohe");
     }
 
     #[test]
@@ -446,9 +800,7 @@ mod tests {
         let stream = backward_stream(&[(2, 2)]);
         let mut reps = REP_START;
         let mut out = Vec::new();
-        tables
-            .execute(1, &stream, b"abcXY", &mut reps, &mut out, CONTEXT)
-            .expect("valid");
+        run(&tables, 1, &stream, b"abcXY", &mut reps, &mut out, CONTEXT).expect("valid");
         assert_eq!(out, b"abcabcabXY");
         assert_eq!(reps, [3, 1, 4]);
     }
@@ -465,28 +817,27 @@ mod tests {
         // Literal length 1, offset code 1 with bit 1 → Repeated_Offset3 = 8.
         let tables = rle_tables(1, 1, 0);
         let mut reps = REP_START;
-        tables
-            .execute(
-                1,
-                &backward_stream(&[(1, 1)]),
-                b"z",
-                &mut reps,
-                &mut out,
-                context,
-            )
-            .expect("valid");
+        run(
+            &tables,
+            1,
+            &backward_stream(&[(1, 1)]),
+            b"z",
+            &mut reps,
+            &mut out,
+            context,
+        )
+        .expect("valid");
         assert_eq!(reps, [8, 1, 4]);
         // Literal length 0, offset code 0 → Repeated_Offset2.
         let tables = rle_tables(0, 0, 0);
-        tables
-            .execute(1, &[0x01], b"", &mut reps, &mut out, context)
-            .expect("valid");
+        run(&tables, 1, &[0x01], b"", &mut reps, &mut out, context).expect("valid");
         assert_eq!(reps, [1, 8, 4]);
         // Literal length 0, offset code 1 with bit 1 → Repeated_Offset1 - 1
         // = 0, which is corrupt.
         let tables = rle_tables(0, 1, 0);
         assert_eq!(
-            tables.execute(
+            run(
+                &tables,
                 1,
                 &backward_stream(&[(1, 1)]),
                 b"",
@@ -497,22 +848,20 @@ mod tests {
             Err(InvalidDataKind::Offset)
         );
         // Literal length 0, offset code 1 with bit 0 → Repeated_Offset3.
-        tables
-            .execute(
-                1,
-                &backward_stream(&[(0, 1)]),
-                b"",
-                &mut reps,
-                &mut out,
-                context,
-            )
-            .expect("valid");
+        run(
+            &tables,
+            1,
+            &backward_stream(&[(0, 1)]),
+            b"",
+            &mut reps,
+            &mut out,
+            context,
+        )
+        .expect("valid");
         assert_eq!(reps, [4, 1, 8]);
         // Offset code 0 with literals keeps the order.
         let tables = rle_tables(1, 0, 0);
-        tables
-            .execute(1, &[0x01], b"q", &mut reps, &mut out, context)
-            .expect("valid");
+        run(&tables, 1, &[0x01], b"q", &mut reps, &mut out, context).expect("valid");
         assert_eq!(reps, [4, 1, 8]);
     }
 
@@ -523,7 +872,8 @@ mod tests {
         // Offset 3 with no history.
         let tables = rle_tables(0, 2, 0);
         assert_eq!(
-            tables.execute(
+            run(
+                &tables,
                 1,
                 &backward_stream(&[(2, 2)]),
                 b"",
@@ -536,16 +886,16 @@ mod tests {
         // More literals than the section holds.
         let tables = rle_tables(3, 0, 0);
         assert_eq!(
-            tables.execute(1, &[0x01], b"ab", &mut reps, &mut out, CONTEXT),
+            run(&tables, 1, &[0x01], b"ab", &mut reps, &mut out, CONTEXT),
             Err(InvalidDataKind::LiteralsOverrun)
         );
         // Leftover bits, and a missing end marker.
         assert_eq!(
-            tables.execute(1, &[0x03], b"abc", &mut reps, &mut out, CONTEXT),
+            run(&tables, 1, &[0x03], b"abc", &mut reps, &mut out, CONTEXT),
             Err(InvalidDataKind::SequenceStream)
         );
         assert_eq!(
-            tables.execute(1, &[0x00], b"abc", &mut reps, &mut out, CONTEXT),
+            run(&tables, 1, &[0x00], b"abc", &mut reps, &mut out, CONTEXT),
             Err(InvalidDataKind::SequenceStream)
         );
         // A block larger than its maximum.
@@ -554,12 +904,20 @@ mod tests {
             ..CONTEXT
         };
         assert_eq!(
-            tables.execute(1, &[0x01], b"abc", &mut reps, &mut out, small),
+            run(&tables, 1, &[0x01], b"abc", &mut reps, &mut out, small),
             Err(InvalidDataKind::BlockSize)
         );
         let tables = rle_tables(0, 0, 0);
         assert_eq!(
-            tables.execute(1, &[0x01], b"abc", &mut reps, &mut b"x".to_vec(), small),
+            run(
+                &tables,
+                1,
+                &[0x01],
+                b"abc",
+                &mut reps,
+                &mut b"x".to_vec(),
+                small
+            ),
             Err(InvalidDataKind::BlockSize)
         );
         // Offsets beyond the window.
@@ -568,13 +926,29 @@ mod tests {
             ..CONTEXT
         };
         assert_eq!(
-            tables.execute(1, &[0x01], b"", &mut reps, &mut b"abcdef".to_vec(), narrow),
+            run(
+                &tables,
+                1,
+                &[0x01],
+                b"",
+                &mut reps,
+                &mut b"abcdef".to_vec(),
+                narrow
+            ),
             Err(InvalidDataKind::Offset)
         );
         assert_eq!(reps, REP_START);
         // Tables are required.
         assert_eq!(
-            SequenceTables::default().execute(1, &[0x01], b"", &mut reps, &mut out, CONTEXT),
+            run(
+                &SequenceTables::default(),
+                1,
+                &[0x01],
+                b"",
+                &mut reps,
+                &mut out,
+                CONTEXT
+            ),
             Err(InvalidDataKind::SequencesSection)
         );
     }

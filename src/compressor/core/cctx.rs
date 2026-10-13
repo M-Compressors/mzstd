@@ -7,6 +7,8 @@
 //! [`Segments`]. Buffering of streamed input and output lives one layer up,
 //! in [`super::stream`].
 
+use alloc::boxed::Box;
+
 use super::block;
 use super::entropy::{FseRepeat, Tables};
 use super::error::CoreError;
@@ -19,6 +21,7 @@ use super::params::{
 use super::presplit;
 use super::seq_store::SeqStore;
 use super::window::{Addr, CURRENT_MAX, Segments};
+use crate::Backend;
 use crate::shared::format::{
     BLOCK_COMPRESSED, BLOCK_HEADER_SIZE, BLOCK_RAW, BLOCK_RLE, BLOCK_SIZE_MAX,
     FRAME_HEADER_SIZE_MAX, MAGIC_NUMBER, REP_NUM, REP_START, WINDOW_LOG_ABSOLUTE_MIN,
@@ -256,20 +259,18 @@ pub(crate) struct Engine {
     pub(crate) is_first_block: bool,
     initialized: bool,
     pub(crate) seq_store: SeqStore,
-    pub(crate) prev: BlockState,
-    pub(crate) next: BlockState,
+    pub(crate) prev: Box<BlockState>,
+    pub(crate) next: Box<BlockState>,
     pub(crate) ms: MatchState,
     pub(crate) ldm: LdmState,
     pub(crate) ldm_store: RawSeqStore,
+    /// The SIMD level every kernel of this engine runs with.
+    pub(crate) backend: Backend,
 }
 
 impl Engine {
-    /// A context with no frame begun and no tables allocated.
-    pub(crate) fn empty() -> Self {
-        Self::new()
-    }
-
-    /// A context with no frame begun.
+    /// A context with no frame begun and no tables allocated, on the
+    /// detected backend.
     pub(crate) fn new() -> Self {
         let applied = RequestedParams::default().resolve(CONTENT_SIZE_UNKNOWN);
         Self {
@@ -283,12 +284,23 @@ impl Engine {
             is_first_block: true,
             initialized: false,
             seq_store: SeqStore::default(),
-            prev: BlockState::default(),
-            next: BlockState::default(),
+            prev: Box::default(),
+            next: Box::default(),
             ms: MatchState::empty(applied.cparams, applied.use_row_match_finder),
             ldm: LdmState::default(),
             ldm_store: RawSeqStore::default(),
+            backend: Backend::default(),
         }
+    }
+
+    /// A context with no frame begun whose kernels run on `backend`.
+    pub(crate) fn with_backend(backend: Backend) -> Self {
+        let mut engine = Self {
+            backend,
+            ..Self::new()
+        };
+        engine.ms.backend = backend;
+        engine
     }
 
     /// Starts a frame (`ZSTD_resetCCtx_internal` without dictionaries).
@@ -615,6 +627,7 @@ impl Engine {
     /// Swaps the block states once a compressed block is committed
     /// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
     pub(crate) fn confirm_block_state(&mut self) {
+        // Boxed, so this swaps two pointers as the reference does.
         core::mem::swap(&mut self.prev, &mut self.next);
     }
 

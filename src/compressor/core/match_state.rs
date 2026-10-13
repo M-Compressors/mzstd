@@ -8,6 +8,7 @@ use super::opt::OptState;
 use super::params::{CParams, ParamSwitch, Strategy, row_match_finder_used};
 use super::seq_store::SeqStore;
 use super::window::WindowState;
+use crate::Backend;
 
 /// `ZSTD_HASHLOG3_MAX`.
 const HASHLOG3_MAX: u32 = 17;
@@ -23,6 +24,8 @@ pub(crate) struct BlockInput<'a> {
     pub(crate) start: u32,
     /// Index one past the block's last byte.
     pub(crate) end: u32,
+    /// The SIMD level the block's kernels run with.
+    pub(crate) backend: Backend,
 }
 
 /// A block compressor: fills `seq_store` with the block's sequences, updates
@@ -60,6 +63,9 @@ pub(crate) struct MatchState {
     pub(crate) use_row_match_finder: ParamSwitch,
     /// Long matches offered to the optimal parser for the current block.
     pub(crate) ldm_seq_store: Option<RawSeqStore>,
+    /// The SIMD level the match finders' kernels run with, selected once
+    /// per block outside their loops.
+    pub(crate) backend: Backend,
 }
 
 impl MatchState {
@@ -90,6 +96,7 @@ impl MatchState {
             lazy_skipping: false,
             use_row_match_finder,
             ldm_seq_store: None,
+            backend: Backend::default(),
         }
     }
 
@@ -136,14 +143,33 @@ impl MatchState {
         self.loaded_dict_end = 0;
         self.opt.lit_length_sum = 0;
 
-        self.hash_table.clear();
-        self.hash_table.resize(h_size, 0);
-        self.chain_table.clear();
-        self.chain_table.resize(chain_size, 0);
-        self.hash_table3.clear();
-        self.hash_table3.resize(h3_size, 0);
+        // The reference zeroes its tables only when indices restart
+        // (`ZSTD_cwksp_mark_tables_dirty`, then `ZSTD_cwksp_clean_tables`),
+        // whatever the strategy; when they continue, every entry left from
+        // the previous input lies below the new window, so it is kept. Every
+        // finder tests an entry against the window before following it —
+        // fast and dfast directly, the hash chain and row searches at
+        // `lowLimit`, the binary trees at `windowLow`/`btLow`, the 3-byte
+        // table at its own low bound — and rewrites a tree node's cells when
+        // it inserts the node, so a stale entry acts as the zero it
+        // replaces. The row finder's tag table is likewise never re-zeroed
+        // (`ZSTD_cwksp_reserve_aligned_init_once`); its salt only permutes
+        // rows and tags, so it is not modelled.
+        let keep_stale = !reset_index;
+        for (table, size) in [
+            (&mut self.hash_table, h_size),
+            (&mut self.chain_table, chain_size),
+            (&mut self.hash_table3, h3_size),
+        ] {
+            if !keep_stale {
+                table.clear();
+            }
+            grow_zeroed(table, size);
+        }
 
-        self.tag_table.clear();
+        if !(row && keep_stale) {
+            self.tag_table.clear();
+        }
         if row {
             self.tag_table.resize(h_size, 0);
             let row_log = cparams.search_log.clamp(4, 6);
@@ -195,6 +221,20 @@ impl MatchState {
         let preserve_mark = self.cparams.strategy == Strategy::BtLazy2;
         reduce_table(&mut self.chain_table, reducer, preserve_mark);
         reduce_table(&mut self.hash_table3, reducer, false);
+    }
+}
+
+/// Sizes `table` to `len` entries, new entries zero.
+///
+/// An empty table is allocated zeroed, which the allocator can serve
+/// without writing (most of a large table is never touched by a small
+/// input); a table holding entries is resized in place, zeroing only the
+/// newly exposed tail.
+fn grow_zeroed(table: &mut Vec<u32>, len: usize) {
+    if table.is_empty() && table.capacity() < len {
+        *table = alloc::vec![0; len];
+    } else {
+        table.resize(len, 0);
     }
 }
 
@@ -252,6 +292,51 @@ mod tests {
         assert_eq!(lazy.chain_table.len(), 1 << lazy.cparams.chain_log);
         let opt = MatchState::new(level_cparams(19, u64::MAX), ParamSwitch::Disable);
         assert!(opt.hash_log3 > 0);
+    }
+
+    #[test]
+    fn continuing_indices_keep_every_table() {
+        for level in [1, 3, 6, 13, 19] {
+            for row in [ParamSwitch::Disable, ParamSwitch::Enable] {
+                let cparams = level_cparams(level, u64::MAX);
+                let mut ms = MatchState::new(cparams, row);
+                for table in [&mut ms.hash_table, &mut ms.chain_table, &mut ms.hash_table3] {
+                    table.fill(77);
+                }
+                ms.tag_table.fill(77);
+                ms.reset(cparams, row, false);
+                for table in [&ms.hash_table, &ms.chain_table, &ms.hash_table3] {
+                    assert!(table.iter().all(|&v| v == 77), "{level} {row:?}");
+                }
+                assert!(ms.tag_table.iter().all(|&v| v == 77), "{level} {row:?}");
+                // Restarting indices always cleans.
+                ms.reset(cparams, row, true);
+                for table in [&ms.hash_table, &ms.chain_table, &ms.hash_table3] {
+                    assert!(table.iter().all(|&v| v == 0), "{level} {row:?}");
+                }
+                assert!(ms.tag_table.iter().all(|&v| v == 0), "{level} {row:?}");
+            }
+        }
+        assert!(
+            !MatchState::new(level_cparams(19, u64::MAX), ParamSwitch::Disable)
+                .hash_table3
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn growing_a_table_zeroes_only_new_entries() {
+        let mut table = alloc::vec::Vec::new();
+        grow_zeroed(&mut table, 4);
+        assert_eq!(table, [0; 4]);
+        table.fill(5);
+        grow_zeroed(&mut table, 6);
+        assert_eq!(table, [5, 5, 5, 5, 0, 0]);
+        grow_zeroed(&mut table, 2);
+        assert_eq!(table, [5, 5]);
+        table.clear();
+        grow_zeroed(&mut table, 3);
+        assert_eq!(table, [0; 3]);
     }
 
     #[test]

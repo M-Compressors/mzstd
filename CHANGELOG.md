@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v0.2.0](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.0) - 2026-10-13
 
 - **Breaking:** parallel streaming sessions are rebuilt around a window
   and a non-blocking `process`. `ParallelCompressor::start(stream, window)`
@@ -72,6 +72,53 @@
   set; APIs a build leaves out link to the feature-selection section.
 - The `CI Fuzz` workflow archives AFL's findings before uploading them:
   `actions/upload-artifact` rejects AFL's file names, which contain `:`.
+
+- Added `Backend`, a public, host-validated SIMD level
+  (`fearless_simd`): `Backend::available`, `Backend::name`,
+  `Display`/`Debug`, `CompressorBuilder::with_backend` /
+  `DecompressorBuilder::with_backend`, and `Compressor::backend` /
+  `Decompressor::backend`. The default is detected once when a codec is
+  built; every backend produces identical output. `compression` and
+  `decompression` now depend on `fearless_simd`, and `compression` on
+  `branches` for safe prefetch hints.
+- Decompression is 2.5-9x faster, now at 0.93-1.18x of zstd 1.5.7's time
+  on `cargo bench --bench decompress` (i7-13700KF, AVX2, one core),
+  with identical output and the same verdicts on malformed input:
+  - Huffman and sequence bitstreams use a 64-bit container refilled where
+    the reference refills. Four-stream literals decode interleaved with
+    the reference's sentinel fast loops, with a pair (X2) table when the
+    reference's timing model prefers it.
+  - Sequence tables carry baselines and extra-bit counts per state;
+    predefined tables are kept between blocks; tables and buffers are
+    reused.
+  - Sequences execute with wildcopies, including a byte-shuffle kernel for
+    overlapping short-offset matches on SSSE3, AVX2, AVX-512, NEON and
+    WASM SIMD.
+  - `decompress_to_slice` decodes straight into the destination when every
+    frame declares a content size that fits.
+- Compression is 1.3-3.4x faster. On `cargo bench --bench compress` it now
+  runs at 0.88-1.07x of zstd 1.5.7's time on small inputs and at levels
+  16-19, 1.03-1.17x on 1 MiB of text, and 1.1-1.3x on binary input and
+  in streaming. Frames stay byte-identical to zstd 1.5.7 on every backend:
+  - The fast and dfast finders are specialized per minimum match length,
+    read through fixed-width windows over the block's prefix, and mask
+    their table indices; extDict variants work the same way.
+  - The greedy, lazy, lazy2 and btlazy2 finders compare row tags with one
+    `u8x16`/`u8x32`/`u8x64` compare (`ZSTD_row_getMatchMask`), prefetch
+    rows 8 positions ahead as the reference does, and are specialized per
+    search, depth, minimum match, row size and extDict mode.
+  - The optimal parser (btopt, btultra, btultra2) and LDM are specialized
+    per backend, optimization level and extDict mode; one binary-tree walk
+    serves insertion and match collection; prices come from tables
+    rebuilt at each rescale with a vectorized weight form.
+  - Match lengths are compared a word at a time, then with native vectors.
+  - Entropy coding follows the reference's BMI2 builds: packed Huffman
+    codes with its two-container loop, interleaved histograms, the fast FSE
+    spread, and 16-byte literal copies.
+  - Per call: block states swap instead of copying, and tables are reused
+    whenever indices continue, as `ZSTD_reset_matchState` does.
+- XXH64 stays scalar: an AVX2 kernel measured 1.8x slower (no 64-bit
+  vector multiply); the scalar code matches the reference's throughput.
 
 ## [v0.1.0](https://github.com/M-Compressors/mzstd/releases/tag/v0.1.0) - 2026-10-13
 

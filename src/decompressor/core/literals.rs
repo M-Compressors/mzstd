@@ -4,9 +4,17 @@
 //! Huffman-coded literals are regenerated into a reusable buffer. The
 //! Huffman table of the last `Compressed_Literals_Block` is kept for
 //! `Treeless_Literals_Block`s later in the same frame.
+//!
+//! Sequence execution copies literals in whole chunks, so every
+//! [`Literals`] view carries [`WILDCOPY_OVERLENGTH`] readable bytes past
+//! its end: raw literals are borrowed in place when the block holds that
+//! many more bytes after them, and copied into the buffer otherwise, as
+//! the reference does.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use super::copy::WILDCOPY_OVERLENGTH;
 use super::huffman::HuffmanTable;
 use crate::decompressor::InvalidDataKind;
 use crate::shared::format::EncodingType;
@@ -28,13 +36,47 @@ pub(crate) const fn encoding_type(bits: u8) -> EncodingType {
     }
 }
 
+/// A block's literals, followed by at least [`WILDCOPY_OVERLENGTH`]
+/// readable bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Literals<'a> {
+    /// The literals, then the slack.
+    pub(crate) bytes: &'a [u8],
+    /// How many leading bytes of `bytes` are literals.
+    pub(crate) len: usize,
+}
+
+impl<'a> Literals<'a> {
+    /// The literals themselves.
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &'a [u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 /// Literals state carried across the blocks of one frame.
 #[derive(Debug, Default)]
 pub(crate) struct LiteralsDecoder {
-    /// Table of the last Huffman-compressed literals block.
-    huffman: Option<HuffmanTable>,
-    /// Regenerated RLE or Huffman literals.
+    /// Table of the last Huffman-compressed literals block, allocated on
+    /// first use.
+    huffman: Option<Box<HuffmanTable>>,
+    /// Whether `huffman` holds a table `Treeless_Literals_Block`s may reuse.
+    has_table: bool,
+    /// Regenerated literals and their slack.
     buffer: Vec<u8>,
+}
+
+impl LiteralsDecoder {
+    /// The buffer cut to `size` literals and their slack; the caller
+    /// overwrites the literals. It only ever grows, so blocks of varying
+    /// sizes zero nothing but its new tail.
+    fn buffer(&mut self, size: usize) -> &mut [u8] {
+        let len = size + WILDCOPY_OVERLENGTH;
+        if self.buffer.len() < len {
+            self.buffer.resize(len, 0);
+        }
+        &mut self.buffer[..len]
+    }
 }
 
 /// Reads `N` little-endian header bytes into a `u32`.
@@ -52,25 +94,26 @@ impl LiteralsDecoder {
     /// Heap bytes held between blocks.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.buffer.capacity()
-            + self
-                .huffman
-                .as_ref()
-                .map_or(0, HuffmanTable::retained_bytes)
+            + self.huffman.as_ref().map_or(0, |table| {
+                size_of::<HuffmanTable>() + table.retained_bytes()
+            })
     }
 
-    /// Forgets the previous Huffman table at a frame start.
+    /// Forgets the previous Huffman table at a frame start, keeping its
+    /// allocation.
     pub(crate) fn reset(&mut self) {
-        self.huffman = None;
+        self.has_table = false;
     }
 
     /// Decodes the literals section at the start of a compressed block's
     /// `content`, returning the literals and the section's size.
-    #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
-    pub(crate) fn decode<'a>(
+    #[inline(always)]
+    pub(crate) fn decode<'a, S: fearless_simd::Simd>(
         &'a mut self,
+        simd: S,
         content: &'a [u8],
         block_max: usize,
-    ) -> Result<(&'a [u8], usize), InvalidDataKind> {
+    ) -> Result<(Literals<'a>, usize), InvalidDataKind> {
         let invalid = InvalidDataKind::LiteralsSection;
         if content.len() < MIN_COMPRESSED_BLOCK {
             return Err(invalid);
@@ -93,15 +136,34 @@ impl LiteralsDecoder {
                     let literals = content
                         .get(header_size..header_size + size)
                         .ok_or(invalid)?;
-                    return Ok((literals, header_size + size));
+                    let used = header_size + size;
+                    if content.len() - used >= WILDCOPY_OVERLENGTH {
+                        let bytes = &content[header_size..];
+                        return Ok((Literals { bytes, len: size }, used));
+                    }
+                    let buffer = self.buffer(size);
+                    buffer[..size].copy_from_slice(literals);
+                    return Ok((
+                        Literals {
+                            bytes: buffer,
+                            len: size,
+                        },
+                        used,
+                    ));
                 }
                 let &byte = content.get(header_size).ok_or(invalid)?;
-                self.buffer.clear();
-                self.buffer.resize(size, byte);
-                Ok((&self.buffer, header_size + 1))
+                let buffer = self.buffer(size);
+                buffer[..size].fill(byte);
+                Ok((
+                    Literals {
+                        bytes: buffer,
+                        len: size,
+                    },
+                    header_size + 1,
+                ))
             }
             kind @ (EncodingType::Compressed | EncodingType::Repeat) => {
-                if kind == EncodingType::Repeat && self.huffman.is_none() {
+                if kind == EncodingType::Repeat && !self.has_table {
                     return Err(invalid);
                 }
                 if content.len() < MIN_HUFFMAN_SECTION {
@@ -128,17 +190,28 @@ impl LiteralsDecoder {
                     .get(header_size..header_size + compressed)
                     .ok_or(invalid)?;
                 let streams = if kind == EncodingType::Compressed {
-                    let (table, used) = HuffmanTable::read(section)?;
-                    self.huffman = Some(table);
+                    self.has_table = false;
+                    let table = self.huffman.get_or_insert_with(Box::default);
+                    let used = table.read(section)?;
+                    self.has_table = true;
                     section.get(used..).ok_or(invalid)?
                 } else {
                     section
                 };
-                let table = self.huffman.as_ref().ok_or(invalid)?;
-                self.buffer.clear();
-                self.buffer.resize(size, 0);
-                table.decode_streams(streams, &mut self.buffer, four_streams)?;
-                Ok((&self.buffer, header_size + compressed))
+                let table = self.huffman.as_deref_mut().ok_or(invalid)?;
+                let len = size + WILDCOPY_OVERLENGTH;
+                if self.buffer.len() < len {
+                    self.buffer.resize(len, 0);
+                }
+                let buffer = &mut self.buffer[..len];
+                table.decode_streams(simd, streams, &mut buffer[..size], four_streams)?;
+                Ok((
+                    Literals {
+                        bytes: buffer,
+                        len: size,
+                    },
+                    header_size + compressed,
+                ))
             }
         }
     }
@@ -151,8 +224,11 @@ mod tests {
     fn decode(content: &[u8]) -> Result<(Vec<u8>, usize), InvalidDataKind> {
         let mut decoder = LiteralsDecoder::default();
         decoder
-            .decode(content, 1 << 17)
-            .map(|(literals, used)| (literals.to_vec(), used))
+            .decode(fearless_simd::Fallback::new(), content, 1 << 17)
+            .map(|(literals, used)| {
+                assert!(literals.bytes.len() >= literals.len + WILDCOPY_OVERLENGTH);
+                (literals.as_slice().to_vec(), used)
+            })
     }
 
     #[test]
@@ -190,7 +266,9 @@ mod tests {
     fn sizes_beyond_the_block_or_the_content_are_rejected() {
         let mut decoder = LiteralsDecoder::default();
         assert_eq!(
-            decoder.decode(&[4 << 3, 0, 0, 0, 0], 3).map(|_| ()),
+            decoder
+                .decode(fearless_simd::Fallback::new(), &[4 << 3, 0, 0, 0, 0], 3)
+                .map(|_| ()),
             Err(InvalidDataKind::LiteralsSection)
         );
         assert_eq!(decode(&[9 << 3, 1]), Err(InvalidDataKind::LiteralsSection));
@@ -237,15 +315,19 @@ mod tests {
         content.extend_from_slice(&tree);
         content.push(stream);
         let mut decoder = LiteralsDecoder::default();
-        let (literals, used) = decoder.decode(&content, 1 << 17).expect("valid");
-        assert_eq!(literals, [0, 1]);
+        let (literals, used) = decoder
+            .decode(fearless_simd::Fallback::new(), &content, 1 << 17)
+            .expect("valid");
+        assert_eq!(literals.as_slice(), [0, 1]);
         assert_eq!(used, 8);
         // A treeless block reuses the table.
         let header = 3 | (2 << 4) | (1 << 14);
         let bytes = u32::to_le_bytes(header);
         let treeless = [bytes[0], bytes[1], bytes[2], stream, 0];
-        let (literals, used) = decoder.decode(&treeless, 1 << 17).expect("valid");
-        assert_eq!(literals, [0, 1]);
+        let (literals, used) = decoder
+            .decode(fearless_simd::Fallback::new(), &treeless, 1 << 17)
+            .expect("valid");
+        assert_eq!(literals.as_slice(), [0, 1]);
         assert_eq!(used, 4);
         // Size formats 10 and 11 read 14- and 18-bit fields. A six-byte
         // section holds only the jump table, so its streams are missing.
@@ -253,7 +335,9 @@ mod tests {
         let mut wide = u32::to_le_bytes(header).to_vec();
         wide.extend_from_slice(&[1, 0, 1, 0, 1, 0]);
         assert_eq!(
-            decoder.decode(&wide, 1 << 17).map(|_| ()),
+            decoder
+                .decode(fearless_simd::Fallback::new(), &wide, 1 << 17)
+                .map(|_| ()),
             Err(InvalidDataKind::HuffmanStream)
         );
         let header = 3 | (3 << 2) | (6 << 4) | (10 << 22);
@@ -265,8 +349,10 @@ mod tests {
         // stream decodes nothing, so its marker byte alone is exhausted
         // only when it is 0x01.
         *widest.last_mut().expect("stream") = 0x01;
-        let (literals, used) = decoder.decode(&widest, 1 << 17).expect("valid");
-        assert_eq!(literals, [0, 1, 0, 1, 0, 1]);
+        let (literals, used) = decoder
+            .decode(fearless_simd::Fallback::new(), &widest, 1 << 17)
+            .expect("valid");
+        assert_eq!(literals.as_slice(), [0, 1, 0, 1, 0, 1]);
         assert_eq!(used, 15);
     }
 
