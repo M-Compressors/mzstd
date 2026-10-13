@@ -80,25 +80,6 @@ fn drive(
     }
 }
 
-/// What a decoder makes of a frame that may stop after a flush.
-fn decode_prefix(frame: &[u8]) -> Vec<u8> {
-    let mut decoder = mzstd::Decompressor::default();
-    let mut session = decoder.start();
-    let mut content = Vec::new();
-    let mut buffer = vec![0u8; 1 << 16];
-    let mut input = frame;
-    loop {
-        let progress = session
-            .process(input, &mut buffer, mzstd::DecodeOperation::Process)
-            .unwrap();
-        input = &input[progress.consumed..];
-        content.extend_from_slice(&buffer[..progress.produced]);
-        if progress.status != mzstd::DecoderStatus::NeedsOutput {
-            return content;
-        }
-    }
-}
-
 fn stream(
     compressor: &mut ParallelCompressor,
     stream: StreamConfig,
@@ -347,7 +328,8 @@ fn input_short_of_the_declared_size_fails_at_the_end() {
 #[test]
 fn a_flush_makes_everything_accepted_decodable() {
     let input = corpus::text(3 * SEGMENT, 9);
-    let mut compressor = compressor(3, true);
+    // Without a checksum, an empty last block completes the flushed frame.
+    let mut compressor = compressor(3, false);
     let (mut session, queue) = compressor.start(StreamConfig::default(), window(2));
     let mut out = vec![0u8; 1 << 20];
     // Nothing accepted: nothing to flush.
@@ -357,7 +339,11 @@ fn a_flush_makes_everything_accepted_decodable() {
     let head = &input[..SEGMENT + 100];
     let flushed = drive(&mut session, &queue, head, 10_000, 333, Operation::Flush);
     // Everything accepted so far decodes from what was delivered.
-    assert_eq!(decode_prefix(&flushed), head);
+    let terminated = [&flushed[..], &[1, 0, 0]].concat();
+    assert_eq!(
+        zstd_ffi::oracle::decompress_stream(&terminated, 4096, None).unwrap(),
+        head
+    );
     let rest = drive(
         &mut session,
         &queue,
