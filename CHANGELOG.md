@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `mzstd` and `mzstd-ffi` are now dual-licensed under MIT or
+  Apache-2.0, at your option. The MIT text moved from `LICENSE` to
+  `LICENSE-MIT`, and `LICENSE-APACHE` was added.
+- The `CI Fuzz` workflow archives AFL's findings before uploading them:
+  `actions/upload-artifact` rejects AFL's file names, which contain `:`.
+
 ## [v0.1.0](https://github.com/M-Compressors/mzstd/releases/tag/v0.1.0) - 2026-10-13
 
 First version: a safe-Rust Zstandard encoder byte-identical to zstd 1.5.7,

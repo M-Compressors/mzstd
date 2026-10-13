@@ -39,9 +39,19 @@ jobs:
       - name: prepare seeds
         run: fuzz/afl/prepare-seeds.sh
       - name: fuzz
-        run: fuzz/afl/campaign.sh "${{ inputs.seconds || '600' }}" ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
+        run: fuzz/afl/campaign.sh "$SECONDS_PER_TARGET" ${{ matrix.target }}
+      # AFL names its files `id:000000,...`; upload-artifact rejects `:`, so
+      # the findings travel as one archive.
+      - name: archive findings
+        if: always()
+        run: |
+          if [ -d fuzz/afl/findings ]; then
+            tar -czf findings-${{ matrix.target }}.tar.gz -C fuzz/afl findings
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: findings-${{ matrix.target }}
-          path: fuzz/afl/findings
+          path: findings-${{ matrix.target }}.tar.gz
