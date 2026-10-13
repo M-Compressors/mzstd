@@ -1,19 +1,8 @@
-//! Safe Rust Zstandard (RFC 8878) codecs.
+//! Safe Rust Zstandard ([RFC 8878][rfc]) codecs.
 //!
 //! The encoder is a port of the reference implementation, zstd 1.5.7, and
 //! writes the same bytes it does; the decoder reads every frame RFC 8878
 //! defines apart from those that need a dictionary.
-//!
-//! `compression` and `decompression` are enabled by default. Disable default
-//! features and select either codec alongside `std` or `no_std` (which needs
-//! `alloc`):
-//!
-//! ```toml
-//! mzstd = { version = "0.1", default-features = false, features = ["std", "decompression"] }
-//! ```
-//!
-//! A disabled codec has no module and no re-exports. The `std::io` adapters
-//! and parallel compression need `std`.
 //!
 //! # Byte identity
 //!
@@ -30,79 +19,156 @@
 //! not those of the reference's multithreaded mode. Dictionaries, the
 //! magicless format, `targetCBlockSize` and external sequence producers are
 //! not supported.
+//!
+//! # Choose your API
+//!
+//! Compression and decompression expose the same core I/O shapes. Pick the shape that
+//! matches how your application already moves bytes. [`ParallelCompressor`] is a separate
+//! execution strategy for compression: it splits one frame into independent segments and
+//! hands them to your executor as tasks, either for a whole input at once or for input
+//! that arrives in chunks. Each codec requires its Cargo feature; reader/writer adapters
+//! and parallel compression are unavailable with `no_std`.
+//!
+//! | I/O shape | Compression | Decompression |
+//! | --- | --- | --- |
+//! | Return a new `Vec<u8>` | [`Compressor::compress`][compressor-compress] | [`Decompressor::decompress`][decompressor-decompress] |
+//! | Append to an existing Vec | [`compress_into`][compressor-compress-into] | [`decompress_into`][decompressor-decompress-into] |
+//! | Write into a caller-owned slice | [`compress_to_slice`][compressor-compress-to-slice], [`compress_to_uninit`][compressor-compress-to-uninit] | [`decompress_to_slice`][decompressor-decompress-to-slice] |
+//! | Pull output through `std::io::Read` | [`Compressor::reader`][compressor-reader] | [`Decompressor::reader`][decompressor-reader] |
+//! | Push input through `std::io::Write` | [`Compressor::writer`][compressor-writer] | [`Decompressor::writer`][decompressor-writer] |
+//! | Drive input/output incrementally | [`start`][compressor-start] → [`EncoderSession`] | [`start`][decompressor-start] → [`DecoderSession`] |
+//! | Same, with the session owning the codec | [`into_session`][compressor-into-session] → [`EncoderSessionOwned`] | [`into_session`][decompressor-into-session] → [`DecoderSessionOwned`] |
+//! | Split one known input across your threads | [`prepare_slice`][parallel-prepare-slice] → [`ScopedParallelBatch`] | — |
+//! | Stream chunked input across your threads | [`start`][parallel-start] → [`ParallelEncoderSession`] + [`ParallelTaskQueue`] | — |
+//!
+//! [`EncoderConfig`] selects the level and frame flags, and
+//! [`CompressionParams`] overrides individual parameters exactly as
+//! `ZSTD_CCtx_setParameter` would. [`DecodeLimits`] bound the window, input
+//! and output, so untrusted frames cannot make the decoder allocate without
+//! limit.
+//!
+//! ```
+//! # #[cfg(all(feature = "compression", feature = "decompression"))]
+//! # {
+//! use mzstd::{Compressor, Decompressor, EncoderConfig, Level};
+//!
+//! let mut encoder = Compressor::new(EncoderConfig::default().with_level(Level::try_from(19)?))?;
+//! let payload = "the quick brown fox ".repeat(500);
+//! let compressed = encoder.compress(payload.as_bytes())?;
+//! assert!(compressed.len() < payload.len() / 50);
+//! assert_eq!(Decompressor::default().decompress(&compressed)?, payload.as_bytes());
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Select only the codecs you need
+//!
+//! The default feature set is `std`, `compression`, and `decompression`. Disable default
+//! features to select one codec, alongside `std` or `no_std` (which needs `alloc`):
+//!
+//! ```toml
+//! mzstd = { version = "0.1", default-features = false, features = ["std", "decompression"] }
+//! ```
+//!
+//! A disabled codec has no module and no re-exports. The `std::io` adapters
+//! and parallel compression need `std`.
+//!
+//! [rfc]: https://www.rfc-editor.org/rfc/rfc8878
+// Resolve available APIs locally; unavailable APIs link to feature selection.
 #![cfg_attr(
     feature = "compression",
     doc = r#"
-# Compression
-
-| I/O shape | API |
-| --- | --- |
-| Return a new `Vec<u8>` | [`Compressor::compress`] |
-| Append to an existing `Vec` | [`Compressor::compress_into`] |
-| Write into a caller-owned slice | [`Compressor::compress_to_slice`], [`Compressor::compress_to_uninit`] |
-| Drive input and output incrementally | [`Compressor::start`] → [`EncoderSession`] |
-| Same, with the session owning the compressor | [`Compressor::into_session`] → [`EncoderSessionOwned`] |
-
-```
-use mzstd::{Compressor, EncoderConfig, Level};
-
-let mut encoder = Compressor::new(EncoderConfig::default().with_level(Level::try_from(19)?))?;
-let payload = "the quick brown fox ".repeat(500);
-let compressed = encoder.compress(payload.as_bytes())?;
-assert!(compressed.len() < payload.len() / 50);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-[`EncoderConfig`] selects the level and frame flags, and
-[`CompressionParams`] overrides individual parameters exactly as
-`ZSTD_CCtx_setParameter` would.
+[compressor-compress]: crate::Compressor::compress
+[compressor-compress-into]: crate::Compressor::compress_into
+[compressor-compress-to-slice]: crate::Compressor::compress_to_slice
+[compressor-compress-to-uninit]: crate::Compressor::compress_to_uninit
+[compressor-start]: crate::Compressor::start
+[`EncoderSession`]: crate::EncoderSession
+[compressor-into-session]: crate::Compressor::into_session
+[`EncoderSessionOwned`]: crate::EncoderSessionOwned
+[`EncoderConfig`]: crate::EncoderConfig
+[`CompressionParams`]: crate::CompressionParams
+"#
+)]
+#![cfg_attr(
+    not(feature = "compression"),
+    doc = r#"
+[compressor-compress]: #select-only-the-codecs-you-need
+[compressor-compress-into]: #select-only-the-codecs-you-need
+[compressor-compress-to-slice]: #select-only-the-codecs-you-need
+[compressor-compress-to-uninit]: #select-only-the-codecs-you-need
+[compressor-start]: #select-only-the-codecs-you-need
+[`EncoderSession`]: #select-only-the-codecs-you-need
+[compressor-into-session]: #select-only-the-codecs-you-need
+[`EncoderSessionOwned`]: #select-only-the-codecs-you-need
+[`EncoderConfig`]: #select-only-the-codecs-you-need
+[`CompressionParams`]: #select-only-the-codecs-you-need
 "#
 )]
 #![cfg_attr(
     feature = "decompression",
     doc = r#"
-# Decompression
-
-| I/O shape | API |
-| --- | --- |
-| Return a new `Vec<u8>` | [`Decompressor::decompress`] |
-| Append to an existing `Vec` | [`Decompressor::decompress_into`] |
-| Write into a caller-owned slice | [`Decompressor::decompress_to_slice`] |
-| Drive input and output incrementally | [`Decompressor::start`] → [`DecoderSession`] |
-| Same, with the session owning the decompressor | [`Decompressor::into_session`] → [`DecoderSessionOwned`] |
-
-[`DecodeLimits`] bound the window, input and output, so untrusted frames
-cannot make the decoder allocate without limit.
+[decompressor-decompress]: crate::Decompressor::decompress
+[decompressor-decompress-into]: crate::Decompressor::decompress_into
+[decompressor-decompress-to-slice]: crate::Decompressor::decompress_to_slice
+[decompressor-start]: crate::Decompressor::start
+[`DecoderSession`]: crate::DecoderSession
+[decompressor-into-session]: crate::Decompressor::into_session
+[`DecoderSessionOwned`]: crate::DecoderSessionOwned
+[`DecodeLimits`]: crate::DecodeLimits
 "#
 )]
 #![cfg_attr(
-    all(feature = "compression", feature = "decompression"),
+    not(feature = "decompression"),
     doc = r#"
-```
-use mzstd::{Compressor, Decompressor};
-
-let payload = b"round trip, round trip, round trip";
-let compressed = Compressor::default().compress(payload)?;
-assert_eq!(Decompressor::default().decompress(&compressed)?, payload);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
+[decompressor-decompress]: #select-only-the-codecs-you-need
+[decompressor-decompress-into]: #select-only-the-codecs-you-need
+[decompressor-decompress-to-slice]: #select-only-the-codecs-you-need
+[decompressor-start]: #select-only-the-codecs-you-need
+[`DecoderSession`]: #select-only-the-codecs-you-need
+[decompressor-into-session]: #select-only-the-codecs-you-need
+[`DecoderSessionOwned`]: #select-only-the-codecs-you-need
+[`DecodeLimits`]: #select-only-the-codecs-you-need
 "#
 )]
 #![cfg_attr(
     all(feature = "compression", not(feature = "no_std")),
     doc = r#"
-# Streams and threads
-
-[`Compressor::reader`] and [`Compressor::writer`] adapt the encoder to
-`std::io`, and [`compressor::parallel::ParallelCompressor`] splits one
-frame into segments compressed as independent tasks on your executor.
+[compressor-reader]: crate::Compressor::reader
+[compressor-writer]: crate::Compressor::writer
+[`ParallelCompressor`]: crate::compressor::parallel::ParallelCompressor
+[parallel-prepare-slice]: crate::compressor::parallel::ParallelCompressor::prepare_slice
+[`ScopedParallelBatch`]: crate::compressor::parallel::ScopedParallelBatch
+[parallel-start]: crate::compressor::parallel::ParallelCompressor::start
+[`ParallelEncoderSession`]: crate::compressor::parallel::ParallelEncoderSession
+[`ParallelTaskQueue`]: crate::compressor::parallel::ParallelTaskQueue
+"#
+)]
+#![cfg_attr(
+    not(all(feature = "compression", not(feature = "no_std"))),
+    doc = r#"
+[compressor-reader]: #select-only-the-codecs-you-need
+[compressor-writer]: #select-only-the-codecs-you-need
+[`ParallelCompressor`]: #select-only-the-codecs-you-need
+[parallel-prepare-slice]: #select-only-the-codecs-you-need
+[`ScopedParallelBatch`]: #select-only-the-codecs-you-need
+[parallel-start]: #select-only-the-codecs-you-need
+[`ParallelEncoderSession`]: #select-only-the-codecs-you-need
+[`ParallelTaskQueue`]: #select-only-the-codecs-you-need
 "#
 )]
 #![cfg_attr(
     all(feature = "decompression", not(feature = "no_std")),
     doc = r#"
-[`Decompressor::reader`] and [`Decompressor::writer`] adapt the decoder to
-`std::io`; the adapters live in [`io`].
+[decompressor-reader]: crate::Decompressor::reader
+[decompressor-writer]: crate::Decompressor::writer
+"#
+)]
+#![cfg_attr(
+    not(all(feature = "decompression", not(feature = "no_std"))),
+    doc = r#"
+[decompressor-reader]: #select-only-the-codecs-you-need
+[decompressor-writer]: #select-only-the-codecs-you-need
 "#
 )]
 #![cfg_attr(feature = "no_std", no_std)]

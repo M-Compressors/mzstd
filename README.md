@@ -41,16 +41,6 @@ assert_eq!(restored, b"hello, hello, hello");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-| I/O shape | Compression | Decompression |
-| --- | --- | --- |
-| New `Vec<u8>` | `Compressor::compress` | `Decompressor::decompress` |
-| Append to a `Vec` | `compress_into` | `decompress_into` |
-| Caller-owned slice | `compress_to_slice`, `compress_to_uninit` | `decompress_to_slice` |
-| Incremental | `start` → `EncoderSession` | `start` → `DecoderSession` |
-| Incremental, owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
-| `std::io` | `Compressor::reader` / `writer` | `Decompressor::reader` / `writer` |
-| Across threads | `compressor::parallel::ParallelCompressor` | — |
-
 Explicit parameters override the level just as `ZSTD_CCtx_setParameter` does:
 
 ```rust
@@ -64,6 +54,26 @@ let config = EncoderConfig::default()
 let mut encoder = Compressor::new(config)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Choose your API
+
+Compression and decompression expose the same core I/O shapes. Pick the shape that
+matches how your application already moves bytes. `ParallelCompressor` (in
+`mzstd::compressor::parallel`) is a separate execution strategy for compression: it
+splits one frame into independent segments and hands them to your executor as tasks,
+either for a whole input at once or for input that arrives in chunks. It requires `std`.
+
+| I/O shape | Compression | Decompression |
+| --- | --- | --- |
+| Return a new `Vec<u8>` | `Compressor::compress` | `Decompressor::decompress` |
+| Append to an existing Vec | `compress_into` | `decompress_into` |
+| Write into a caller-owned slice | `compress_to_slice`, `compress_to_uninit` | `decompress_to_slice` |
+| Pull output through `std::io::Read` | `Compressor::reader` | `Decompressor::reader` |
+| Push input through `std::io::Write` | `Compressor::writer` | `Decompressor::writer` |
+| Drive input/output incrementally | `start` → `EncoderSession` | `start` → `DecoderSession` |
+| Same, with the session owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
+| Split one known input across your threads | `ParallelCompressor::prepare_slice` → `ScopedParallelBatch` | — |
+| Stream chunked input across your threads | `ParallelCompressor::start` → `ParallelEncoderSession` + `ParallelTaskQueue` | — |
 
 ## Features
 

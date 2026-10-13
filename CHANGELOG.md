@@ -5,6 +5,10 @@
 - `mzstd` and `mzstd-ffi` are now dual-licensed under MIT or
   Apache-2.0, at your option. The MIT text moved from `LICENSE` to
   `LICENSE-MIT`, and `LICENSE-APACHE` was added.
+- The README and crate docs have one "Choose your API" table covering
+  both codecs, the `std::io` adapters and `ParallelCompressor`
+  (`prepare_slice`, `start`). In the crate docs it renders for every feature
+  set; APIs a build leaves out link to the feature-selection section.
 - The `CI Fuzz` workflow archives AFL's findings before uploading them:
   `actions/upload-artifact` rejects AFL's file names, which contain `:`.
 
