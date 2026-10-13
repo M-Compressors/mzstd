@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.1.0](https://github.com/M-Compressors/mbrotli/releases/tag/v0.1.0) - 2026-10-13
+## [v0.1.0](https://github.com/M-Compressors/mzstd/releases/tag/v0.1.0) - 2026-10-13
 
 First version: a safe-Rust Zstandard encoder byte-identical to zstd 1.5.7,
 an independent RFC 8878 decoder, parallel compression, and a C ABI.
