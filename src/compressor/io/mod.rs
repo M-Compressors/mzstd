@@ -3,7 +3,7 @@
 mod reader;
 mod writer;
 
-pub use reader::EncoderReader;
+pub use reader::{EncoderReader, EncoderReaderParts};
 pub use writer::EncoderWriter;
 
 use std::io::{Read, Write};

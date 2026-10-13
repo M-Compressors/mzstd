@@ -31,23 +31,28 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-pub(crate) mod core;
+mod core;
+mod error;
+mod io;
+mod session;
 
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 
-use thiserror::Error;
+pub use error::ParallelEncodeError;
+pub use io::{ParallelEncoderReader, ParallelEncoderWriter};
+pub use session::{
+    OwnedParallelTask, ParallelEncoderSession, ParallelEncoderSessionOwned, ParallelEncoderStatus,
+    ParallelProgress, ParallelTaskQueue, ParallelTasks,
+};
 
-use self::core::{FramePlan, compress_segment};
+use self::core::{EnginePool, FramePlan, compress_segment, compress_serial, lock};
 use super::config::{ConfigError, EncoderConfig, Parameter};
-use super::core::cctx::{Engine, RequestedParams, compress_bound};
+use super::core::cctx::RequestedParams;
 use super::error::EncodeError;
 use super::internal::requested_params;
-use super::session::{InputSize, StreamConfig};
 use crate::shared::xxhash::Xxh64;
 
 /// Size of the segments a frame is cut into.
@@ -190,70 +195,6 @@ impl ParallelConfig {
     }
 }
 
-/// Error of a parallel compression.
-///
-/// # Examples
-///
-/// ```
-/// use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig, ParallelEncodeError, TaskCount};
-///
-/// let mut compressor = ParallelCompressor::new(Default::default(), ParallelConfig::default())?;
-/// let input = vec![1u8; 9 << 20];
-/// let mut session = compressor.start(mzstd::InputSize::Exact(4).into());
-/// assert!(matches!(
-///     session.push(&input),
-///     Err(ParallelEncodeError::InputSizeMismatch { declared: 4, .. })
-/// ));
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Error, Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ParallelEncodeError {
-    /// A segment failed to compress.
-    #[error("a segment failed to compress")]
-    Encode(#[from] EncodeError),
-    /// The input does not match the declared size.
-    #[error("the stream was declared as {declared} bytes but received {actual}")]
-    InputSizeMismatch {
-        /// The declared size.
-        declared: u64,
-        /// The bytes received.
-        actual: u64,
-    },
-    /// The session has already finished or failed.
-    #[error("the session cannot accept this operation in its current state")]
-    InvalidState,
-}
-
-/// Engines shared by the tasks of one compressor.
-#[derive(Debug, Default)]
-struct EnginePool {
-    engines: Mutex<Vec<Box<Engine>>>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl EnginePool {
-    fn take(&self) -> Box<Engine> {
-        lock(&self.engines)
-            .pop()
-            .unwrap_or_else(|| Box::new(Engine::empty()))
-    }
-
-    fn give(&self, engine: Box<Engine>) {
-        lock(&self.engines).push(engine);
-    }
-
-    fn retained_bytes(&self) -> usize {
-        lock(&self.engines)
-            .iter()
-            .map(|engine| engine.retained_bytes())
-            .sum()
-    }
-}
-
 /// A compressor that splits a frame across caller-run tasks.
 ///
 /// # Examples
@@ -310,7 +251,7 @@ impl ParallelCompressor {
 
     /// Releases every idle engine.
     pub fn release(&mut self) {
-        lock(&self.pool.engines).clear();
+        self.pool.release();
     }
 
     /// Plans the compression of `input` into at most `tasks` tasks.
@@ -332,8 +273,11 @@ impl ParallelCompressor {
                     input,
                 },
                 index: 0,
+                segment: 0,
                 shared: Arc::clone(&shared),
                 pool: Arc::clone(&self.pool),
+                running: false,
+                published: false,
             };
             return ScopedParallelBatch {
                 tasks: vec![task],
@@ -361,8 +305,11 @@ impl ParallelCompressor {
                     segment,
                 },
                 index: t,
+                segment: first as u64,
                 shared: Arc::clone(&shared),
                 pool: Arc::clone(&self.pool),
+                running: false,
+                published: false,
             });
             first += count;
         }
@@ -380,55 +327,14 @@ impl ParallelCompressor {
     ///
     /// # Errors
     ///
-    /// [`ParallelEncodeError::Encode`] when a segment fails.
+    /// [`ParallelEncodeError::BatchFailed`] when a segment fails.
     pub fn compress(&mut self, input: &[u8]) -> Result<Vec<u8>, ParallelEncodeError> {
         self.prepare_slice(input, TaskCount::ONE).finish()
-    }
-
-    /// Starts a frame whose input arrives in chunks.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig};
-    ///
-    /// let mut compressor = ParallelCompressor::new(Default::default(), ParallelConfig::default())?;
-    /// let mut session = compressor.start(Default::default());
-    /// let queue = session.queue();
-    /// session.push(&vec![3u8; 5 << 20])?;
-    /// while let Some(task) = queue.next_task() {
-    ///     task.run();
-    /// }
-    /// let mut frame = Vec::new();
-    /// session.finish_into(&mut frame)?;
-    /// assert!(!frame.is_empty());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn start(&mut self, stream: StreamConfig) -> ParallelEncoderSession<'_> {
-        let declared = match stream.input_size() {
-            InputSize::Exact(size) => Some(size),
-            InputSize::Unknown => None,
-        };
-        let plan = FramePlan::new(&self.requested, declared);
-        ParallelEncoderSession {
-            compressor: self,
-            plan,
-            declared,
-            queue: ParallelTaskQueue::default(),
-            pending: Vec::new(),
-            overlap: Vec::new(),
-            received: 0,
-            hasher: Xxh64::new(0),
-            next_segment: 0,
-            delivered: 0,
-            header_written: false,
-            state: SessionState::Open,
-        }
     }
 }
 
 /// One task's result: its index and its blocks.
-type Slot = (usize, Result<Vec<u8>, EncodeError>);
+type Slot = (usize, Result<Vec<u8>, ParallelEncodeError>);
 
 /// Results of a batch, one slot per task.
 #[derive(Debug, Default)]
@@ -455,36 +361,30 @@ enum Work<'a> {
 }
 
 /// One unit of work of a batch; run it on any thread.
+///
+/// Dropping it unrun makes [`ScopedParallelBatch::finish`] report
+/// [`ParallelEncodeError::TaskAbandoned`], and a panic while it runs
+/// [`ParallelEncodeError::TaskPanicked`]; the panic itself still unwinds.
 #[derive(Debug)]
 pub struct ScopedParallelTask<'a> {
     work: Work<'a>,
     index: usize,
+    /// The first segment the task covers.
+    segment: u64,
     shared: Arc<BatchShared>,
     pool: Arc<EnginePool>,
+    /// Whether compression has started, so an unwinding drop reports a panic.
+    running: bool,
+    published: bool,
 }
 
 impl ScopedParallelTask<'_> {
     /// Compresses this task's segments.
-    pub fn run(self) {
+    pub fn run(mut self) {
+        self.running = true;
         let mut engine = self.pool.take();
-        let result = match self.work {
-            Work::Serial { requested, input } => {
-                let bound = compress_bound(input.len()).unwrap_or(0);
-                let mut out = vec![0u8; bound];
-                match super::core::compress_once_into(&mut engine, &requested, input, 1, &mut out) {
-                    Ok(size) => {
-                        out.truncate(size);
-                        Ok(out)
-                    }
-                    // The destination holds any frame, so this arm is a core
-                    // bug reported as an error rather than a panic.
-                    Err(error) => Err(EncodeError::from_core(
-                        error,
-                        bound,
-                        Some(input.len() as u64),
-                    )),
-                }
-            }
+        let result = match &self.work {
+            Work::Serial { requested, input } => compress_serial(&mut engine, requested, input),
             Work::Segments {
                 plan,
                 input,
@@ -495,11 +395,11 @@ impl ScopedParallelTask<'_> {
                 let overlap = plan.overlap();
                 let mut out = Vec::new();
                 let mut result = Ok(());
-                for s in first..first + count {
+                for s in *first..first + count {
                     let start = s * segment;
                     let end = (start + segment).min(input.len());
                     let from = start.saturating_sub(overlap);
-                    match compress_segment(&mut engine, &plan, &input[from..end], start - from) {
+                    match compress_segment(&mut engine, plan, &input[from..end], start - from) {
                         Ok(bytes) => out.extend_from_slice(&bytes),
                         Err(error) => {
                             result = Err(EncodeError::from_core(error, 0, None));
@@ -510,8 +410,27 @@ impl ScopedParallelTask<'_> {
                 result.map(|()| out)
             }
         };
+        // An engine that unwound is dropped instead of being returned here.
         self.pool.give(engine);
+        self.publish(result.map_err(ParallelEncodeError::from));
+    }
+
+    fn publish(&mut self, result: Result<Vec<u8>, ParallelEncodeError>) {
+        self.published = true;
         lock(&self.shared.slots).push((self.index, result));
+    }
+}
+
+impl Drop for ScopedParallelTask<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let segment = self.segment;
+            self.publish(Err(if self.running {
+                ParallelEncodeError::TaskPanicked { segment }
+            } else {
+                ParallelEncodeError::TaskAbandoned { segment }
+            }));
+        }
     }
 }
 
@@ -540,15 +459,34 @@ impl<'a> ScopedParallelBatch<'a> {
     ///
     /// # Errors
     ///
-    /// [`ParallelEncodeError::InvalidState`] when taken tasks were dropped
-    /// without running, and the failure of a task.
+    /// [`ParallelEncodeError::BatchFailed`] with the failure of the first
+    /// failing task as its source: a segment that failed to compress
+    /// ([`ParallelEncodeError::Encode`]), a task dropped without running
+    /// ([`ParallelEncodeError::TaskAbandoned`]) or one that panicked
+    /// ([`ParallelEncodeError::TaskPanicked`]).
+    /// [`ParallelEncodeError::InvalidState`] when a task was leaked and never
+    /// reported.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig, ParallelEncodeError, TaskCount};
+    ///
+    /// let mut compressor = ParallelCompressor::new(Default::default(), ParallelConfig::default())?;
+    /// let input = vec![5u8; 9 << 20];
+    /// let mut batch = compressor.prepare_slice(&input, TaskCount::try_from(2)?);
+    /// drop(batch.take_tasks());
+    /// let Err(ParallelEncodeError::BatchFailed(cause)) = batch.finish() else { unreachable!() };
+    /// assert_eq!(*cause, ParallelEncodeError::TaskAbandoned { segment: 0 });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn finish(self) -> Result<Vec<u8>, ParallelEncodeError> {
         let mut out = Vec::new();
         self.finish_into(&mut out)?;
         Ok(out)
     }
 
-    /// Appends the frame to `out`.
+    /// Appends the frame to `out`; on failure `out` is left as it was.
     ///
     /// # Errors
     ///
@@ -562,23 +500,19 @@ impl<'a> ScopedParallelBatch<'a> {
             return Err(ParallelEncodeError::InvalidState);
         }
         slots.sort_by_key(|(index, _)| *index);
-        if self.serial {
-            for (_, result) in slots {
-                out.extend_from_slice(&result?);
-            }
-            return Ok(());
-        }
-        let start = out.len();
-        out.extend_from_slice(&self.plan.header());
+        let mut parts = Vec::with_capacity(slots.len());
         for (_, result) in slots {
             match result {
-                Ok(bytes) => out.extend_from_slice(&bytes),
-                Err(error) => {
-                    out.truncate(start);
-                    return Err(error.into());
-                }
+                Ok(bytes) => parts.push(bytes),
+                Err(error) => return Err(ParallelEncodeError::BatchFailed(Arc::new(error))),
             }
         }
+        if self.serial {
+            parts.iter().for_each(|part| out.extend_from_slice(part));
+            return Ok(());
+        }
+        out.extend_from_slice(&self.plan.header());
+        parts.iter().for_each(|part| out.extend_from_slice(part));
         let mut hasher = Xxh64::new(0);
         if self.plan.applied.fparams.checksum {
             hasher.update(self.input);
@@ -588,269 +522,24 @@ impl<'a> ScopedParallelBatch<'a> {
     }
 }
 
-/// A segment compression queued by a streaming session.
-#[derive(Debug)]
-pub struct OwnedParallelTask {
-    plan: FramePlan,
-    data: Vec<u8>,
-    overlap: usize,
-    index: u64,
-    queue: Arc<QueueShared>,
-    pool: Arc<EnginePool>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Records a task's completion even when the task unwinds, so a session
-/// waiting for it is not left hanging.
-struct Completion<'q> {
-    queue: &'q QueueShared,
-    index: u64,
-    result: Option<Result<Vec<u8>, EncodeError>>,
-}
-
-impl Drop for Completion<'_> {
-    fn drop(&mut self) {
-        let result = self.result.take().unwrap_or(Err(EncodeError::Internal));
-        let mut state = lock(&self.queue.state);
-        state.running -= 1;
-        state.done.push((self.index, result));
-        self.queue.changed.notify_all();
-    }
-}
-
-impl OwnedParallelTask {
-    /// Compresses the segment.
-    pub fn run(self) {
-        let mut completion = Completion {
-            queue: &self.queue,
-            index: self.index,
-            result: None,
-        };
-        let mut engine = self.pool.take();
-        // Segments size their own buffers, so an error is a core bug
-        // reported rather than a panic.
-        let result = match compress_segment(&mut engine, &self.plan, &self.data, self.overlap) {
-            Ok(blocks) => Ok(blocks),
-            Err(error) => Err(EncodeError::from_core(error, 0, None)),
-        };
-        self.pool.give(engine);
-        completion.result = Some(result);
-    }
-}
-
-#[derive(Debug, Default)]
-struct QueueState {
-    queued: VecDeque<OwnedParallelTask>,
-    running: usize,
-    done: Vec<(u64, Result<Vec<u8>, EncodeError>)>,
-}
-
-#[derive(Debug, Default)]
-struct QueueShared {
-    state: Mutex<QueueState>,
-    changed: Condvar,
-}
-
-/// Where a streaming session's tasks wait to be run; clone it into worker
-/// threads.
-#[derive(Debug, Clone, Default)]
-pub struct ParallelTaskQueue {
-    shared: Arc<QueueShared>,
-}
-
-impl ParallelTaskQueue {
-    /// Takes the next queued task, if any.
-    #[must_use]
-    pub fn next_task(&self) -> Option<OwnedParallelTask> {
-        let mut state = lock(&self.shared.state);
-        let task = state.queued.pop_front()?;
-        state.running += 1;
-        Some(task)
-    }
-
-    /// Number of tasks queued and not yet taken.
-    #[must_use]
-    pub fn queued(&self) -> usize {
-        lock(&self.shared.state).queued.len()
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SessionState {
-    Open,
-    Finished,
-    Failed,
-}
-
-/// A parallel frame whose input arrives in chunks.
-///
-/// Every full segment becomes a task in the session's
-/// [`ParallelTaskQueue`]; finished segments are delivered in order by
-/// [`Self::drain_into`]. The caller bounds memory by running tasks and
-/// draining output as it pushes input; [`ParallelTaskQueue::queued`] reports
-/// the backlog.
-#[derive(Debug)]
-pub struct ParallelEncoderSession<'c> {
-    compressor: &'c mut ParallelCompressor,
-    plan: FramePlan,
-    declared: Option<u64>,
-    queue: ParallelTaskQueue,
-    /// Input of the segment being gathered.
-    pending: Vec<u8>,
-    /// The tail of earlier segments a new segment may reach into.
-    overlap: Vec<u8>,
-    received: u64,
-    hasher: Xxh64,
-    next_segment: u64,
-    delivered: u64,
-    header_written: bool,
-    state: SessionState,
-}
-
-impl ParallelEncoderSession<'_> {
-    /// The queue of this session's tasks.
-    #[must_use]
-    pub fn queue(&self) -> ParallelTaskQueue {
-        self.queue.clone()
-    }
-
-    fn enqueue_pending(&mut self) {
-        let overlap_len = self.overlap.len();
-        let mut data = Vec::with_capacity(overlap_len + self.pending.len());
-        data.extend_from_slice(&self.overlap);
-        data.extend_from_slice(&self.pending);
-        let keep = self.plan.overlap().min(data.len());
-        self.overlap = data[data.len() - keep..].to_vec();
-        self.pending.clear();
-        let task = OwnedParallelTask {
-            plan: self.plan,
-            data,
-            overlap: overlap_len,
-            index: self.next_segment,
-            queue: Arc::clone(&self.queue.shared),
-            pool: Arc::clone(&self.compressor.pool),
-        };
-        self.next_segment += 1;
-        lock(&self.queue.shared.state).queued.push_back(task);
-    }
-
-    /// Accepts input; every full segment is queued as a task.
-    ///
-    /// # Errors
-    ///
-    /// [`ParallelEncodeError::InvalidState`] after the session finished or
-    /// failed, and [`ParallelEncodeError::InputSizeMismatch`] beyond a
-    /// declared size, which fails the session.
-    pub fn push(&mut self, mut input: &[u8]) -> Result<(), ParallelEncodeError> {
-        if self.state != SessionState::Open {
-            return Err(ParallelEncodeError::InvalidState);
-        }
-        let received = self.received + input.len() as u64;
-        if let Some(declared) = self.declared
-            && received > declared
-        {
-            self.state = SessionState::Failed;
-            return Err(ParallelEncodeError::InputSizeMismatch {
-                declared,
-                actual: received,
-            });
-        }
-        self.received = received;
-        if self.plan.applied.fparams.checksum {
-            self.hasher.update(input);
-        }
-        let segment = self.compressor.parallel.segment_size.get();
-        while !input.is_empty() {
-            let take = (segment - self.pending.len()).min(input.len());
-            self.pending.extend_from_slice(&input[..take]);
-            input = &input[take..];
-            if self.pending.len() == segment {
-                self.enqueue_pending();
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs queued tasks on the calling thread until none is left.
-    pub fn run_queued(&self) {
-        while let Some(task) = self.queue.next_task() {
-            task.run();
-        }
-    }
-
-    /// Appends the frame header and every segment that is ready, in order,
-    /// to `out`; returns how many bytes were appended.
-    ///
-    /// # Errors
-    ///
-    /// The failure of a task, which fails the session.
-    pub fn drain_into(&mut self, out: &mut Vec<u8>) -> Result<usize, ParallelEncodeError> {
-        let start = out.len();
-        if !self.header_written {
-            out.extend_from_slice(&self.plan.header());
-            self.header_written = true;
-        }
-        let mut state = lock(&self.queue.shared.state);
-        state
-            .done
-            .sort_by_key(|(index, _)| ::core::cmp::Reverse(*index));
-        while state
-            .done
-            .last()
-            .is_some_and(|(index, _)| *index == self.delivered)
-        {
-            if let Some((_, result)) = state.done.pop() {
-                match result {
-                    Ok(bytes) => out.extend_from_slice(&bytes),
-                    Err(error) => {
-                        self.state = SessionState::Failed;
-                        return Err(error.into());
-                    }
-                }
-            }
-            self.delivered += 1;
-        }
-        Ok(out.len() - start)
-    }
-
-    /// Ends the frame: queues the last segment, runs whatever is still
-    /// queued on the calling thread, waits for tasks other threads are
-    /// running, and appends the rest of the frame to `out`.
-    ///
-    /// # Errors
-    ///
-    /// [`ParallelEncodeError::InputSizeMismatch`] when the input fell short
-    /// of a declared size, and the failure of a task.
-    pub fn finish_into(&mut self, out: &mut Vec<u8>) -> Result<(), ParallelEncodeError> {
-        if self.state != SessionState::Open {
-            return Err(ParallelEncodeError::InvalidState);
-        }
-        if let Some(declared) = self.declared
-            && self.received != declared
-        {
-            self.state = SessionState::Failed;
-            return Err(ParallelEncodeError::InputSizeMismatch {
-                declared,
-                actual: self.received,
-            });
-        }
-        if !self.pending.is_empty() {
-            self.enqueue_pending();
-        }
-        self.run_queued();
-        {
-            let mut state = lock(&self.queue.shared.state);
-            while state.running > 0 {
-                state = self
-                    .queue
-                    .shared
-                    .changed
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-        }
-        self.drain_into(out)?;
-        out.extend_from_slice(&self.plan.epilogue(&self.hasher));
-        self.state = SessionState::Finished;
-        Ok(())
+    #[test]
+    fn a_task_that_unwinds_reports_a_panic_to_its_batch() {
+        let mut compressor =
+            ParallelCompressor::new(EncoderConfig::default(), ParallelConfig::default()).unwrap();
+        let mut batch = compressor.prepare_slice(b"input", TaskCount::ONE);
+        let mut tasks = batch.take_tasks();
+        // What an unwinding `run` leaves behind: started, never published.
+        tasks[0].running = true;
+        drop(tasks);
+        assert_eq!(
+            batch.finish(),
+            Err(ParallelEncodeError::BatchFailed(Arc::new(
+                ParallelEncodeError::TaskPanicked { segment: 0 }
+            )))
+        );
     }
 }

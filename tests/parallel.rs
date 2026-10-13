@@ -5,7 +5,8 @@
 use mzstd::compressor::parallel::{
     ParallelCompressor, ParallelConfig, ParallelEncodeError, SegmentSize, TaskCount,
 };
-use mzstd::{Compressor, ConfigError, EncoderConfig, InputSize, Level, Parameter};
+use mzstd::{Compressor, ConfigError, EncoderConfig, Level, Parameter};
+use std::sync::Arc;
 use zstd_ffi::corpus;
 
 fn compressor(level: i32, checksum: bool) -> ParallelCompressor {
@@ -46,59 +47,6 @@ fn frames_are_independent_of_task_count_and_decode() {
             input
         );
     }
-}
-
-#[test]
-fn sessions_produce_the_batch_frame_for_a_declared_size() {
-    let input = corpus::text(1_500_000, 2);
-    let mut compressor = compressor(5, true);
-    let batch = threaded(&mut compressor, &input, 4);
-    let mut out = Vec::new();
-    {
-        let mut session = compressor.start(InputSize::Exact(input.len() as u64).into());
-        let queue = session.queue();
-        for chunk in input.chunks(100_003) {
-            session.push(chunk).unwrap();
-            while let Some(task) = queue.next_task() {
-                task.run();
-            }
-            session.drain_into(&mut out).unwrap();
-        }
-        session.finish_into(&mut out).unwrap();
-    }
-    assert_eq!(out, batch);
-}
-
-#[test]
-fn unknown_size_sessions_decode() {
-    let input = corpus::binary(900_000, 3);
-    let mut compressor = compressor(3, true);
-    let mut out = Vec::new();
-    let mut session = compressor.start(Default::default());
-    let queue = session.queue();
-    std::thread::scope(|scope| {
-        let worker = queue.clone();
-        let handle = scope.spawn(move || {
-            let mut ran = 0;
-            for _ in 0..200 {
-                while let Some(task) = worker.next_task() {
-                    task.run();
-                    ran += 1;
-                }
-                std::thread::yield_now();
-            }
-            ran
-        });
-        for chunk in input.chunks(50_000) {
-            session.push(chunk).unwrap();
-        }
-        session.finish_into(&mut out).unwrap();
-        handle.join().unwrap();
-    });
-    assert_eq!(
-        zstd_ffi::oracle::decompress_stream(&out, 4096, None).unwrap(),
-        input
-    );
 }
 
 #[test]
@@ -196,148 +144,6 @@ fn segment_sizes_outside_their_range_are_rejected() {
 }
 
 #[test]
-fn the_queue_reports_its_backlog() {
-    let mut compressor = compressor(1, false);
-    let mut session = compressor.start(Default::default());
-    let queue = session.queue();
-    assert_eq!(queue.queued(), 0);
-    session
-        .push(&corpus::text(3 * (256 << 10) + 10, 6))
-        .unwrap();
-    assert_eq!(queue.queued(), 3);
-    let task = queue.next_task().unwrap();
-    assert_eq!(queue.queued(), 2);
-    task.run();
-    session.run_queued();
-    assert_eq!(queue.queued(), 0);
-    assert!(queue.next_task().is_none());
-}
-
-#[test]
-fn every_queue_handle_shares_the_same_tasks() {
-    let mut compressor = compressor(1, false);
-    let mut session = compressor.start(Default::default());
-    let first = session.queue();
-    let second = session.queue();
-    session.push(&corpus::text(2 * (256 << 10), 7)).unwrap();
-    assert_eq!(second.queued(), 2);
-    first.next_task().unwrap().run();
-    assert_eq!(second.queued(), 1);
-    second.next_task().unwrap().run();
-    assert_eq!(first.queued(), 0);
-}
-
-#[test]
-fn streamed_segments_drain_in_order_whatever_order_tasks_ran_in() {
-    let input = corpus::mixed(4 * (256 << 10), 8);
-    let mut compressor = compressor(3, true);
-    let batch = threaded(&mut compressor, &input, 4);
-    let mut out = Vec::new();
-    let mut session = compressor.start(InputSize::Exact(input.len() as u64).into());
-    let queue = session.queue();
-    session.push(&input).unwrap();
-    let mut tasks: Vec<_> = std::iter::from_fn(|| queue.next_task()).collect();
-    // The last segment completes first; nothing after the header drains.
-    tasks.pop().unwrap().run();
-    let header = session.drain_into(&mut out).unwrap();
-    assert!(header > 0);
-    assert_eq!(session.drain_into(&mut out).unwrap(), 0);
-    for task in tasks.into_iter().rev() {
-        task.run();
-    }
-    assert!(session.drain_into(&mut out).unwrap() > 0);
-    session.finish_into(&mut out).unwrap();
-    assert_eq!(out, batch);
-}
-
-#[test]
-fn owned_tasks_run_on_other_threads() {
-    let input = corpus::text(3 * (256 << 10), 9);
-    let mut compressor = compressor(5, false);
-    let batch = threaded(&mut compressor, &input, 3);
-    let mut out = Vec::new();
-    let mut session = compressor.start(InputSize::Exact(input.len() as u64).into());
-    let queue = session.queue();
-    session.push(&input).unwrap();
-    let tasks: Vec<_> = std::iter::from_fn(|| queue.next_task()).collect();
-    assert_eq!(tasks.len(), 3);
-    std::thread::scope(|scope| {
-        for task in tasks {
-            scope.spawn(move || task.run());
-        }
-    });
-    session.finish_into(&mut out).unwrap();
-    assert_eq!(out, batch);
-}
-
-#[test]
-fn sessions_reject_input_beyond_the_declared_size() {
-    let mut compressor = compressor(1, false);
-    let mut session = compressor.start(InputSize::Exact(10).into());
-    session.push(b"0123456789").unwrap();
-    assert_eq!(
-        session.push(b"x"),
-        Err(ParallelEncodeError::InputSizeMismatch {
-            declared: 10,
-            actual: 11
-        })
-    );
-    assert_eq!(session.push(b""), Err(ParallelEncodeError::InvalidState));
-    assert_eq!(
-        session.finish_into(&mut Vec::new()),
-        Err(ParallelEncodeError::InvalidState)
-    );
-}
-
-#[test]
-fn sessions_reject_input_short_of_the_declared_size() {
-    let mut compressor = compressor(1, false);
-    let mut session = compressor.start(InputSize::Exact(10).into());
-    session.push(b"01234").unwrap();
-    let error = session.finish_into(&mut Vec::new()).unwrap_err();
-    assert_eq!(
-        error,
-        ParallelEncodeError::InputSizeMismatch {
-            declared: 10,
-            actual: 5
-        }
-    );
-    assert_eq!(
-        error.to_string(),
-        "the stream was declared as 10 bytes but received 5"
-    );
-}
-
-#[test]
-fn finished_sessions_reject_further_input() {
-    let mut compressor = compressor(1, false);
-    let mut session = compressor.start(Default::default());
-    session.push(b"payload").unwrap();
-    let mut out = Vec::new();
-    session.finish_into(&mut out).unwrap();
-    assert_eq!(session.push(b"x"), Err(ParallelEncodeError::InvalidState));
-    assert_eq!(
-        session.finish_into(&mut out),
-        Err(ParallelEncodeError::InvalidState)
-    );
-    assert_eq!(
-        zstd_ffi::oracle::decompress_stream(&out, 4096, None).unwrap(),
-        b"payload"
-    );
-}
-
-#[test]
-fn batches_with_dropped_tasks_report_invalid_state() {
-    let input = corpus::text(600_000, 10);
-    let mut compressor = compressor(1, false);
-    let mut batch = compressor.prepare_slice(&input, TaskCount::try_from(2).unwrap());
-    let tasks = batch.take_tasks();
-    assert_eq!(tasks.len(), 2);
-    drop(tasks);
-    assert_eq!(batch.finish(), Err(ParallelEncodeError::InvalidState));
-}
-
-#[test]
 fn batches_run_untaken_tasks_on_the_calling_thread() {
     let input = corpus::text(600_000, 11);
     let mut compressor = compressor(1, false);
@@ -371,4 +177,58 @@ fn a_single_segment_batch_is_one_serial_task() {
         }
     });
     assert_eq!(batch.finish().unwrap(), serial.compress(&input).unwrap());
+}
+
+#[test]
+fn batches_with_dropped_tasks_report_their_abandonment() {
+    let input = corpus::text(600_000, 10);
+    let mut compressor = compressor(1, false);
+    let mut batch = compressor.prepare_slice(&input, TaskCount::try_from(2).unwrap());
+    let mut tasks = batch.take_tasks();
+    assert_eq!(tasks.len(), 2);
+    tasks.remove(0).run();
+    drop(tasks);
+    let mut out = b"kept".to_vec();
+    let error = batch.finish_into(&mut out).unwrap_err();
+    // Three 256 KiB segments: the first task has two, the second one.
+    assert_eq!(
+        error,
+        ParallelEncodeError::BatchFailed(Arc::new(ParallelEncodeError::TaskAbandoned {
+            segment: 2
+        }))
+    );
+    assert_eq!(out, b"kept");
+    assert_eq!(error.to_string(), "the parallel batch failed");
+    let cause = std::error::Error::source(&error).unwrap();
+    assert_eq!(
+        cause.to_string(),
+        "the task for segment 2 was dropped without running"
+    );
+}
+
+#[test]
+fn a_dropped_serial_task_fails_its_batch() {
+    let mut compressor = compressor(1, false);
+    let mut batch = compressor.prepare_slice(b"short", TaskCount::ONE);
+    drop(batch.take_tasks());
+    assert_eq!(
+        batch.finish(),
+        Err(ParallelEncodeError::BatchFailed(Arc::new(
+            ParallelEncodeError::TaskAbandoned { segment: 0 }
+        )))
+    );
+}
+
+#[test]
+fn batches_with_leaked_tasks_report_invalid_state() {
+    let input = corpus::text(600_000, 14);
+    let mut compressor = compressor(1, false);
+    let mut batch = compressor.prepare_slice(&input, TaskCount::try_from(2).unwrap());
+    std::mem::forget(batch.take_tasks());
+    let error = batch.finish().unwrap_err();
+    assert_eq!(error, ParallelEncodeError::InvalidState);
+    assert_eq!(
+        error.to_string(),
+        "the batch cannot be assembled: a task never reported"
+    );
 }

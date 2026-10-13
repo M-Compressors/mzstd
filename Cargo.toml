@@ -50,6 +50,11 @@ harness = false
 required-features = ["compression"]
 
 [[bench]]
+name = "parallel"
+harness = false
+required-features = ["compression"]
+
+[[bench]]
 name = "decompress"
 harness = false
 required-features = ["decompression"]

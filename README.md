@@ -74,6 +74,8 @@ either for a whole input at once or for input that arrives in chunks. It require
 | Same, with the session owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
 | Split one known input across your threads | `ParallelCompressor::prepare_slice` → `ScopedParallelBatch` | — |
 | Stream chunked input across your threads | `ParallelCompressor::start` → `ParallelEncoderSession` + `ParallelTaskQueue` | — |
+| Same, with the session owning the compressor | `ParallelCompressor::into_session` → `ParallelEncoderSessionOwned` | — |
+| Push or pull through `std::io` across your threads | `ParallelCompressor::writer`, `ParallelCompressor::reader` | — |
 
 ## Features
 

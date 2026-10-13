@@ -11,16 +11,92 @@
 //! A segment's bytes depend only on the parameters, the overlap and the
 //! segment itself, so the frame is the same however many tasks produced it
 //! and in whatever order they ran.
+//!
+//! [`stream`] is the incremental form: input arrives in chunks, full
+//! segments become queued tasks, and finished parts are delivered in order.
 
+mod stream;
+
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub(crate) use stream::{QueueHandle, Stream, StreamTask};
 
 use crate::compressor::core::cctx::{AppliedParams, Engine, RequestedParams, compress_bound};
 use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::{CONTENT_SIZE_UNKNOWN, Strategy};
 use crate::compressor::core::window::{Addr, Segment, Segments};
+use crate::compressor::error::EncodeError;
 use crate::shared::format::{MAGIC_NUMBER, WINDOW_LOG_ABSOLUTE_MIN};
 use crate::shared::xxhash::Xxh64;
+
+/// Locks `mutex`, ignoring poisoning: only bookkeeping runs under these
+/// locks, never codec work, so a panic elsewhere cannot leave them torn.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Engines shared by the tasks of one compressor.
+#[derive(Debug, Default)]
+pub(crate) struct EnginePool {
+    engines: Mutex<Vec<Box<Engine>>>,
+}
+
+impl EnginePool {
+    /// An idle engine, or a new one.
+    pub(crate) fn take(&self) -> Box<Engine> {
+        lock(&self.engines)
+            .pop()
+            .unwrap_or_else(|| Box::new(Engine::empty()))
+    }
+
+    /// Returns an engine whose task completed.
+    pub(crate) fn give(&self, engine: Box<Engine>) {
+        lock(&self.engines).push(engine);
+    }
+
+    /// Bytes retained by idle engines.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        lock(&self.engines)
+            .iter()
+            .map(|engine| engine.retained_bytes())
+            .sum()
+    }
+
+    /// Drops every idle engine.
+    pub(crate) fn release(&self) {
+        lock(&self.engines).clear();
+    }
+}
+
+/// Compresses `input` as one serial frame, the bytes
+/// [`Compressor::compress`](crate::Compressor::compress) writes.
+///
+/// # Errors
+///
+/// None for valid input: the destination holds any frame, so a failure is a
+/// core bug reported rather than a panic.
+pub(crate) fn compress_serial(
+    engine: &mut Engine,
+    requested: &RequestedParams,
+    input: &[u8],
+) -> Result<Vec<u8>, EncodeError> {
+    let bound = compress_bound(input.len()).unwrap_or(0);
+    let mut out = vec![0u8; bound];
+    match crate::compressor::core::compress_once_into(engine, requested, input, 1, &mut out) {
+        Ok(size) => {
+            out.truncate(size);
+            Ok(out)
+        }
+        Err(error) => Err(EncodeError::from_core(
+            error,
+            bound,
+            Some(input.len() as u64),
+        )),
+    }
+}
 
 /// Parameters every segment of one frame shares.
 #[derive(Copy, Clone, Debug)]
@@ -189,5 +265,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_pool_reuses_and_releases_engines() {
+        let pool = EnginePool::default();
+        let mut engine = pool.take();
+        let frame = compress_serial(&mut engine, &RequestedParams::default(), b"pooled").unwrap();
+        assert_eq!(
+            zstd_ffi::oracle::decompress(&frame, 6).unwrap(),
+            b"pooled".to_vec()
+        );
+        pool.give(engine);
+        assert!(pool.retained_bytes() > 0);
+        pool.release();
+        assert_eq!(pool.retained_bytes(), 0);
     }
 }

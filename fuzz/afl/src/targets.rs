@@ -1,7 +1,12 @@
 //! Target bodies, shared by the AFL binaries and the regression replay.
 
-use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig, SegmentSize, TaskCount};
-use mzstd::{Compressor, EncodeError, EncoderStatus, InputSize, Operation};
+use std::mem::MaybeUninit;
+
+use mzstd::compressor::parallel::{
+    ParallelCompressor, ParallelConfig, ParallelEncoderStatus, SegmentSize, TaskCount,
+};
+use mzstd::io::FinishError;
+use mzstd::{Compressor, EncodeError, EncoderStatus, InputSize, Operation, StreamConfig};
 use zstd_ffi::oracle::{self, Directive};
 
 use crate::decode_config;
@@ -141,29 +146,174 @@ pub fn compressor_lifecycle(data: &[u8]) {
     assert_eq!(frame_b, reused.compress(second.rest).expect("compression"));
 }
 
-/// Parallel frames decode, and do not depend on the number of tasks.
+/// Parallel frames decode and do not depend on the number of tasks; streams
+/// and their `std::io` adapters reproduce the batch frame.
+///
+/// The control byte after the configuration picks the batch's task count
+/// (bits 0-2), the stream's window (bits 3-4), a mid-stream flush (bit 5) and
+/// the chunk size (bits 6-7, together with the task bits).
 pub fn parallel(data: &[u8]) {
     let Some(mut decoded) = decode_config(data) else {
         return;
     };
-    let Some((tasks, rest)) = decoded.rest.split_first() else {
+    let Some((&control, rest)) = decoded.rest.split_first() else {
         return;
     };
     decoded.rest = rest;
+    let input = decoded.rest;
     let config = ParallelConfig::default().with_segment_size(SegmentSize::MIN);
     let mut compressor =
         ParallelCompressor::new(decoded.config, config).expect("valid configuration");
-    let one = compressor
-        .compress(decoded.rest)
-        .expect("parallel compression");
-    let tasks = TaskCount::try_from(1 + usize::from(*tasks % 8)).expect("task count");
-    let mut batch = compressor.prepare_slice(decoded.rest, tasks);
+    let one = compressor.compress(input).expect("parallel compression");
+    let tasks = TaskCount::try_from(1 + usize::from(control % 8)).expect("task count");
+    let mut batch = compressor.prepare_slice(input, tasks);
     for task in batch.take_tasks().into_iter().rev() {
         task.run();
     }
     assert_eq!(batch.finish().expect("parallel compression"), one);
     let restored = oracle::decompress_stream(&one, 1 << 12, Some(31)).expect("reference decoding");
-    assert_eq!(restored, decoded.rest);
+    assert_eq!(restored, input);
+
+    let window = TaskCount::try_from(1 + usize::from(control >> 3 & 3)).expect("window");
+    let flush_at = (control & 0x20 != 0).then_some(input.len() / 2);
+    let chunk = 1 + usize::from(control >> 6) * 23_000 + usize::from(control & 7) * 997;
+    let declared = StreamConfig::from(InputSize::Exact(input.len() as u64));
+    for stream in [declared, StreamConfig::default()] {
+        // Without a declared size only the serial fallback repeats the batch.
+        let identical = flush_at.is_none() && (stream == declared || input.len() <= SEGMENT);
+        let streamed = parallel_stream(&mut compressor, stream, input, chunk, window, flush_at);
+        let (written, read) =
+            parallel_adapters(&mut compressor, stream, input, chunk, window, flush_at);
+        for frame in [&streamed, &written] {
+            let restored =
+                oracle::decompress_stream(frame, 1 << 12, Some(31)).expect("reference decoding");
+            assert_eq!(restored, input);
+            if identical {
+                assert_eq!(frame, &one);
+            }
+        }
+        // The reader never flushes.
+        if stream == declared || input.len() <= SEGMENT {
+            assert_eq!(read, one);
+        }
+        // The same writes and flushes cut the same segments.
+        assert_eq!(written, streamed);
+    }
+}
+
+/// The segment size of the `parallel` target.
+const SEGMENT: usize = 64 << 10;
+
+/// Bytes `process_uninit` must leave alone.
+const SENTINEL: u8 = 0xA5;
+
+/// Drives a parallel session in `chunk`-byte calls through a small output
+/// buffer, running queued tasks in reverse queue order whenever it is
+/// pending. Calls alternate between `process` and `process_uninit`, which
+/// must not write a byte past what it reports.
+fn parallel_stream(
+    compressor: &mut ParallelCompressor,
+    stream: StreamConfig,
+    input: &[u8],
+    chunk: usize,
+    window: TaskCount,
+    mut flush_at: Option<usize>,
+) -> Vec<u8> {
+    let (mut session, queue) = compressor.start(stream, window);
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 97];
+    let mut uninit = [MaybeUninit::new(SENTINEL); 97];
+    let mut position = 0;
+    for call in 0usize.. {
+        let limit = flush_at.unwrap_or(input.len());
+        let end = (position + chunk).min(limit);
+        let operation = match flush_at {
+            Some(_) if end == limit => Operation::Flush,
+            None if end == input.len() => Operation::End,
+            _ => Operation::Continue,
+        };
+        let progress = if call % 2 == 0 {
+            let progress = session
+                .process(&input[position..end], &mut buffer, operation)
+                .expect("parallel stream");
+            out.extend_from_slice(&buffer[..progress.produced]);
+            progress
+        } else {
+            let progress = session
+                .process_uninit(&input[position..end], &mut uninit, operation)
+                .expect("parallel stream");
+            let written = uninit.map(|slot| {
+                // SAFETY: the array is initialized with the sentinel and
+                // `process_uninit` only ever writes initialized bytes.
+                unsafe { slot.assume_init() }
+            });
+            out.extend_from_slice(&written[..progress.produced]);
+            assert!(written[progress.produced..].iter().all(|&b| b == SENTINEL));
+            uninit = [MaybeUninit::new(SENTINEL); 97];
+            progress
+        };
+        assert!(progress.consumed <= end - position);
+        position += progress.consumed;
+        match progress.status {
+            ParallelEncoderStatus::Finished => return out,
+            ParallelEncoderStatus::Pending => {
+                let tasks: Vec<_> = std::iter::from_fn(|| queue.next_task()).collect();
+                for task in tasks.into_iter().rev() {
+                    task.run();
+                }
+                session.wait().expect("parallel stream");
+            }
+            ParallelEncoderStatus::NeedsInput if operation == Operation::Flush => flush_at = None,
+            ParallelEncoderStatus::NeedsInput => assert_eq!(position, end),
+            ParallelEncoderStatus::NeedsOutput => {}
+        }
+    }
+    unreachable!("a stream finishes")
+}
+
+/// Writes `input` in `chunk`-byte writes, flushing at `flush_at`, and reads
+/// it back through the reader adapter in buffers of at most `chunk` bytes,
+/// each with one executor thread.
+fn parallel_adapters(
+    compressor: &mut ParallelCompressor,
+    stream: StreamConfig,
+    input: &[u8],
+    chunk: usize,
+    window: TaskCount,
+    flush_at: Option<usize>,
+) -> (Vec<u8>, Vec<u8>) {
+    use std::io::{Read, Write};
+    let written = std::thread::scope(|scope| {
+        let (mut sink, queue) = compressor.writer(Vec::new(), stream, window);
+        scope.spawn(move || queue.into_iter().for_each(|task| task.run()));
+        let (head, tail) = input.split_at(flush_at.unwrap_or(0));
+        for piece in head.chunks(chunk) {
+            sink.write_all(piece).expect("parallel writer");
+        }
+        if flush_at.is_some() {
+            sink.flush().expect("parallel writer");
+        }
+        for piece in tail.chunks(chunk) {
+            sink.write_all(piece).expect("parallel writer");
+        }
+        sink.finish()
+            .map_err(FinishError::into_error)
+            .expect("parallel writer")
+    });
+    let read = std::thread::scope(|scope| {
+        let (mut source, queue) = compressor.reader(input, stream, window);
+        scope.spawn(move || queue.into_iter().for_each(|task| task.run()));
+        let mut out = Vec::new();
+        let mut buffer = vec![0; chunk.min(4096)];
+        loop {
+            let n = source.read(&mut buffer).expect("parallel reader");
+            if n == 0 {
+                break out;
+            }
+            out.extend_from_slice(&buffer[..n]);
+        }
+    });
+    (written, read)
 }
 
 /// Configuration decoding never panics, and every accepted configuration

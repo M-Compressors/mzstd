@@ -470,6 +470,28 @@ fn readers_expose_their_source() {
 }
 
 #[test]
+fn reader_parts_return_the_unaccepted_read_ahead() {
+    let input = corpus::binary(1 << 20, 21);
+    let mut encoder = Compressor::default();
+    let mut reader = encoder.reader(io::Cursor::new(input.clone()), Default::default());
+    // Undelivered output stops the session from taking the second chunk.
+    let mut byte = [0u8; 1];
+    assert_eq!(reader.read(&mut byte).expect("reads"), 1);
+    assert_eq!(reader.read(&mut byte).expect("reads"), 1);
+    let position = reader.get_ref().position() as usize;
+    let parts = reader.into_parts();
+    assert!(!parts.unread_input.is_empty());
+    let accepted = position - parts.unread_input.len();
+    assert_eq!(parts.unread_input, input[accepted..position]);
+    let mut rest = Vec::new();
+    io::Cursor::new(parts.unread_input)
+        .chain(parts.source)
+        .read_to_end(&mut rest)
+        .expect("reads");
+    assert_eq!(rest, input[accepted..]);
+}
+
+#[test]
 fn readers_debug_output_names_the_adapter() {
     let mut encoder = Compressor::default();
     let reader = encoder.reader(&b""[..], Default::default());

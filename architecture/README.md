@@ -16,7 +16,7 @@ graph TD
     Root --> IO["io: reader and writer adapters (std)"]
     Encode --> Cfg[config + internal lowering]
     Encode --> ECore["compressor::core (private): engine, match finders, entropy, streaming"]
-    Encode --> Par["parallel (std) + parallel::core (private)"]
+    Encode --> Par["parallel (std): batches, sessions, io adapters + parallel::core (private): segments, stream"]
     Par --> ECore
     Decode --> DCore["decompressor::core (private): frames, blocks, entropy, history"]
     ECore --> Shared["shared (private): format constants, XXH64"]
@@ -41,7 +41,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Codec features](codec-features.md) | Feature gates, `no_std`, std-only modules, hotpath anchors and the checked configurations. |
 | [Compressor](compressor.md) | Public encoder API, configuration lowering, one-shot calls, sessions, I/O adapters, errors and retention. |
 | [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle, the segment and address model of the window, the block pipeline, match finders, LDM, entropy coding and streaming. |
-| [Parallel compression](parallel-compression.md) | Frame plans, overlapped segments, scoped batches, streaming sessions with task queues, and panic safety. |
+| [Parallel compression](parallel-compression.md) | Frame plans, overlapped segments, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, streaming state machine, history, block regeneration and compatibility with the reference decoder. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |

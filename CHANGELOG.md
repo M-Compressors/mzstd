@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+- **Breaking:** parallel streaming sessions are rebuilt around a window
+  and a non-blocking `process`. `ParallelCompressor::start(stream, window)`
+  returns a `ParallelEncoderSession` and its `ParallelTaskQueue`;
+  `into_session(stream, window)` returns the owned
+  `ParallelEncoderSessionOwned` (with `into_compressor`). Sessions have
+  `process`, `flush` and `finish`, which report the new
+  `ParallelEncoderStatus` (`NeedsInput`, `NeedsOutput`, `Pending`,
+  `Finished`) in a `ParallelProgress`, and `wait`, which blocks for one task
+  completion. `window` bounds the segments queued, running or awaiting
+  delivery, and so the session's memory; a full window reports `Pending`.
+  Each full segment becomes a task on the queue, which executors drain with
+  `for task in queue { task.run() }` (`recv` blocks; `next_task` does not).
+  With a declared size and without a flush, the frame is byte-identical to
+  `prepare_slice` for any chunking, window and execution order; an input
+  that fits in one segment takes the batch's serial fallback with or without
+  a declared size. Finishing, failing or dropping the session closes the
+  queue, so executor loops end; dropping every queue handle fails the stream
+  with the new `ParallelEncodeError::TaskQueueClosed` or `TaskAbandoned`
+  instead of hanging. Stream failures are the new `StreamFailed` with the
+  cause as its source, repeated on every later call. `push`, `drain_into`,
+  `finish_into`, `run_queued` and `queue()` are removed.
+- `ParallelEncoderSession` and `ParallelEncoderSessionOwned` have
+  `process_uninit`, which delivers into `&mut [MaybeUninit<u8>]` such as
+  `Vec::spare_capacity_mut` without zeroing it first. It produces the same
+  bytes, counts, statuses and errors as `process`, writes nothing past
+  `produced`, and may be mixed with `process` on one stream. The AFL
+  `parallel` target alternates the two.
+- Parallel streams have `std::io` adapters.
+  `ParallelCompressor::writer(sink, stream, window)` returns a
+  `ParallelEncoderWriter` and `ParallelCompressor::reader(source, stream,
+  window)` a `ParallelEncoderReader`, each beside the `ParallelTaskQueue`
+  their segment tasks go to, as `start` does. Both drive the parallel session
+  and produce its bytes, so with a declared size and without a flush the
+  output is byte-identical to `prepare_slice` however writes or source reads
+  are split. Unlike `process`, they block in `wait` while the window is full
+  or a part is pending, so the queue must run on other threads. The writer
+  keeps `EncoderWriter`'s transactional guarantees: nothing is lost to short
+  writes or sink errors, `Write::flush` is `Operation::Flush`, and `finish`
+  returns the adapter inside `FinishError` for a retry. `reader.into_parts()`
+  returns read-ahead source bytes as the new `EncoderReaderParts`
+  (`source`, `unread_input`), which `EncoderReader::into_parts` now returns
+  too. `ParallelEncodeError` now converts into `std::io::Error`, taking the
+  kind of its root cause through `StreamFailed` and `BatchFailed` and never
+  `Interrupted` or `WouldBlock`. The AFL `parallel` target also drives both
+  adapters.
+- Batch tasks report exactly once: a task dropped unrun is
+  `TaskAbandoned { segment }` and one that unwinds `TaskPanicked { segment }`
+  (the panic still propagates and its engine is discarded). A failed batch
+  returns the new `ParallelEncodeError::BatchFailed` with the first failing
+  task's cause as its source, and `finish_into` leaves its output untouched;
+  `InvalidState` now only reports a task leaked with `mem::forget`. Batch
+  frames are unchanged.
+- A new `parallel` Criterion bench (`benches/parallel.rs`) compresses one
+  16 MiB input in 1 MiB segments on four executor threads through the batch, the session and the
+  writer, beside zstd's single-threaded `ZSTD_compress2`. Measured with
+  `cargo bench --bench parallel -- --warm-up-time 1
+  --measurement-time 3` (Apple M5 Pro): all three write the same frame, and
+  the session and writer run within noise of the batch (level 1: 9.99,
+  10.08 and 10.02 ms; level 3: 17.62, 17.27 and 17.12 ms). zstd serial takes
+  18.09 and 30.37 ms; the parallel frames are 0.05% and 0.36% larger
+  (6286456 vs 6283433 and 5712713 vs 5692172 bytes).
 - `mzstd` and `mzstd-ffi` are now dual-licensed under MIT or
   Apache-2.0, at your option. The MIT text moved from `LICENSE` to
   `LICENSE-MIT`, and `LICENSE-APACHE` was added.

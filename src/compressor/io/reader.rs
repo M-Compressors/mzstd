@@ -56,6 +56,45 @@ impl<'c, R: Read> EncoderReader<'c, R> {
     pub const fn get_ref(&self) -> &R {
         &self.source
     }
+
+    /// Ends the operation and returns the source with the bytes read from it
+    /// that the session had not accepted, in source order. Bytes the session
+    /// accepted belong to the abandoned frame.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::Compressor;
+    /// use std::io::{Cursor, Read};
+    ///
+    /// let mut encoder = Compressor::new(Default::default())?;
+    /// let reader = encoder.reader(&b"payload"[..], Default::default());
+    /// let parts = reader.into_parts();
+    /// let mut rest = Vec::new();
+    /// Cursor::new(parts.unread_input).chain(parts.source).read_to_end(&mut rest)?;
+    /// assert_eq!(rest, b"payload");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_parts(self) -> EncoderReaderParts<R> {
+        EncoderReaderParts {
+            unread_input: self.input[self.available.clone()].to_vec(),
+            source: self.source,
+        }
+    }
+}
+
+/// The source and its unaccepted read-ahead, after
+/// [`EncoderReader::into_parts`] or
+/// [`ParallelEncoderReader::into_parts`](crate::compressor::parallel::ParallelEncoderReader::into_parts).
+///
+/// Read `unread_input` before resuming `source` to keep byte order.
+#[derive(Debug)]
+pub struct EncoderReaderParts<R> {
+    /// The uncompressed source at its current position.
+    pub source: R,
+    /// Bytes read from `source` but not accepted by the encoder.
+    pub unread_input: Vec<u8>,
 }
 
 impl<R: Read> Read for EncoderReader<'_, R> {

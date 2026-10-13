@@ -40,6 +40,8 @@
 //! | Same, with the session owning the codec | [`into_session`][compressor-into-session] → [`EncoderSessionOwned`] | [`into_session`][decompressor-into-session] → [`DecoderSessionOwned`] |
 //! | Split one known input across your threads | [`prepare_slice`][parallel-prepare-slice] → [`ScopedParallelBatch`] | — |
 //! | Stream chunked input across your threads | [`start`][parallel-start] → [`ParallelEncoderSession`] + [`ParallelTaskQueue`] | — |
+//! | Same, with the session owning the compressor | [`into_session`][parallel-into-session] → [`ParallelEncoderSessionOwned`] | — |
+//! | Push or pull through `std::io` across your threads | [`writer`][parallel-writer], [`reader`][parallel-reader] | — |
 //!
 //! [`EncoderConfig`] selects the level and frame flags, and
 //! [`CompressionParams`] overrides individual parameters exactly as
@@ -142,6 +144,10 @@
 [parallel-start]: crate::compressor::parallel::ParallelCompressor::start
 [`ParallelEncoderSession`]: crate::compressor::parallel::ParallelEncoderSession
 [`ParallelTaskQueue`]: crate::compressor::parallel::ParallelTaskQueue
+[parallel-into-session]: crate::compressor::parallel::ParallelCompressor::into_session
+[`ParallelEncoderSessionOwned`]: crate::compressor::parallel::ParallelEncoderSessionOwned
+[parallel-writer]: crate::compressor::parallel::ParallelCompressor::writer
+[parallel-reader]: crate::compressor::parallel::ParallelCompressor::reader
 "#
 )]
 #![cfg_attr(
@@ -155,6 +161,10 @@
 [parallel-start]: #select-only-the-codecs-you-need
 [`ParallelEncoderSession`]: #select-only-the-codecs-you-need
 [`ParallelTaskQueue`]: #select-only-the-codecs-you-need
+[parallel-into-session]: #select-only-the-codecs-you-need
+[`ParallelEncoderSessionOwned`]: #select-only-the-codecs-you-need
+[parallel-writer]: #select-only-the-codecs-you-need
+[parallel-reader]: #select-only-the-codecs-you-need
 "#
 )]
 #![cfg_attr(

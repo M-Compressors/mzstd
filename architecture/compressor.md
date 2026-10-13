@@ -31,7 +31,7 @@ graph TD
 | `encoder` | `Compressor`, `CompressorBuilder`, one-shot calls, `start`/`into_session`, retention. |
 | `session` | `EncoderSession`, `EncoderSessionOwned`, `StreamConfig`, `InputSize`, `Operation`, `EncoderStatus`, `Progress`. |
 | `error` | `EncodeError` and the mapping from the core's private `CoreError`. |
-| `io` | `EncoderReader`, `EncoderWriter` (re-exported from `mzstd::io`). |
+| `io` | `EncoderReader`, `EncoderWriter`, `EncoderReaderParts` (re-exported from `mzstd::io`). `EncoderReader::into_parts` returns the source with the bytes read from it that the session had not accepted; `ParallelEncoderReader::into_parts` returns the same type. |
 | `parallel` | See [parallel compression](parallel-compression.md). |
 
 `Compressor` owns a boxed `core::cctx::Engine` (match state, entropy tables,
