@@ -1,0 +1,77 @@
+[package]
+name = "mzstd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Zstandard (RFC 8878) compression and decompression in safe Rust; single-threaded encoding is byte-identical to zstd 1.5.7"
+repository = "https://github.com/M-Compressors/mzstd"
+homepage = "https://github.com/M-Compressors/mzstd"
+documentation = "https://docs.rs/mzstd"
+readme = "README.md"
+keywords = ["zstd", "zstandard", "compression", "encoder", "decoder"]
+categories = ["compression", "algorithms", "no-std"]
+exclude = [
+    ".github/**",
+    "architecture/**",
+    "benchmarks/**",
+    "docs/**",
+    "fuzz/**",
+    "mzstd-ffi/**",
+    "specifications/**",
+    "target/**",
+    "testdata/**",
+    "zstd-ffi/**",
+]
+
+[dependencies.thiserror]
+version = "2"
+optional = true
+default-features = false
+
+# Profiling instrumentation only; every anchor in `src/` is written as
+# `#[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]`.
+[dependencies.hotpath]
+version = "0.28"
+optional = true
+
+[dev-dependencies]
+rayon = "1.12"
+
+[dev-dependencies.criterion]
+version = "0.8"
+
+[dev-dependencies.zstd-ffi]
+path = "zstd-ffi"
+
+[[bench]]
+name = "compress"
+harness = false
+required-features = ["compression"]
+
+[[bench]]
+name = "decompress"
+harness = false
+required-features = ["decompression"]
+
+[features]
+default = ["std", "compression", "decompression"]
+# Independently selectable public codecs and their private implementations.
+compression = ["dep:thiserror"]
+decompression = ["dep:thiserror"]
+# Standard library support: `std::io` adapters and `std::error::Error`.
+std = ["thiserror?/std"]
+# Opt-in alloc-backed support; overrides std-only APIs and instrumentation.
+no_std = []
+
+
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+
+[workspace]
+members = ["zstd-ffi", "mzstd-ffi"]
+# The fuzz package pulls in AFL's instrumentation runtime; keeping it out of
+# the workspace leaves `cargo test` and `cargo clippy` unaffected by it.
+exclude = ["fuzz/afl"]
+resolver = "3"

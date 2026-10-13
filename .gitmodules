@@ -1,0 +1,4 @@
+[submodule "zstd-ffi/vendor/zstd"]
+	path = zstd-ffi/vendor/zstd
+	url = https://github.com/facebook/zstd.git
+	shallow = true

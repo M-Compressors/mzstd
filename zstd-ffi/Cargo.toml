@@ -1,0 +1,25 @@
+[package]
+name = "zstd-ffi"
+version = "0.1.0"
+edition = "2024"
+links = "zstd"
+license = "MIT"
+description = "Raw Rust FFI bindings to the vendored Zstandard C library, used as the mzstd test oracle"
+homepage = "https://github.com/facebook/zstd"
+publish = false
+include = [
+    "src/**",
+    "shim/**",
+    "build.rs",
+    "README.md",
+    "UPSTREAM_VERSION",
+    "vendor/zstd/LICENSE",
+    "vendor/zstd/lib/common/**",
+    "vendor/zstd/lib/compress/**",
+    "vendor/zstd/lib/decompress/**",
+    "vendor/zstd/lib/zstd.h",
+    "vendor/zstd/lib/zstd_errors.h",
+]
+
+[build-dependencies]
+cc = "1.2"

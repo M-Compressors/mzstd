@@ -1,0 +1,763 @@
+//! Frame sequencing: the resumable streaming state machine and the
+//! one-shot driver over complete input.
+//!
+//! Both walk the same grammar: frames back to back, each either a
+//! skippable frame or a Zstandard frame of blocks and an optional checksum.
+//! The streaming [`Stream`] accepts input in any pieces: it collects each
+//! header and each whole block content in a scratch buffer before acting on
+//! it, regenerates blocks into its [`History`], and delivers output from
+//! there in any pieces. [`Stream::decode_all`] parses straight from a
+//! complete slice and regenerates into the caller's vector, which serves as
+//! the history.
+
+use alloc::vec::Vec;
+
+use super::block::BlockHeader;
+use super::frame::{FrameDecoder, FrameHeader, MAGIC_SIZE, header_size};
+use super::history::History;
+use crate::decompressor::{
+    DecodeError, DecodeFailure, DecodeOperation, DecodeProgress, DecoderConfig, DecoderStatus,
+    FrameMode, InvalidDataKind,
+};
+use crate::shared::format::{
+    BLOCK_HEADER_SIZE, CHECKSUM_SIZE, MAGIC_NUMBER, MAGIC_SKIPPABLE_MASK, MAGIC_SKIPPABLE_START,
+    SKIPPABLE_HEADER_SIZE,
+};
+
+/// Size of a skippable frame's size field.
+const SKIPPABLE_SIZE_FIELD: usize = SKIPPABLE_HEADER_SIZE - MAGIC_SIZE;
+/// Largest skippable frame payload: the reference rejects sizes whose
+/// header-inclusive total overflows 32 bits.
+const SKIPPABLE_PAYLOAD_MAX: u32 = u32::MAX - SKIPPABLE_HEADER_SIZE as u32;
+
+/// What the streaming decoder expects next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    /// A frame magic number, or the end of the input between frames.
+    Magic,
+    /// A skippable frame's size field.
+    SkippableSize,
+    /// This many skippable payload bytes.
+    Skipping(u64),
+    /// A frame header, from its descriptor byte.
+    FrameHeader,
+    /// A block header.
+    BlockHeader,
+    /// The content of this block.
+    BlockContent(BlockHeader),
+    /// A frame's content checksum.
+    Checksum,
+    /// A single-frame operation is complete.
+    Done,
+}
+
+/// Moves bytes from `input` into `scratch` until it holds `need`, returning
+/// whether it does.
+fn fill(scratch: &mut Vec<u8>, input: &mut &[u8], need: usize) -> bool {
+    let take = need.saturating_sub(scratch.len()).min(input.len());
+    let (head, tail) = input.split_at(take);
+    scratch.extend_from_slice(head);
+    *input = tail;
+    scratch.len() >= need
+}
+
+/// The first `N` bytes of `bytes`, which the caller has filled.
+fn array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], DecodeError> {
+    bytes
+        .first_chunk::<N>()
+        .copied()
+        .ok_or(DecodeError::InvalidState)
+}
+
+/// Whether `magic` opens a skippable frame.
+const fn is_skippable(magic: u32) -> bool {
+    magic & MAGIC_SKIPPABLE_MASK == MAGIC_SKIPPABLE_START
+}
+
+/// A cursor over complete one-shot input, possibly cut short by the input
+/// budget.
+struct SliceReader<'a> {
+    data: &'a [u8],
+    position: usize,
+    /// The budget, when it cut the input short.
+    limit: Option<u64>,
+}
+
+impl<'a> SliceReader<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], DecodeError> {
+        let bytes = self
+            .data
+            .get(self.position..)
+            .and_then(|rest| rest.get(..count))
+            .ok_or(match self.limit {
+                Some(limit) => DecodeError::InputLimitExceeded { limit },
+                None => DecodeError::UnexpectedEndOfInput,
+            })?;
+        self.position += count;
+        Ok(bytes)
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        array(self.take(N)?)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position >= self.data.len()
+    }
+}
+
+/// Streaming decoder state, owned by a `Decompressor` and reused between
+/// operations.
+#[derive(Debug)]
+pub(crate) struct Stream {
+    config: DecoderConfig,
+    state: State,
+    scratch: Vec<u8>,
+    history: History,
+    frame: FrameDecoder,
+    total_in: u64,
+    total_out: u64,
+    decoded: u64,
+    frames: u64,
+    complete_frames: u64,
+    final_end: Option<u64>,
+    finished: bool,
+    failed: bool,
+}
+
+impl Stream {
+    /// An idle decoder for `config`; nothing is allocated yet.
+    pub(crate) fn new(config: DecoderConfig) -> Self {
+        Self {
+            config,
+            state: State::Magic,
+            scratch: Vec::new(),
+            history: History::default(),
+            frame: FrameDecoder::default(),
+            total_in: 0,
+            total_out: 0,
+            decoded: 0,
+            frames: 0,
+            complete_frames: 0,
+            final_end: None,
+            finished: false,
+            failed: false,
+        }
+    }
+
+    /// Starts a new operation under `config`, keeping allocations.
+    pub(crate) fn reset(&mut self, config: DecoderConfig) {
+        self.config = config;
+        self.state = State::Magic;
+        self.scratch.clear();
+        self.history.reset();
+        self.total_in = 0;
+        self.total_out = 0;
+        self.decoded = 0;
+        self.frames = 0;
+        self.complete_frames = 0;
+        self.final_end = None;
+        self.finished = false;
+        self.failed = false;
+    }
+
+    /// Drops every buffer, keeping the operation's state and counters; only
+    /// valid between operations or once one has finished or failed.
+    pub(crate) fn release(&mut self) {
+        self.scratch = Vec::new();
+        self.history.release();
+        self.frame.release();
+    }
+
+    /// Heap bytes held for reuse.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.scratch.capacity() + self.history.retained_bytes() + self.frame.retained_bytes()
+    }
+
+    /// Whether the operation completed.
+    pub(crate) const fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Compressed bytes accepted so far.
+    pub(crate) const fn total_in(&self) -> u64 {
+        self.total_in
+    }
+
+    /// Decompressed bytes delivered so far.
+    pub(crate) const fn total_out(&self) -> u64 {
+        self.total_out
+    }
+
+    /// Zstandard frames completed so far.
+    pub(crate) const fn frames_decoded(&self) -> u64 {
+        self.frames
+    }
+
+    /// The window of the most recent frame header.
+    pub(crate) fn window_size(&self) -> Option<u64> {
+        self.frame.header().map(|header| header.window_size)
+    }
+
+    /// Runs one call of the incremental contract.
+    pub(crate) fn process(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        operation: DecodeOperation,
+    ) -> Result<DecodeProgress, DecodeFailure> {
+        let failure = |error, consumed, produced| DecodeFailure {
+            error,
+            consumed,
+            produced,
+        };
+        if self.failed {
+            return Err(failure(DecodeError::InvalidState, 0, 0));
+        }
+        if self.finished {
+            return Ok(DecodeProgress {
+                consumed: 0,
+                produced: 0,
+                status: DecoderStatus::Finished,
+            });
+        }
+        let finish = operation == DecodeOperation::Finish;
+        let end = self.total_in.saturating_add(input.len() as u64);
+        let consistent = match (finish, self.final_end) {
+            (false, None) => true,
+            (false, Some(_)) => false,
+            (true, None) => {
+                self.final_end = Some(end);
+                true
+            }
+            (true, Some(expected)) => expected == end,
+        };
+        if !consistent {
+            self.failed = true;
+            return Err(failure(DecodeError::InvalidState, 0, 0));
+        }
+        let limit = self.config.limits().max_input_bytes();
+        let (offered, limited) = match limit {
+            Some(limit) => {
+                let room = limit.saturating_sub(self.total_in);
+                if input.len() as u64 > room {
+                    (&input[..room as usize], true)
+                } else {
+                    (input, false)
+                }
+            }
+            None => (input, false),
+        };
+        let mut remaining = offered;
+        let mut produced = 0;
+        let result = self.run(&mut remaining, output, &mut produced, finish);
+        let consumed = offered.len() - remaining.len();
+        self.total_in += consumed as u64;
+        self.total_out += produced as u64;
+        let result = result.and_then(|status| match (status, limit) {
+            (DecoderStatus::NeedsInput, Some(limit)) if limited => {
+                Err(DecodeError::InputLimitExceeded { limit })
+            }
+            (DecoderStatus::NeedsInput, _) if finish => Err(DecodeError::UnexpectedEndOfInput),
+            (status, _) => Ok(status),
+        });
+        match result {
+            Ok(status) => Ok(DecodeProgress {
+                consumed,
+                produced,
+                status,
+            }),
+            Err(error) => {
+                self.failed = true;
+                Err(failure(error, consumed, produced))
+            }
+        }
+    }
+
+    /// Advances the state machine until it needs input or output space, or
+    /// the operation completes.
+    fn run(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        produced: &mut usize,
+        finish: bool,
+    ) -> Result<DecoderStatus, DecodeError> {
+        loop {
+            if self.history.pending() > 0 {
+                *produced += self.history.deliver(&mut output[*produced..]);
+                if self.history.pending() > 0 {
+                    return Ok(DecoderStatus::NeedsOutput);
+                }
+            }
+            match self.state {
+                State::Done => {
+                    self.finished = true;
+                    return Ok(DecoderStatus::Finished);
+                }
+                State::Magic => {
+                    if self.scratch.is_empty() && input.is_empty() {
+                        if finish
+                            && self.complete_frames > 0
+                            && self.config.frame_mode() == FrameMode::Concatenated
+                        {
+                            self.finished = true;
+                            return Ok(DecoderStatus::Finished);
+                        }
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    if !fill(&mut self.scratch, input, MAGIC_SIZE) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let magic = u32::from_le_bytes(array(&self.scratch)?);
+                    self.scratch.clear();
+                    self.state = if magic == MAGIC_NUMBER {
+                        State::FrameHeader
+                    } else if is_skippable(magic) {
+                        State::SkippableSize
+                    } else {
+                        return Err(InvalidDataKind::Magic.into());
+                    };
+                }
+                State::SkippableSize => {
+                    if !fill(&mut self.scratch, input, SKIPPABLE_SIZE_FIELD) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let size = u32::from_le_bytes(array(&self.scratch)?);
+                    self.scratch.clear();
+                    if size > SKIPPABLE_PAYLOAD_MAX {
+                        return Err(InvalidDataKind::SkippableFrame.into());
+                    }
+                    self.state = State::Skipping(u64::from(size));
+                }
+                State::Skipping(rest) => {
+                    let take = rest.min(input.len() as u64);
+                    *input = &input[take as usize..];
+                    if take < rest {
+                        self.state = State::Skipping(rest - take);
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    self.complete_frames += 1;
+                    self.state = State::Magic;
+                }
+                State::FrameHeader => {
+                    if !fill(&mut self.scratch, input, 1) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let size = header_size(self.scratch[0]);
+                    if !fill(&mut self.scratch, input, size) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let header = FrameHeader::parse(&self.scratch)?;
+                    self.scratch.clear();
+                    self.frame.begin(header, &self.config.limits())?;
+                    self.history.reset();
+                    self.state = State::BlockHeader;
+                }
+                State::BlockHeader => {
+                    if !fill(&mut self.scratch, input, BLOCK_HEADER_SIZE) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let block = BlockHeader::parse(array(&self.scratch)?, self.frame.block_max())?;
+                    self.scratch.clear();
+                    self.state = State::BlockContent(block);
+                }
+                State::BlockContent(block) => {
+                    if !fill(&mut self.scratch, input, block.content_size()) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    let window = self.window_size().ok_or(DecodeError::InvalidState)?;
+                    let buffer = self.history.prepare(window);
+                    let before = buffer.len();
+                    self.frame.decode_block(&block, &self.scratch, buffer, 0)?;
+                    self.decoded += (buffer.len() - before) as u64;
+                    if let Some(limit) = self.config.limits().max_output_bytes()
+                        && self.decoded > limit
+                    {
+                        return Err(DecodeError::OutputLimitExceeded { limit });
+                    }
+                    self.scratch.clear();
+                    self.state = if !block.last {
+                        State::BlockHeader
+                    } else if self.frame.has_checksum() {
+                        State::Checksum
+                    } else {
+                        self.end_frame()
+                    };
+                }
+                State::Checksum => {
+                    if !fill(&mut self.scratch, input, CHECKSUM_SIZE) {
+                        return Ok(DecoderStatus::NeedsInput);
+                    }
+                    self.frame.verify_checksum(array(&self.scratch)?)?;
+                    self.scratch.clear();
+                    self.state = self.end_frame();
+                }
+            }
+        }
+    }
+
+    /// Counts a completed Zstandard frame and picks what follows it.
+    fn end_frame(&mut self) -> State {
+        self.frames += 1;
+        self.complete_frames += 1;
+        match self.config.frame_mode() {
+            FrameMode::Single => State::Done,
+            FrameMode::Concatenated => State::Magic,
+        }
+    }
+
+    /// Decodes complete input, appending the output to `dst` and using it
+    /// as the history. On error `dst` may hold a partial result past its
+    /// original length.
+    #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
+    pub(crate) fn decode_all(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let limits = self.config.limits();
+        let base = dst.len();
+        let (data, limit) = match limits.max_input_bytes() {
+            Some(limit) if src.len() as u64 > limit => (&src[..limit as usize], Some(limit)),
+            _ => (src, None),
+        };
+        let mut reader = SliceReader {
+            data,
+            position: 0,
+            limit,
+        };
+        let mut complete_frames = 0u64;
+        loop {
+            if reader.is_empty() {
+                if let Some(limit) = limit {
+                    return Err(DecodeError::InputLimitExceeded { limit });
+                }
+                if complete_frames > 0 && self.config.frame_mode() == FrameMode::Concatenated {
+                    return Ok(());
+                }
+                return Err(DecodeError::UnexpectedEndOfInput);
+            }
+            let magic = u32::from_le_bytes(reader.take_array()?);
+            if is_skippable(magic) {
+                let size = u32::from_le_bytes(reader.take_array()?);
+                if size > SKIPPABLE_PAYLOAD_MAX {
+                    return Err(InvalidDataKind::SkippableFrame.into());
+                }
+                reader.take(size as usize)?;
+                complete_frames += 1;
+                continue;
+            }
+            if magic != MAGIC_NUMBER {
+                return Err(InvalidDataKind::Magic.into());
+            }
+            let descriptor = reader.data.get(reader.position).copied();
+            let descriptor = descriptor.ok_or(match limit {
+                Some(limit) => DecodeError::InputLimitExceeded { limit },
+                None => DecodeError::UnexpectedEndOfInput,
+            })?;
+            let header = FrameHeader::parse(reader.take(header_size(descriptor))?)?;
+            self.frame.begin(header, &limits)?;
+            let frame_start = dst.len();
+            loop {
+                let block = BlockHeader::parse(reader.take_array()?, self.frame.block_max())?;
+                let content = reader.take(block.content_size())?;
+                self.frame.decode_block(&block, content, dst, frame_start)?;
+                if let Some(limit) = limits.max_output_bytes()
+                    && (dst.len() - base) as u64 > limit
+                {
+                    return Err(DecodeError::OutputLimitExceeded { limit });
+                }
+                if block.last {
+                    break;
+                }
+            }
+            if self.frame.has_checksum() {
+                self.frame.verify_checksum(reader.take_array()?)?;
+            }
+            complete_frames += 1;
+            if self.config.frame_mode() == FrameMode::Single {
+                if reader.position < src.len() {
+                    return Err(DecodeError::TrailingData {
+                        offset: reader.position as u64,
+                    });
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompressor::DecodeLimits;
+
+    /// `hello` as one raw block in a single-segment frame with a checksum.
+    const HELLO: [u8; 18] = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x24, 5, 0x29, 0, 0, b'h', b'e', b'l', b'l', b'o', 0x0b, 0x2f,
+        0x77, 0xcc,
+    ];
+    /// An empty skippable frame.
+    const SKIP: [u8; 9] = [0x5a, 0x2a, 0x4d, 0x18, 1, 0, 0, 0, 0xee];
+
+    fn checksum_of_hello() -> [u8; 4] {
+        let mut hasher = crate::shared::xxhash::Xxh64::new(0);
+        hasher.update(b"hello");
+        (hasher.digest() as u32).to_le_bytes()
+    }
+
+    fn hello() -> Vec<u8> {
+        let mut frame = HELLO.to_vec();
+        frame[14..].copy_from_slice(&checksum_of_hello());
+        frame
+    }
+
+    fn stream(config: DecoderConfig) -> Stream {
+        let mut stream = Stream::new(DecoderConfig::DEFAULT);
+        stream.reset(config);
+        stream
+    }
+
+    #[test]
+    fn a_frame_streams_byte_by_byte() {
+        let frame = hello();
+        let mut stream = stream(DecoderConfig::DEFAULT);
+        let mut decoded = Vec::new();
+        for byte in &frame {
+            let mut out = [0u8; 1];
+            let progress = stream
+                .process(
+                    ::core::slice::from_ref(byte),
+                    &mut out,
+                    DecodeOperation::Process,
+                )
+                .expect("valid");
+            assert_eq!(progress.consumed, 1);
+            decoded.extend_from_slice(&out[..progress.produced]);
+            if progress.status == DecoderStatus::NeedsOutput {
+                loop {
+                    let progress = stream
+                        .process(&[], &mut out, DecodeOperation::Process)
+                        .expect("valid");
+                    decoded.extend_from_slice(&out[..progress.produced]);
+                    if progress.status != DecoderStatus::NeedsOutput {
+                        break;
+                    }
+                }
+            }
+        }
+        let progress = stream
+            .process(&[], &mut [], DecodeOperation::Finish)
+            .expect("valid");
+        assert_eq!(progress.status, DecoderStatus::Finished);
+        assert_eq!(decoded, b"hello");
+        assert_eq!(stream.total_in(), frame.len() as u64);
+        assert_eq!(stream.total_out(), 5);
+        assert_eq!(stream.frames_decoded(), 1);
+        assert_eq!(stream.window_size(), Some(5));
+        assert!(stream.is_finished());
+        // A finished operation reports no further progress.
+        let again = stream
+            .process(&[1, 2], &mut [0; 4], DecodeOperation::Finish)
+            .expect("finished");
+        assert_eq!((again.consumed, again.produced), (0, 0));
+    }
+
+    #[test]
+    fn single_mode_stops_after_the_first_frame() {
+        let mut input = SKIP.to_vec();
+        input.extend_from_slice(&hello());
+        input.extend_from_slice(b"tail");
+        let mut stream = stream(FrameMode::Single.into());
+        let mut out = [0u8; 16];
+        let progress = stream
+            .process(&input, &mut out, DecodeOperation::Process)
+            .expect("valid");
+        assert_eq!(progress.status, DecoderStatus::Finished);
+        assert_eq!(progress.consumed, input.len() - 4);
+        assert_eq!(&out[..progress.produced], b"hello");
+    }
+
+    #[test]
+    fn finish_contract_violations_poison_the_session() {
+        let frame = hello();
+        let mut stream = stream(DecoderConfig::DEFAULT);
+        stream
+            .process(&frame[..4], &mut [], DecodeOperation::Finish)
+            .expect_err("truncated");
+        let mut stream = self::stream(DecoderConfig::DEFAULT);
+        stream
+            .process(&frame[..4], &mut [], DecodeOperation::Process)
+            .expect("accepted");
+        let progress = stream
+            .process(&frame[4..], &mut [0; 2], DecodeOperation::Finish)
+            .expect("partial");
+        assert_eq!(progress.status, DecoderStatus::NeedsOutput);
+        let rest = &frame[4 + progress.consumed..];
+        let failure = stream
+            .process(&rest[1..], &mut [0; 8], DecodeOperation::Finish)
+            .expect_err("changed suffix");
+        assert!(matches!(failure.error, DecodeError::InvalidState));
+        let failure = stream
+            .process(rest, &mut [0; 8], DecodeOperation::Finish)
+            .expect_err("failed");
+        assert!(matches!(failure.error, DecodeError::InvalidState));
+
+        let mut stream = self::stream(DecoderConfig::DEFAULT);
+        stream
+            .process(&frame[..4], &mut [], DecodeOperation::Finish)
+            .expect_err("truncated");
+        let mut stream = self::stream(DecoderConfig::DEFAULT);
+        stream
+            .process(&frame, &mut [0; 2], DecodeOperation::Finish)
+            .expect("partial");
+        let failure = stream
+            .process(&[], &mut [0; 8], DecodeOperation::Process)
+            .expect_err("process after finish");
+        assert!(matches!(failure.error, DecodeError::InvalidState));
+    }
+
+    #[test]
+    fn limits_stop_streaming_operations() {
+        let frame = hello();
+        let input_limit = DecodeLimits::default().with_max_input_bytes(Some(10));
+        let mut stream = stream(input_limit.into());
+        let failure = stream
+            .process(&frame, &mut [0; 8], DecodeOperation::Process)
+            .expect_err("input budget");
+        assert!(matches!(
+            failure.error,
+            DecodeError::InputLimitExceeded { limit: 10 }
+        ));
+        assert_eq!(failure.consumed, 10);
+
+        let output_limit = DecodeLimits::default().with_max_output_bytes(Some(4));
+        let mut stream = self::stream(output_limit.into());
+        let failure = stream
+            .process(&frame, &mut [0; 8], DecodeOperation::Finish)
+            .expect_err("output budget");
+        assert!(matches!(
+            failure.error,
+            DecodeError::OutputLimitExceeded { limit: 4 }
+        ));
+        assert_eq!(failure.produced, 0);
+    }
+
+    #[test]
+    fn streaming_rejects_bad_magic_and_oversized_skippable_frames() {
+        let mut stream = stream(DecoderConfig::DEFAULT);
+        let failure = stream
+            .process(b"nope", &mut [], DecodeOperation::Process)
+            .expect_err("bad magic");
+        assert!(matches!(
+            failure.error,
+            DecodeError::InvalidData {
+                kind: InvalidDataKind::Magic
+            }
+        ));
+        let mut stream = self::stream(DecoderConfig::DEFAULT);
+        let failure = stream
+            .process(
+                &[0x50, 0x2a, 0x4d, 0x18, 0xf8, 0xff, 0xff, 0xff],
+                &mut [],
+                DecodeOperation::Process,
+            )
+            .expect_err("oversized");
+        assert!(matches!(
+            failure.error,
+            DecodeError::InvalidData {
+                kind: InvalidDataKind::SkippableFrame
+            }
+        ));
+        // A skippable frame alone is a complete concatenated operation.
+        let mut stream = self::stream(DecoderConfig::DEFAULT);
+        let progress = stream
+            .process(&SKIP[..5], &mut [], DecodeOperation::Process)
+            .expect("partial");
+        assert_eq!(progress.status, DecoderStatus::NeedsInput);
+        let progress = stream
+            .process(&SKIP[5..], &mut [], DecodeOperation::Process)
+            .expect("partial");
+        assert_eq!(progress.status, DecoderStatus::NeedsInput);
+        let progress = stream
+            .process(&[], &mut [], DecodeOperation::Finish)
+            .expect("complete");
+        assert_eq!(progress.status, DecoderStatus::Finished);
+        assert_eq!(stream.frames_decoded(), 0);
+    }
+
+    #[test]
+    fn decode_all_handles_frames_skippable_frames_and_trailing_bytes() {
+        let mut stream = stream(DecoderConfig::DEFAULT);
+        let mut input = hello();
+        input.extend_from_slice(&SKIP);
+        input.extend_from_slice(&hello());
+        let mut out = b">".to_vec();
+        stream.decode_all(&input, &mut out).expect("valid");
+        assert_eq!(out, b">hellohello");
+
+        let mut single = self::stream(FrameMode::Single.into());
+        let mut out = Vec::new();
+        assert!(matches!(
+            single.decode_all(&input, &mut out),
+            Err(DecodeError::TrailingData { offset: 18 })
+        ));
+        let mut out = Vec::new();
+        single.decode_all(&hello(), &mut out).expect("valid");
+        assert_eq!(out, b"hello");
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            stream.decode_all(&[], &mut out),
+            Err(DecodeError::UnexpectedEndOfInput)
+        ));
+        assert!(matches!(
+            stream.decode_all(&HELLO[..4], &mut out),
+            Err(DecodeError::UnexpectedEndOfInput)
+        ));
+        assert!(matches!(
+            stream.decode_all(&[0x50, 0x2a, 0x4d, 0x18, 0xf8, 0xff, 0xff, 0xff], &mut out),
+            Err(DecodeError::InvalidData {
+                kind: InvalidDataKind::SkippableFrame
+            })
+        ));
+        assert!(matches!(
+            stream.decode_all(b"nope", &mut out),
+            Err(DecodeError::InvalidData {
+                kind: InvalidDataKind::Magic
+            })
+        ));
+        let mut bad = hello();
+        bad[17] ^= 1;
+        assert!(matches!(
+            stream.decode_all(&bad, &mut out),
+            Err(DecodeError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_all_enforces_budgets() {
+        let frame = hello();
+        let mut out = Vec::new();
+        for cut in [3, 4, 10, 17] {
+            let limits = DecodeLimits::default().with_max_input_bytes(Some(cut));
+            let mut stream = stream(limits.into());
+            assert!(
+                matches!(
+                    stream.decode_all(&frame, &mut out),
+                    Err(DecodeError::InputLimitExceeded { .. })
+                ),
+                "cut {cut}"
+            );
+        }
+        let mut doubled = frame.clone();
+        doubled.extend_from_slice(&frame);
+        let limits = DecodeLimits::default().with_max_input_bytes(Some(18));
+        assert!(matches!(
+            stream(limits.into()).decode_all(&doubled, &mut out),
+            Err(DecodeError::InputLimitExceeded { limit: 18 })
+        ));
+        let limits = DecodeLimits::default().with_max_output_bytes(Some(4));
+        assert!(matches!(
+            stream(limits.into()).decode_all(&frame, &mut out),
+            Err(DecodeError::OutputLimitExceeded { limit: 4 })
+        ));
+    }
+}

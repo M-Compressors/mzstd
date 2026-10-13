@@ -1,0 +1,305 @@
+use ::core::ops::Range;
+use alloc::vec::Vec;
+
+use super::core::Stream;
+use super::{
+    DecodeError, DecodeOperation, DecoderConfig, DecoderSession, DecoderSessionOwned, DecoderStatus,
+};
+use crate::RetentionPolicy;
+
+/// A reusable Zstandard decoder.
+///
+/// Keep it alive to reuse its buffers between payloads; its
+/// [`RetentionPolicy`] decides what stays allocated after each operation.
+/// One-shot methods take complete input; [`Self::start`] and
+/// [`Self::into_session`] decode incrementally, and with `std` its
+/// `reader` and `writer` methods (in the `decompressor::io` module) adapt
+/// it to `std::io`.
+///
+/// # Examples
+///
+/// ```
+/// use mzstd::Decompressor;
+/// // "hello" as one raw block in a single-segment frame.
+/// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
+/// let mut decoder = Decompressor::default();
+/// assert_eq!(decoder.decompress(&frame)?, b"hello");
+/// assert_eq!(decoder.decompress(&[frame, frame].concat())?, b"hellohello");
+/// # Ok::<(), mzstd::DecodeError>(())
+/// ```
+#[derive(Debug)]
+pub struct Decompressor {
+    pub(super) config: DecoderConfig,
+    retention: RetentionPolicy,
+    pub(super) stream: Stream,
+}
+
+/// Builds a [`Decompressor`] with non-default options.
+///
+/// Obtained from [`Decompressor::builder`].
+///
+/// # Examples
+///
+/// ```
+/// use mzstd::{DecodeLimits, DecoderConfig, Decompressor, FrameMode, RetentionPolicy};
+/// let config = DecoderConfig::default()
+///     .with_frame_mode(FrameMode::Single)
+///     .with_limits(DecodeLimits::default().with_max_window_log(23)?);
+/// let decoder = Decompressor::builder(config)
+///     .with_retention(RetentionPolicy::ReleaseAll)
+///     .build();
+/// assert_eq!(decoder.config().frame_mode(), FrameMode::Single);
+/// assert_eq!(decoder.retention(), RetentionPolicy::ReleaseAll);
+/// # Ok::<(), mzstd::DecodeConfigError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecompressorBuilder {
+    config: DecoderConfig,
+    retention: RetentionPolicy,
+}
+
+impl DecompressorBuilder {
+    /// Sets what is kept allocated between operations.
+    #[must_use]
+    pub const fn with_retention(mut self, retention: RetentionPolicy) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Builds the decoder; nothing is allocated until it decodes.
+    #[must_use]
+    pub fn build(self) -> Decompressor {
+        Decompressor {
+            config: self.config,
+            retention: self.retention,
+            stream: Stream::new(self.config),
+        }
+    }
+}
+
+impl Default for Decompressor {
+    /// A decoder with [`DecoderConfig::DEFAULT`].
+    fn default() -> Self {
+        Self::new(DecoderConfig::DEFAULT)
+    }
+}
+
+impl From<DecoderConfig> for Decompressor {
+    fn from(config: DecoderConfig) -> Self {
+        Self::new(config)
+    }
+}
+
+impl Decompressor {
+    /// A decoder with `config` that keeps its buffers between operations;
+    /// nothing is allocated until it decodes.
+    #[must_use]
+    pub fn new(config: DecoderConfig) -> Self {
+        Self::builder(config).build()
+    }
+
+    /// Starts building a decoder with non-default options.
+    #[must_use]
+    pub const fn builder(config: DecoderConfig) -> DecompressorBuilder {
+        DecompressorBuilder {
+            config,
+            retention: RetentionPolicy::Aggressive,
+        }
+    }
+
+    /// The decoder's policy.
+    #[must_use]
+    pub const fn config(&self) -> &DecoderConfig {
+        &self.config
+    }
+
+    /// The retention policy applied after each operation.
+    #[must_use]
+    pub const fn retention(&self) -> RetentionPolicy {
+        self.retention
+    }
+
+    /// Replaces the policy for later operations, keeping allocations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Decompressor, FrameMode};
+    /// let mut decoder = Decompressor::default();
+    /// decoder.reconfigure(FrameMode::Single.into());
+    /// assert_eq!(decoder.config().frame_mode(), FrameMode::Single);
+    /// ```
+    pub fn reconfigure(&mut self, config: DecoderConfig) {
+        self.config = config;
+        self.stream.reset(config);
+    }
+
+    /// Heap bytes the decoder keeps between operations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::Decompressor;
+    /// let mut decoder = Decompressor::default();
+    /// assert_eq!(decoder.retained_bytes(), 0);
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x09, 0x00, 0x00, b'o'];
+    /// decoder.start().process(&frame, &mut [0; 4], Default::default())?;
+    /// assert!(decoder.retained_bytes() > 0);
+    /// # Ok::<(), mzstd::DecodeFailure>(())
+    /// ```
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.stream.retained_bytes()
+    }
+
+    /// Releases buffers that `policy` does not allow to keep.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Decompressor, RetentionPolicy};
+    /// let mut decoder = Decompressor::default();
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x09, 0x00, 0x00, b'o'];
+    /// decoder.start().process(&frame, &mut [0; 4], Default::default())?;
+    /// decoder.trim(RetentionPolicy::Bounded { max_bytes: 1 << 30 });
+    /// assert!(decoder.retained_bytes() > 0);
+    /// decoder.trim(RetentionPolicy::ReleaseAll);
+    /// assert_eq!(decoder.retained_bytes(), 0);
+    /// # Ok::<(), mzstd::DecodeFailure>(())
+    /// ```
+    pub fn trim(&mut self, policy: RetentionPolicy) {
+        if !policy.allows(self.retained_bytes()) {
+            self.stream.release();
+        }
+    }
+
+    /// Applies the configured retention policy between operations.
+    pub(super) fn apply_retention(&mut self) {
+        self.trim(self.retention);
+    }
+
+    /// Starts an incremental operation borrowing this decoder.
+    ///
+    /// See [`DecoderSession::process`] for a complete loop.
+    pub fn start(&mut self) -> DecoderSession<'_> {
+        DecoderSession::new(self)
+    }
+
+    /// Starts an incremental operation that owns this decoder.
+    ///
+    /// See [`DecoderSessionOwned`] for an example.
+    #[must_use]
+    pub fn into_session(self) -> DecoderSessionOwned {
+        DecoderSessionOwned::new(self)
+    }
+
+    /// Decodes complete input into a new vector.
+    ///
+    /// In [`FrameMode::Concatenated`](super::FrameMode::Concatenated) the
+    /// input must consist of whole frames, at least one; in
+    /// [`FrameMode::Single`](super::FrameMode::Single) of one Zstandard
+    /// frame after any skippable frames, and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns format, checksum, content-size, limit and allocation errors,
+    /// [`DecodeError::UnexpectedEndOfInput`] for empty or truncated input,
+    /// and [`DecodeError::TrailingData`] for bytes after a single frame.
+    ///
+    /// # Examples
+    ///
+    /// See [`Decompressor`].
+    pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        let mut dst = Vec::new();
+        self.decompress_into(src, &mut dst)?;
+        Ok(dst)
+    }
+
+    /// Decodes complete input onto the end of `dst`, returning the range of
+    /// the appended bytes.
+    ///
+    /// The vector itself serves as the frames' history, so output is never
+    /// copied. On error `dst` is truncated back to its original length,
+    /// though it may keep capacity it grew.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::Decompressor;
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// let mut decoder = Decompressor::default();
+    /// let mut output = b"status: ".to_vec();
+    /// let range = decoder.decompress_into(&frame, &mut output)?;
+    /// assert_eq!(&output[range], b"ok");
+    /// assert!(decoder.decompress_into(&frame[..10], &mut output).is_err());
+    /// assert_eq!(output, b"status: ok");
+    /// # Ok::<(), mzstd::DecodeError>(())
+    /// ```
+    pub fn decompress_into(
+        &mut self,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Result<Range<usize>, DecodeError> {
+        let start = dst.len();
+        self.stream.reset(self.config);
+        let result = self.stream.decode_all(src, dst);
+        self.apply_retention();
+        match result {
+            Ok(()) => Ok(start..dst.len()),
+            Err(error) => {
+                dst.truncate(start);
+                Err(error)
+            }
+        }
+    }
+
+    /// Decodes complete input into `dst`, returning the number of bytes
+    /// written; the rest of `dst` is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress`], plus [`DecodeError::OutputTooSmall`] when
+    /// the output does not fit; `dst` is then completely filled with the
+    /// output's prefix. After other errors `dst` may hold a partial result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{DecodeError, Decompressor};
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// let mut decoder = Decompressor::default();
+    /// let mut output = [0xaa; 4];
+    /// let written = decoder.decompress_to_slice(&frame, &mut output)?;
+    /// assert_eq!(&output[..written], b"ok");
+    /// assert_eq!(&output[written..], &[0xaa, 0xaa]);
+    /// assert!(matches!(
+    ///     decoder.decompress_to_slice(&frame, &mut [0; 1]),
+    ///     Err(DecodeError::OutputTooSmall { written: 1 })
+    /// ));
+    /// # Ok::<(), mzstd::DecodeError>(())
+    /// ```
+    pub fn decompress_to_slice(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize, DecodeError> {
+        let mut session = self.start();
+        let progress = session.process(src, dst, DecodeOperation::Finish)?;
+        match progress.status {
+            DecoderStatus::NeedsOutput => Err(DecodeError::OutputTooSmall {
+                written: progress.produced,
+            }),
+            DecoderStatus::NeedsInput => Err(DecodeError::UnexpectedEndOfInput),
+            DecoderStatus::Finished if progress.consumed != src.len() => {
+                Err(DecodeError::TrailingData {
+                    offset: progress.consumed as u64,
+                })
+            }
+            DecoderStatus::Finished => Ok(progress.produced),
+        }
+    }
+}

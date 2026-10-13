@@ -1,0 +1,27 @@
+[package]
+name = "mzstd-afl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "AFL++ fuzz targets for the mzstd encoder and decoder"
+
+[dependencies]
+afl = "0.18"
+
+[dependencies.mzstd]
+path = "../.."
+
+[dependencies.zstd-ffi]
+path = "../../zstd-ffi"
+
+[features]
+default = []
+# Opt-in targets for surfaces still marked experimental. None exist yet; the
+# flag is kept so the stable and experimental configurations are both checked.
+experimental = []
+
+[profile.release]
+debug = true
+codegen-units = 1
+
+[workspace]

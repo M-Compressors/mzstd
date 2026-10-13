@@ -1,0 +1,47 @@
+name: CI Fuzz
+
+# Run for every pushed tag, or on demand from Actions / the GitHub CLI.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  smoke-fuzz:
+    name: bounded fuzz campaign
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [differential_c, output_capacity, encoder_session, compressor_lifecycle, parallel, parameter_parsing, decompress, decode_streaming, decode_roundtrip]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz/afl
+          cache-targets: false
+          prefix-key: v1-afl-no-targets
+      - run: cargo install cargo-afl --version 0.18.2 --locked --force
+      - run: cargo afl config --build --force
+      - name: configure the host for AFL
+        run: cargo afl system-config
+      - name: prepare seeds
+        run: fuzz/afl/prepare-seeds.sh
+      - name: fuzz
+        run: fuzz/afl/campaign.sh "${{ inputs.seconds || '600' }}" ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: findings-${{ matrix.target }}
+          path: fuzz/afl/findings
