@@ -17,7 +17,6 @@
 
 mod stream;
 
-use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -41,19 +40,19 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Engines shared by the tasks of one compressor.
 #[derive(Debug, Default)]
 pub(crate) struct EnginePool {
-    engines: Mutex<Vec<Box<Engine>>>,
+    /// Idle engines, held inline: an engine's large state (tables, block
+    /// states) is already on the heap, so moving one in or out is cheap.
+    engines: Mutex<Vec<Engine>>,
 }
 
 impl EnginePool {
-    /// An idle engine, or a new one.
-    pub(crate) fn take(&self) -> Box<Engine> {
-        lock(&self.engines)
-            .pop()
-            .unwrap_or_else(|| Box::new(Engine::empty()))
+    /// An idle engine, or a new one on the detected backend.
+    pub(crate) fn take(&self) -> Engine {
+        lock(&self.engines).pop().unwrap_or_else(Engine::new)
     }
 
     /// Returns an engine whose task completed.
-    pub(crate) fn give(&self, engine: Box<Engine>) {
+    pub(crate) fn give(&self, engine: Engine) {
         lock(&self.engines).push(engine);
     }
 

@@ -8,15 +8,19 @@
 
 use alloc::vec::Vec;
 
+use fearless_simd::{Simd, dispatch};
+use fearless_simd_macros::simd;
+
 use super::cctx::LdmParams;
 use super::double_fast;
 use super::fast;
 use super::ldm_geartab::GEAR_TAB;
 use super::match_state::{BlockCompressor, BlockInput, MatchState};
+use super::opt_count;
 use super::params::Strategy;
 use super::seq_store::{SeqStore, offset_to_offbase};
 use super::window::{HASH_READ_SIZE, Segments, WindowState};
-use crate::shared::xxhash::Xxh64;
+use crate::Backend;
 
 /// `LDM_BATCH_SIZE`.
 const BATCH_SIZE: usize = 64;
@@ -159,30 +163,97 @@ impl Gear {
     }
 
     /// `ZSTD_ldm_gear_feed`: records split points into `splits`, stopping
-    /// when the batch is full; returns how many bytes were consumed.
-    fn feed(&mut self, data: &[u8], splits: &mut Vec<usize>) -> usize {
+    /// when the batch is full; returns how many bytes were consumed and how
+    /// many splits were recorded.
+    fn feed(&mut self, data: &[u8], splits: &mut [u32; BATCH_SIZE]) -> (usize, usize) {
         let mut hash = self.rolling;
         let mask = self.stop_mask;
-        let mut n = 0;
-        while n < data.len() {
-            hash = (hash << 1).wrapping_add(GEAR_TAB[usize::from(data[n])]);
-            n += 1;
+        let mut found = 0;
+        for (n, &byte) in data.iter().enumerate() {
+            hash = (hash << 1).wrapping_add(GEAR_TAB[usize::from(byte)]);
             if hash & mask == 0 {
-                splits.push(n);
-                if splits.len() == BATCH_SIZE {
-                    break;
+                splits[found % BATCH_SIZE] = n as u32 + 1;
+                found += 1;
+                if found == BATCH_SIZE {
+                    self.rolling = hash;
+                    return (n + 1, found);
                 }
             }
         }
         self.rolling = hash;
-        n
+        (data.len(), found)
     }
 }
 
+/// `XXH64(data, len, 0)` in one shot, as `ZSTD_ldm_generateSequences`
+/// calls it once per split point; the same digest as the frame checksum's
+/// streaming hasher, without its buffering.
 fn xxh64(data: &[u8]) -> u64 {
-    let mut hasher = Xxh64::new(0);
-    hasher.update(data);
-    hasher.digest()
+    const PRIME_1: u64 = 0x9E37_79B1_85EB_CA87;
+    const PRIME_2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const PRIME_3: u64 = 0x1656_67B1_9E37_79F9;
+    const PRIME_4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const PRIME_5: u64 = 0x27D4_EB2F_1656_67C5;
+    const fn round(acc: u64, input: u64) -> u64 {
+        acc.wrapping_add(input.wrapping_mul(PRIME_2))
+            .rotate_left(31)
+            .wrapping_mul(PRIME_1)
+    }
+    let (stripes, mut tail) = data.as_chunks::<32>();
+    let mut hash = if stripes.is_empty() {
+        PRIME_5
+    } else {
+        let mut lanes = [
+            PRIME_1.wrapping_add(PRIME_2),
+            PRIME_2,
+            0,
+            PRIME_1.wrapping_neg(),
+        ];
+        for stripe in stripes {
+            let (words, _) = stripe.as_chunks::<8>();
+            for (lane, word) in lanes.iter_mut().zip(words) {
+                *lane = round(*lane, u64::from_le_bytes(*word));
+            }
+        }
+        let [v1, v2, v3, v4] = lanes;
+        let mut hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+        for lane in lanes {
+            hash = (hash ^ round(0, lane))
+                .wrapping_mul(PRIME_1)
+                .wrapping_add(PRIME_4);
+        }
+        hash
+    };
+    hash = hash.wrapping_add(data.len() as u64);
+    while let Some((word, rest)) = tail.split_first_chunk::<8>() {
+        hash ^= round(0, u64::from_le_bytes(*word));
+        hash = hash
+            .rotate_left(27)
+            .wrapping_mul(PRIME_1)
+            .wrapping_add(PRIME_4);
+        tail = rest;
+    }
+    if let Some((word, rest)) = tail.split_first_chunk::<4>() {
+        hash ^= u64::from(u32::from_le_bytes(*word)).wrapping_mul(PRIME_1);
+        hash = hash
+            .rotate_left(23)
+            .wrapping_mul(PRIME_2)
+            .wrapping_add(PRIME_3);
+        tail = rest;
+    }
+    for &byte in tail {
+        hash ^= u64::from(byte).wrapping_mul(PRIME_5);
+        hash = hash.rotate_left(11).wrapping_mul(PRIME_1);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(PRIME_2);
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(PRIME_3);
+    hash ^ (hash >> 32)
 }
 
 impl LdmState {
@@ -211,9 +282,12 @@ impl LdmState {
     }
 
     /// `ZSTD_ldm_generateSequences_internal` over `[start, end)` (window
-    /// indices of the LDM window). Returns the trailing literal count.
-    fn generate_internal(
+    /// indices of the LDM window), in `simd`'s feature context. Returns the
+    /// trailing literal count.
+    #[simd]
+    fn generate_internal<S: Simd>(
         &mut self,
+        simd: S,
         segments: &Segments<'_>,
         store: &mut RawSeqStore,
         params: &LdmParams,
@@ -237,7 +311,27 @@ impl LdmState {
         let ilimit = iend - i64::from(HASH_READ_SIZE);
         let mut anchor = istart;
         let mut ip = istart;
-        let mut splits = Vec::with_capacity(BATCH_SIZE);
+        let mut splits = [0u32; BATCH_SIZE];
+        let prefix_bytes = prefix.slice(prefix.start(), prefix.end());
+        let ext_bytes = view.ext.slice(view.ext.start(), view.ext.end());
+        // `ZSTD_count` / `ZSTD_count_2segments` from `split`, which is in the
+        // prefix, against an earlier candidate in either segment.
+        let count_forward = |split: u32, candidate: u32| {
+            let at = (split - dict_limit) as usize;
+            let limit = (end - dict_limit) as usize;
+            if candidate >= dict_limit {
+                opt_count::count(
+                    simd,
+                    prefix_bytes,
+                    at,
+                    (candidate - dict_limit) as usize,
+                    limit,
+                )
+            } else {
+                let earlier = ext_bytes.len() - (dict_limit - candidate) as usize;
+                opt_count::count_2segments(simd, prefix_bytes, at, ext_bytes, earlier, limit)
+            }
+        };
 
         if ((end - start) as usize) < min_match_length as usize {
             return Ok((iend - anchor) as usize);
@@ -247,16 +341,16 @@ impl LdmState {
         ip += i64::from(min_match_length);
 
         while ip < ilimit {
-            splits.clear();
-            let hashed = gear.feed(prefix.slice(ip as u32, ilimit as u32), &mut splits) as i64;
+            let (hashed, found) = gear.feed(prefix.slice(ip as u32, ilimit as u32), &mut splits);
+            let hashed = hashed as i64;
             let mut candidates = [(0u32, 0usize, 0u32); BATCH_SIZE];
-            for (n, &split_at) in splits.iter().enumerate() {
+            for (n, &split_at) in splits[..found].iter().enumerate() {
                 let split = (ip + split_at as i64 - i64::from(min_match_length)) as u32;
                 let xxhash = xxh64(prefix.slice(split, split + min_match_length));
                 let hash = (xxhash & ((1u64 << h_bits) - 1)) as usize;
                 candidates[n] = (split, hash, (xxhash >> 32) as u32);
             }
-            for &(split, hash, checksum) in &candidates[..splits.len()] {
+            for &(split, hash, checksum) in &candidates[..found] {
                 let new_entry = Entry {
                     offset: split,
                     checksum,
@@ -274,7 +368,7 @@ impl LdmState {
                     if cur.checksum != checksum || cur.offset <= lowest_index {
                         continue;
                     }
-                    let forward = view.count_virtual(split, cur.offset, end);
+                    let forward = count_forward(split, cur.offset);
                     if forward < min_match_length as usize {
                         continue;
                     }
@@ -335,6 +429,7 @@ impl LdmState {
         params: &LdmParams,
         mut start: u32,
         mut end: u32,
+        backend: Backend,
     ) {
         const MAX_CHUNK_SIZE: u32 = 1 << 20;
         let max_dist = 1u32 << params.window_log;
@@ -367,9 +462,9 @@ impl LdmState {
             }
             self.window
                 .enforce_max_dist(chunk_end, max_dist, &mut self.loaded_dict_end);
-            let Ok(new_leftover) =
-                self.generate_internal(segments, store, params, chunk_start, chunk_end)
-            else {
+            let Ok(new_leftover) = dispatch!(backend.0, simd => {
+                self.generate_internal(simd, segments, store, params, chunk_start, chunk_end)
+            }) else {
                 return;
             };
             if prev_size < store.size() {
@@ -413,9 +508,13 @@ pub(crate) fn block_compress(
     let min_match = ms.cparams.min_match;
     let src_size = (block.end - block.start) as usize;
     if ms.cparams.strategy >= Strategy::BtOpt {
-        ms.ldm_seq_store = Some(store.clone());
+        // Lent to the parser, which reads the candidates through its own
+        // cursor and hands them back unchanged.
+        ms.ldm_seq_store = Some(core::mem::take(store));
         let last_ll_size = compressor(ms, seq_store, rep, block);
-        ms.ldm_seq_store = None;
+        if let Some(lent) = ms.ldm_seq_store.take() {
+            *store = lent;
+        }
         store.skip_bytes_opt(src_size);
         return last_ll_size;
     }
@@ -433,6 +532,7 @@ pub(crate) fn block_compress(
             window: block.window,
             start: ip,
             end: ip + sequence.lit_length,
+            backend: block.backend,
         };
         let new_lit_length = compressor(ms, seq_store, rep, &sub) as u32;
         ip += sequence.lit_length;
@@ -452,6 +552,7 @@ pub(crate) fn block_compress(
         window: block.window,
         start: ip,
         end: block.end,
+        backend: block.backend,
     };
     compressor(ms, seq_store, rep, &tail)
 }
@@ -459,6 +560,33 @@ pub(crate) fn block_compress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::xxhash::Xxh64;
+
+    #[test]
+    fn one_shot_xxh64_matches_the_streaming_hasher() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 31 % 251) as u8).collect();
+        for len in 0..data.len() {
+            let mut hasher = Xxh64::new(0);
+            hasher.update(&data[..len]);
+            assert_eq!(xxh64(&data[..len]), hasher.digest(), "length {len}");
+        }
+    }
+
+    #[test]
+    fn gear_feed_stops_at_a_full_batch() {
+        let params = LdmParams {
+            hash_rate_log: 0,
+            ..LdmParams::default()
+        };
+        // With no rate bits every position is a split point.
+        let mut gear = Gear::new(&params);
+        let mut splits = [0u32; BATCH_SIZE];
+        let data = [7u8; 200];
+        assert_eq!(gear.feed(&data, &mut splits), (BATCH_SIZE, BATCH_SIZE));
+        assert_eq!(splits[0], 1);
+        assert_eq!(splits[BATCH_SIZE - 1], BATCH_SIZE as u32);
+        assert_eq!(gear.feed(&data[..10], &mut splits), (10, 10));
+    }
 
     fn seq(offset: u32, lit_length: u32, match_length: u32) -> RawSeq {
         RawSeq {

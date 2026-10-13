@@ -464,6 +464,7 @@ fn compress_single_block(
         &params,
         &mut dst[BLOCK_HEADER_SIZE..],
         src.len(),
+        engine.backend,
     )?;
     if !engine.is_first_block && c_seqs_size < RLE_MAX_LENGTH && block::is_rle(src) {
         c_seqs_size = 1;

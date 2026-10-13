@@ -1,10 +1,14 @@
 //! The sequences section of a compressed block
 //! (`zstd_compress_sequences.c` and `ZSTD_buildSequencesStatistics`).
 
+use fearless_simd::Simd;
+use fearless_simd_macros::simd;
+
 use super::bits::BitWriter;
 use super::fse::{self, CState, CTable};
 use super::hist;
 use super::{FseRepeat, FseTables};
+use crate::Backend;
 use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::Strategy;
 use crate::compressor::core::seq_store::SeqStore;
@@ -434,7 +438,26 @@ pub(crate) fn build_statistics(
     })
 }
 
-/// Writes the sequences bitstream (`ZSTD_encodeSequences`).
+/// `bits` padded to 64 entries, so a code masked to six bits indexes it
+/// without a bounds check.
+const fn padded_bits<const N: usize>(bits: [u8; N]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    let mut i = 0;
+    while i < N {
+        out[i] = bits[i];
+        i += 1;
+    }
+    out
+}
+
+/// Extra bits per literal length code.
+const LL_EXTRA_BITS: [u8; 64] = padded_bits(LL_BITS);
+/// Extra bits per match length code.
+const ML_EXTRA_BITS: [u8; 64] = padded_bits(ML_BITS);
+
+/// Writes the sequences bitstream (`ZSTD_encodeSequences`), backward from
+/// the last sequence, with the loop compiled for `backend` (the reference
+/// selects its BMI2 build at run time the same way).
 ///
 /// # Errors
 ///
@@ -443,48 +466,58 @@ pub(crate) fn encode(
     dst: &mut [u8],
     tables: &FseTables,
     store: &SeqStore,
+    backend: Backend,
+) -> Result<usize, CoreError> {
+    fearless_simd::dispatch!(backend.0, simd => encode_on(simd, dst, tables, store))
+}
+
+/// [`encode`] inside `simd`'s feature context.
+#[simd]
+fn encode_on<S: Simd>(
+    simd: S,
+    dst: &mut [u8],
+    tables: &FseTables,
+    store: &SeqStore,
 ) -> Result<usize, CoreError> {
     let Some(mut writer) = BitWriter::new(dst) else {
         return Err(CoreError::DstSizeTooSmall);
     };
     let n = store.nb_seq();
-    let seqs = &store.sequences;
-    let (ll, of, ml) = (&store.ll_code, &store.of_code, &store.ml_code);
+    let seqs = &store.sequences[..n];
+    let (ll, of, ml) = (
+        &store.ll_code[..n],
+        &store.of_code[..n],
+        &store.ml_code[..n],
+    );
     let last = n - 1;
+    let ll_bits_of = |code: u8| u32::from(LL_EXTRA_BITS[usize::from(code & 63)]);
+    let ml_bits_of = |code: u8| u32::from(ML_EXTRA_BITS[usize::from(code & 63)]);
 
     let mut state_ml = CState::with_first_symbol(&tables.matchlength, u32::from(ml[last]));
     let mut state_of = CState::with_first_symbol(&tables.offcode, u32::from(of[last]));
     let mut state_ll = CState::with_first_symbol(&tables.litlength, u32::from(ll[last]));
-    writer.add_bits(
-        u64::from(seqs[last].lit_length),
-        u32::from(LL_BITS[usize::from(ll[last])]),
-    );
-    writer.add_bits(
-        u64::from(seqs[last].ml_base),
-        u32::from(ML_BITS[usize::from(ml[last])]),
-    );
+    writer.add_bits(u64::from(seqs[last].lit_length), ll_bits_of(ll[last]));
+    writer.add_bits(u64::from(seqs[last].ml_base), ml_bits_of(ml[last]));
     writer.add_bits(u64::from(seqs[last].off_base), u32::from(of[last]));
     writer.flush();
 
-    for i in (0..last).rev() {
-        let ll_code = ll[i];
-        let of_code = of[i];
-        let ml_code = ml[i];
-        let ll_bits = u32::from(LL_BITS[usize::from(ll_code)]);
+    let codes = ll[..last].iter().zip(&of[..last]).zip(&ml[..last]);
+    for (seq, ((&ll_code, &of_code), &ml_code)) in seqs[..last].iter().zip(codes).rev() {
+        let ll_bits = ll_bits_of(ll_code);
         let of_bits = u32::from(of_code);
-        let ml_bits = u32::from(ML_BITS[usize::from(ml_code)]);
+        let ml_bits = ml_bits_of(ml_code);
         state_of.encode(&mut writer, u32::from(of_code));
         state_ml.encode(&mut writer, u32::from(ml_code));
         state_ll.encode(&mut writer, u32::from(ll_code));
         if of_bits + ml_bits + ll_bits >= 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG) {
             writer.flush();
         }
-        writer.add_bits(u64::from(seqs[i].lit_length), ll_bits);
-        writer.add_bits(u64::from(seqs[i].ml_base), ml_bits);
+        writer.add_bits(u64::from(seq.lit_length), ll_bits);
+        writer.add_bits(u64::from(seq.ml_base), ml_bits);
         if of_bits + ml_bits + ll_bits > 56 {
             writer.flush();
         }
-        writer.add_bits(u64::from(seqs[i].off_base), of_bits);
+        writer.add_bits(u64::from(seq.off_base), of_bits);
         writer.flush();
     }
 
@@ -500,6 +533,15 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_extra_bits_extend_the_format_tables_with_zeros() {
+        let ll = padded_bits(LL_BITS);
+        assert_eq!(ll[..LL_BITS.len()], LL_BITS);
+        assert!(ll[LL_BITS.len()..].iter().all(|&b| b == 0));
+        assert_eq!(ML_EXTRA_BITS[..ML_BITS.len()], ML_BITS);
+        assert_eq!(LL_EXTRA_BITS, ll);
+    }
 
     #[test]
     fn a_single_code_is_rle_unless_basic_is_cheaper() {

@@ -13,8 +13,10 @@
 use alloc::vec::Vec;
 
 use super::block::BlockHeader;
+use super::copy::WILDCOPY_OVERLENGTH;
 use super::frame::{FrameDecoder, FrameHeader, MAGIC_SIZE, header_size};
-use super::history::History;
+use super::history::{History, grow_zeroed};
+use crate::Backend;
 use crate::decompressor::{
     DecodeError, DecodeFailure, DecodeOperation, DecodeProgress, DecoderConfig, DecoderStatus,
     FrameMode, InvalidDataKind,
@@ -123,11 +125,13 @@ pub(crate) struct Stream {
     final_end: Option<u64>,
     finished: bool,
     failed: bool,
+    /// The SIMD level every kernel runs with.
+    backend: Backend,
 }
 
 impl Stream {
-    /// An idle decoder for `config`; nothing is allocated yet.
-    pub(crate) fn new(config: DecoderConfig) -> Self {
+    /// An idle decoder for `config` on `backend`; nothing is allocated yet.
+    pub(crate) fn new(config: DecoderConfig, backend: Backend) -> Self {
         Self {
             config,
             state: State::Magic,
@@ -142,7 +146,13 @@ impl Stream {
             final_end: None,
             finished: false,
             failed: false,
+            backend,
         }
+    }
+
+    /// The SIMD level the decoder runs with.
+    pub(crate) const fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// Starts a new operation under `config`, keeping allocations.
@@ -367,10 +377,17 @@ impl Stream {
                         return Ok(DecoderStatus::NeedsInput);
                     }
                     let window = self.window_size().ok_or(DecodeError::InvalidState)?;
-                    let buffer = self.history.prepare(window);
-                    let before = buffer.len();
-                    self.frame.decode_block(&block, &self.scratch, buffer, 0)?;
-                    self.decoded += (buffer.len() - before) as u64;
+                    let (buffer, start) = self.history.prepare(window, self.frame.block_max())?;
+                    let end = self.frame.decode_block(
+                        self.backend,
+                        &block,
+                        &self.scratch,
+                        buffer,
+                        start,
+                        0,
+                    )?;
+                    self.history.commit(end);
+                    self.decoded += (end - start) as u64;
                     if let Some(limit) = self.config.limits().max_output_bytes()
                         && self.decoded > limit
                     {
@@ -412,8 +429,41 @@ impl Stream {
     /// original length.
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
     pub(crate) fn decode_all(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut out = VecOutput {
+            buffer: dst,
+            filled: 0,
+        };
+        out.filled = out.buffer.len();
+        let result = self.walk(src, &mut out);
+        let filled = out.filled;
+        dst.truncate(filled);
+        result
+    }
+
+    /// Decodes complete input straight into `dst`, returning the output's
+    /// length, when every Zstandard frame declares a content size that
+    /// fits. `None` asks the caller to take the incremental path, which
+    /// also reports any error: this path stops at the first one, and may
+    /// have written anywhere before the end of the frame it failed in.
+    ///
+    /// Each frame's output is cut to its declared size, so chunked copies
+    /// never touch bytes past the output.
+    #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
+    pub(crate) fn decode_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
+        let mut out = SliceOutput {
+            buffer: dst,
+            filled: 0,
+            frame_end: 0,
+        };
+        self.walk(src, &mut out).ok()?;
+        Some(out.filled)
+    }
+
+    /// The one-shot frame grammar over complete input, writing through
+    /// `out`.
+    fn walk<O: Output>(&mut self, src: &[u8], out: &mut O) -> Result<(), DecodeError> {
         let limits = self.config.limits();
-        let base = dst.len();
+        let base = out.filled();
         let (data, limit) = match limits.max_input_bytes() {
             Some(limit) if src.len() as u64 > limit => (&src[..limit as usize], Some(limit)),
             _ => (src, None),
@@ -454,13 +504,24 @@ impl Stream {
             })?;
             let header = FrameHeader::parse(reader.take(header_size(descriptor))?)?;
             self.frame.begin(header, &limits)?;
-            let frame_start = dst.len();
+            let frame_start = out.filled();
+            out.begin_frame(header.content_size)?;
             loop {
                 let block = BlockHeader::parse(reader.take_array()?, self.frame.block_max())?;
                 let content = reader.take(block.content_size())?;
-                self.frame.decode_block(&block, content, dst, frame_start)?;
+                let start = out.filled();
+                let buffer = out.reserve(self.frame.block_max())?;
+                let end = self.frame.decode_block(
+                    self.backend,
+                    &block,
+                    content,
+                    buffer,
+                    start,
+                    frame_start,
+                )?;
+                out.commit(end);
                 if let Some(limit) = limits.max_output_bytes()
-                    && (dst.len() - base) as u64 > limit
+                    && (end - base) as u64 > limit
                 {
                     return Err(DecodeError::OutputLimitExceeded { limit });
                 }
@@ -481,6 +542,84 @@ impl Stream {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Where the one-shot driver writes: a buffer whose prefix up to
+/// [`Output::filled`] is output, the current frame's included.
+trait Output {
+    /// Bytes of output so far.
+    fn filled(&self) -> usize;
+
+    /// Starts a frame that declares `content_size`, if it does.
+    fn begin_frame(&mut self, content_size: Option<u64>) -> Result<(), DecodeError>;
+
+    /// The buffer, with room for a block of `block_max` bytes after the
+    /// output where it can grow.
+    fn reserve(&mut self, block_max: usize) -> Result<&mut [u8], DecodeError>;
+
+    /// Records the end of the block just decoded.
+    fn commit(&mut self, end: usize);
+}
+
+/// A caller's vector, grown with initialized slack for chunked copies.
+struct VecOutput<'a> {
+    buffer: &'a mut Vec<u8>,
+    filled: usize,
+}
+
+impl Output for VecOutput<'_> {
+    fn filled(&self) -> usize {
+        self.filled
+    }
+
+    fn begin_frame(&mut self, _content_size: Option<u64>) -> Result<(), DecodeError> {
+        // The buffer grows block by block, as output is produced: a declared
+        // size alone never makes the decoder allocate.
+        Ok(())
+    }
+
+    fn reserve(&mut self, block_max: usize) -> Result<&mut [u8], DecodeError> {
+        grow_zeroed(self.buffer, self.filled + block_max + WILDCOPY_OVERLENGTH)?;
+        Ok(self.buffer)
+    }
+
+    fn commit(&mut self, end: usize) {
+        self.filled = end;
+    }
+}
+
+/// A caller's slice, cut at each frame's declared end.
+struct SliceOutput<'a> {
+    buffer: &'a mut [u8],
+    filled: usize,
+    frame_end: usize,
+}
+
+impl Output for SliceOutput<'_> {
+    fn filled(&self) -> usize {
+        self.filled
+    }
+
+    fn begin_frame(&mut self, content_size: Option<u64>) -> Result<(), DecodeError> {
+        let room = (self.buffer.len() - self.filled) as u64;
+        match content_size {
+            Some(size) if size <= room => {
+                self.frame_end = self.filled + size as usize;
+                Ok(())
+            }
+            _ => Err(DecodeError::OutputTooSmall {
+                written: self.filled,
+            }),
+        }
+    }
+
+    fn reserve(&mut self, _block_max: usize) -> Result<&mut [u8], DecodeError> {
+        Ok(&mut self.buffer[..self.frame_end])
+    }
+
+    fn commit(&mut self, end: usize) {
+        self.filled = end;
     }
 }
 
@@ -510,7 +649,7 @@ mod tests {
     }
 
     fn stream(config: DecoderConfig) -> Stream {
-        let mut stream = Stream::new(DecoderConfig::DEFAULT);
+        let mut stream = Stream::new(DecoderConfig::DEFAULT, Backend::default());
         stream.reset(config);
         stream
     }

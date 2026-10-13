@@ -28,7 +28,7 @@ graph TD
 | --- | --- |
 | `config` | `Level`, `Strategy`, `CompressionParams`, `LdmParams`, `LongDistanceMatching`, `EncoderConfig`, `Parameter`, `ConfigError`, `SizeOverflow`, and validation against the reference's bounds. |
 | `internal` | `requested_params`: the single translation from `EncoderConfig` to the core's `RequestedParams` (the reference's `ZSTD_CCtx_params`). |
-| `encoder` | `Compressor`, `CompressorBuilder`, one-shot calls, `start`/`into_session`, retention. |
+| `encoder` | `Compressor`, `CompressorBuilder` (`with_retention`, `with_backend`), one-shot calls, `start`/`into_session`, retention. The backend (default: the detected SIMD level) is stored in the `Engine` for the match finders. |
 | `session` | `EncoderSession`, `EncoderSessionOwned`, `StreamConfig`, `InputSize`, `Operation`, `EncoderStatus`, `Progress`. |
 | `error` | `EncodeError` and the mapping from the core's private `CoreError`. |
 | `io` | `EncoderReader`, `EncoderWriter`, `EncoderReaderParts` (re-exported from `mzstd::io`). `EncoderReader::into_parts` returns the source with the bytes read from it that the session had not accepted; `ParallelEncoderReader::into_parts` returns the same type. |
@@ -55,8 +55,10 @@ classDiagram
         config: EncoderConfig
         requested: RequestedParams
         retention: RetentionPolicy
+        backend: Backend
         engine: Box~Engine~
         stream: Stream
+        +backend() Backend
         +compress(&[u8]) Vec~u8~
         +compress_into(&[u8], &mut Vec~u8~) Range
         +compress_to_slice(&[u8], &mut [u8]) usize

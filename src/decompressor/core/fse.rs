@@ -6,8 +6,13 @@
 //! table (section 4.1.1.1, Appendix A), and [`decode_weights`] runs the
 //! interleaved two-state decoder over a Huffman weight stream
 //! (section 4.2.1.2).
+//!
+//! Sequence decoding uses [`SeqTable`] instead of [`FseTable`]: each row
+//! also carries its symbol's baseline and extra-bit count, as the
+//! reference's `ZSTD_seqSymbol` does, so a sequence field costs one table
+//! lookup and one bit read.
 
-use alloc::vec::Vec;
+use alloc::boxed::Box;
 
 use super::bits::{ForwardBitReader, ReverseBitReader};
 use crate::decompressor::InvalidDataKind;
@@ -34,20 +39,168 @@ pub(crate) struct FseEntry {
     pub(crate) new_state: u16,
 }
 
+/// Symbols a distribution can describe.
+const MAX_SYMBOLS: usize = MAX_LIT as usize + 1;
+
 /// A normalized distribution: `-1` marks a "less than one" probability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Distribution {
-    /// Probabilities of symbols `0..counts.len()`.
-    pub(crate) counts: Vec<i16>,
+    /// Probabilities of symbols `0..len`; the rest are zero.
+    probabilities: [i16; MAX_SYMBOLS],
+    /// Symbols described.
+    len: usize,
     /// Accuracy log.
     pub(crate) table_log: u32,
 }
 
-/// An FSE decoding table of `1 << log` rows.
+impl Distribution {
+    /// Probabilities of the described symbols.
+    pub(crate) fn counts(&self) -> &[i16] {
+        &self.probabilities[..self.len.min(MAX_SYMBOLS)]
+    }
+
+    /// Appends `count` zero probabilities. The count may overshoot the
+    /// symbol limit, which [`read_distribution`] then rejects.
+    const fn push_zeros(&mut self, count: usize) {
+        self.len += count;
+    }
+
+    /// Appends one probability; the caller stays within the symbol limit.
+    fn push(&mut self, probability: i16) {
+        if let Some(slot) = self.probabilities.get_mut(self.len) {
+            *slot = probability;
+        }
+        self.len += 1;
+    }
+}
+
+/// Largest accuracy log of a table [`FseTable`] holds.
+const FSE_TABLE_LOG_MAX: u32 = WEIGHT_TABLE_LOG_MAX;
+/// Rows of the largest [`FseTable`].
+const FSE_TABLE_SIZE: usize = 1 << FSE_TABLE_LOG_MAX;
+
+/// An FSE decoding table of `1 << log` rows, for Huffman weights.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FseTable {
     log: u32,
-    entries: Vec<FseEntry>,
+    entries: [FseEntry; FSE_TABLE_SIZE],
+}
+
+/// Largest accuracy log of a sequence table (literal and match lengths).
+pub(crate) const SEQ_TABLE_LOG_MAX: u32 = 9;
+/// Rows of the largest [`SeqTable`]; smaller tables use a prefix.
+pub(crate) const SEQ_TABLE_SIZE: usize = 1 << SEQ_TABLE_LOG_MAX;
+/// Masks a state into [`SEQ_TABLE_SIZE`].
+const SEQ_STATE_MASK: usize = SEQ_TABLE_SIZE - 1;
+
+/// One sequence decoding row: the next state's base and bit count, and the
+/// decoded symbol's baseline and extra-bit count; the reference's
+/// `ZSTD_seqSymbol`.
+///
+/// The sequence loop holds references to rows and reads each field when it
+/// needs it, as the reference does, rather than three rows' worth of
+/// fields in registers it does not have.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SeqRow {
+    base: u32,
+    next_state: u16,
+    extra_bits: u8,
+    nb_bits: u8,
+}
+
+impl SeqRow {
+    /// A row.
+    pub(crate) const fn new(base: u32, next_state: u16, extra_bits: u8, nb_bits: u8) -> Self {
+        Self {
+            base,
+            next_state,
+            extra_bits,
+            nb_bits,
+        }
+    }
+
+    /// Baseline of the decoded symbol's value.
+    #[inline(always)]
+    pub(crate) const fn base(&self) -> u32 {
+        self.base
+    }
+
+    /// Base of the next state.
+    #[inline(always)]
+    pub(crate) const fn next_state(&self) -> usize {
+        self.next_state as usize
+    }
+
+    /// Extra bits that follow the baseline.
+    #[inline(always)]
+    pub(crate) const fn extra_bits(&self) -> u32 {
+        self.extra_bits as u32
+    }
+
+    /// Bits to read for the next state.
+    #[inline(always)]
+    pub(crate) const fn nb_bits(&self) -> u32 {
+        self.nb_bits as u32
+    }
+}
+
+/// A sequence decoding table of `1 << log` rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SeqTable {
+    log: u32,
+    rows: Box<[SeqRow; SEQ_TABLE_SIZE]>,
+}
+
+impl Default for SeqTable {
+    fn default() -> Self {
+        Self {
+            log: 0,
+            rows: Box::new([SeqRow::default(); SEQ_TABLE_SIZE]),
+        }
+    }
+}
+
+/// Spreads a distribution over `1 << table_log` cells (RFC 8878 section
+/// 4.1.1.1), writing each cell's symbol into `symbols`, and leaves in `next`
+/// the first state of each symbol.
+fn spread(counts: &[i16], table_log: u32, symbols: &mut [u8], next: &mut [u16; MAX_SYMBOLS]) {
+    let size = 1usize << table_log;
+    // "Less than one" symbols take single cells from the end.
+    let mut high = size;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == -1 {
+            high -= 1;
+            symbols[high] = symbol as u8;
+            next[symbol] = 1;
+        } else {
+            next[symbol] = count.max(0) as u16;
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let mut position = 0;
+    for (symbol, &count) in counts.iter().enumerate() {
+        for _ in 0..count.max(0) {
+            symbols[position] = symbol as u8;
+            position = (position + step) & mask;
+            while position >= high {
+                position = (position + step) & mask;
+            }
+        }
+    }
+}
+
+/// The bit count and next-state base of a cell whose symbol's state
+/// counter reads `next`, in a table of `1 << table_log` cells.
+const fn transition(next: u16, table_log: u32) -> (u8, u16) {
+    // Every placed symbol has a non-zero count; `max(1)` only keeps the
+    // arithmetic total for a table nothing else would accept.
+    let state = if next == 0 { 1 } else { next as u32 };
+    let nb_bits = table_log - highbit32(state);
+    (
+        nb_bits as u8,
+        ((state << nb_bits) - (1u32 << table_log)) as u16,
+    )
 }
 
 /// Reads a normalized distribution describing symbols `0..=max_symbol`.
@@ -66,7 +219,11 @@ pub(crate) fn read_distribution(
     if table_log > MAX_TABLE_LOG_DESCRIBED {
         return Err(invalid);
     }
-    let mut counts = Vec::with_capacity(symbol_limit);
+    let mut counts = Distribution {
+        probabilities: [0; MAX_SYMBOLS],
+        len: 0,
+        table_log,
+    };
     let mut remaining: i32 = (1 << table_log) + 1;
     let mut threshold: i32 = 1 << table_log;
     let mut nb_bits = table_log + 1;
@@ -76,12 +233,12 @@ pub(crate) fn read_distribution(
             // Two-bit repeat flags; a value of 3 continues the run.
             loop {
                 let repeat = bits.read(2) as usize;
-                counts.resize(counts.len() + repeat, 0);
-                if repeat != 3 || counts.len() >= symbol_limit {
+                counts.push_zeros(repeat);
+                if repeat != 3 || counts.len >= symbol_limit {
                     break;
                 }
             }
-            if counts.len() >= symbol_limit {
+            if counts.len >= symbol_limit {
                 break;
             }
         }
@@ -106,81 +263,44 @@ pub(crate) fn read_distribution(
             nb_bits = highbit32(remaining as u32) + 1;
             threshold = 1 << (nb_bits - 1);
         }
-        if counts.len() >= symbol_limit {
+        if counts.len >= symbol_limit {
             break;
         }
     }
-    if remaining != 1 || counts.len() > symbol_limit {
+    if remaining != 1 || counts.len > symbol_limit {
         return Err(invalid);
     }
     let used = bits.bytes_used();
     if used > src.len() {
         return Err(invalid);
     }
-    Ok((Distribution { counts, table_log }, used))
+    Ok((counts, used))
 }
 
 impl FseTable {
     /// Builds the decoding table of a distribution whose probabilities sum
-    /// to `1 << table_log`.
+    /// to `1 << table_log`, at most `1 << 6`.
     pub(crate) fn from_distribution(counts: &[i16], table_log: u32) -> Self {
+        debug_assert!(table_log <= FSE_TABLE_LOG_MAX);
         let size = 1usize << table_log;
-        let mut entries = alloc::vec![FseEntry::default(); size];
-        let mut next = [0u16; 256];
-        // "Less than one" symbols take single rows from the end.
-        let mut high = size;
-        for (symbol, &count) in counts.iter().enumerate() {
-            if count == -1 {
-                high -= 1;
-                entries[high].symbol = symbol as u8;
-                next[symbol] = 1;
-            } else {
-                next[symbol] = count.max(0) as u16;
-            }
-        }
-        let step = (size >> 1) + (size >> 3) + 3;
-        let mask = size - 1;
-        let mut position = 0;
-        for (symbol, &count) in counts.iter().enumerate() {
-            for _ in 0..count.max(0) {
-                entries[position].symbol = symbol as u8;
-                position = (position + step) & mask;
-                while position >= high {
-                    position = (position + step) & mask;
-                }
-            }
-        }
-        for entry in &mut entries {
-            let next_state = &mut next[usize::from(entry.symbol)];
-            // Every placed symbol has a non-zero count; `max(1)` only keeps
-            // the arithmetic total for a table nothing else would accept.
-            let state = u32::from(*next_state).max(1);
-            let nb_bits = table_log - highbit32(state);
-            entry.nb_bits = nb_bits as u8;
-            entry.new_state = ((state << nb_bits) - size as u32) as u16;
+        let mut symbols = [0u8; FSE_TABLE_SIZE];
+        let mut next = [0u16; MAX_SYMBOLS];
+        spread(counts, table_log, &mut symbols[..size], &mut next);
+        let mut entries = [FseEntry::default(); FSE_TABLE_SIZE];
+        for (entry, &symbol) in entries.iter_mut().zip(&symbols[..size]) {
+            let next_state = &mut next[usize::from(symbol)];
+            let (nb_bits, new_state) = transition(*next_state, table_log);
+            *entry = FseEntry {
+                symbol,
+                nb_bits,
+                new_state,
+            };
             *next_state += 1;
         }
         Self {
             log: table_log,
             entries,
         }
-    }
-
-    /// A one-row table that always yields `symbol` and reads no bits.
-    pub(crate) fn rle(symbol: u8) -> Self {
-        Self {
-            log: 0,
-            entries: alloc::vec![FseEntry {
-                symbol,
-                nb_bits: 0,
-                new_state: 0,
-            }],
-        }
-    }
-
-    /// Heap bytes the table holds.
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.entries.capacity() * size_of::<FseEntry>()
     }
 
     /// Accuracy log: the bits an initial state takes.
@@ -206,6 +326,77 @@ impl FseTable {
     }
 }
 
+impl SeqTable {
+    /// Rebuilds the table for a distribution whose probabilities sum to
+    /// `1 << table_log`, at most `1 << 9`, over an alphabet whose symbol `s`
+    /// decodes to `bases[s]` plus `extra_bits[s]` more bits.
+    pub(crate) fn fill(
+        &mut self,
+        counts: &[i16],
+        table_log: u32,
+        bases: &[u32],
+        extra_bits: &[u8],
+    ) {
+        debug_assert!(table_log <= SEQ_TABLE_LOG_MAX);
+        let size = 1usize << table_log;
+        let mut symbols = [0u8; SEQ_TABLE_SIZE];
+        let mut next = [0u16; MAX_SYMBOLS];
+        spread(counts, table_log, &mut symbols[..size], &mut next);
+        for (row, &symbol) in self.rows.iter_mut().zip(&symbols[..size]) {
+            let symbol = usize::from(symbol);
+            let next_state = &mut next[symbol];
+            let (nb_bits, state) = transition(*next_state, table_log);
+            *row = SeqRow::new(
+                bases.get(symbol).copied().unwrap_or_default(),
+                state,
+                extra_bits.get(symbol).copied().unwrap_or_default(),
+                nb_bits,
+            );
+            *next_state += 1;
+        }
+        self.log = table_log;
+    }
+
+    /// Makes the table a single row that always yields `base` plus
+    /// `extra_bits` more bits and reads no state bits.
+    pub(crate) fn fill_rle(&mut self, base: u32, extra_bits: u8) {
+        self.rows[0] = SeqRow::new(base, 0, extra_bits, 0);
+        self.log = 0;
+    }
+
+    /// Heap bytes the table holds.
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        size_of::<[SeqRow; SEQ_TABLE_SIZE]>()
+    }
+
+    /// Accuracy log: the bits an initial state takes.
+    pub(crate) const fn log(&self) -> u32 {
+        self.log
+    }
+
+    /// The row for `state`; states come from this table's own
+    /// transitions, and the mask only spares the bounds check.
+    #[cfg(test)]
+    pub(crate) fn row(&self, state: usize) -> SeqRow {
+        self.rows()[state & SEQ_STATE_MASK]
+    }
+
+    /// The rows, for loops that look them up with [`seq_row`].
+    #[inline(always)]
+    pub(crate) fn rows(&self) -> &[SeqRow; SEQ_TABLE_SIZE] {
+        &self.rows
+    }
+}
+
+/// The row of `rows` for `state`; states come from the table's own
+/// transitions, and the mask only spares the bounds check.
+#[inline(always)]
+pub(crate) fn seq_row(rows: &[SeqRow; SEQ_TABLE_SIZE], state: usize) -> &SeqRow {
+    &rows[state & SEQ_STATE_MASK]
+}
+
+impl SeqTable {}
+
 /// Decodes an FSE-compressed Huffman weight series into `weights`, returning
 /// how many weights it holds.
 ///
@@ -221,7 +412,7 @@ pub(crate) fn decode_weights(
     if distribution.table_log > WEIGHT_TABLE_LOG_MAX {
         return Err(invalid);
     }
-    let table = FseTable::from_distribution(&distribution.counts, distribution.table_log);
+    let table = FseTable::from_distribution(distribution.counts(), distribution.table_log);
     let stream = src.get(used..).ok_or(invalid)?;
     let mut bits = ReverseBitReader::new(stream).ok_or(invalid)?;
     let mut states = [
@@ -256,6 +447,7 @@ mod tests {
         LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG,
         OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG,
     };
+    use alloc::vec::Vec;
 
     /// Writes `(value, width)` fields forward, little-endian.
     fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
@@ -286,7 +478,7 @@ mod tests {
         let src = pack(&[(0, 4), (17, 5), (31, 5)]);
         let (distribution, used) = read_distribution(&src, 1).expect("valid");
         assert_eq!(distribution.table_log, 5);
-        assert_eq!(distribution.counts, [16, 16]);
+        assert_eq!(distribution.counts(), [16, 16]);
         assert_eq!(used, 2);
     }
 
@@ -298,7 +490,7 @@ mod tests {
         // so it is stored as 33 + max (30) = 63 in six bits.
         let src = pack(&[(0, 4), (1, 5), (3, 2), (1, 2), (63, 6)]);
         let (distribution, _) = read_distribution(&src, 8).expect("valid");
-        assert_eq!(distribution.counts, [0, 0, 0, 0, 0, 32]);
+        assert_eq!(distribution.counts(), [0, 0, 0, 0, 0, 32]);
     }
 
     #[test]
@@ -370,14 +562,39 @@ mod tests {
     }
 
     #[test]
-    fn an_rle_table_reads_no_bits() {
-        let table = FseTable::rle(7);
-        let mut bits = ReverseBitReader::new(&[0x01]).expect("terminated");
-        let state = table.initial_state(&mut bits);
-        assert_eq!(table.entry(state).symbol, 7);
-        assert_eq!(table.next_state(state, &mut bits), 0);
-        assert!(bits.is_exhausted());
-        assert_eq!(table.entry(99), FseEntry::default());
+    fn an_rle_sequence_table_reads_no_bits() {
+        let mut table = SeqTable::default();
+        table.fill_rle(35, 3);
+        assert_eq!(table.log(), 0);
+        assert_eq!(table.row(0), SeqRow::new(35, 0, 3, 0));
+        assert_eq!(table.retained_bytes(), 512 * size_of::<SeqRow>());
+    }
+
+    #[test]
+    fn sequence_tables_carry_the_weight_tables_transitions_and_baselines() {
+        let bases: [u32; 36] = core::array::from_fn(|code| 100 + code as u32);
+        let extra: [u8; 36] = core::array::from_fn(|code| code as u8 % 17);
+        let mut table = SeqTable::default();
+        table.fill(&LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, &bases, &extra);
+        let reference = FseTable::from_distribution(&LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG);
+        assert_eq!(table.log(), LL_DEFAULT_NORM_LOG);
+        for state in 0..1 << LL_DEFAULT_NORM_LOG {
+            let entry = reference.entry(state);
+            let row = table.row(state);
+            assert_eq!(row.base(), bases[usize::from(entry.symbol)]);
+            assert_eq!(
+                row.extra_bits(),
+                u32::from(extra[usize::from(entry.symbol)])
+            );
+            assert_eq!(
+                (row.nb_bits(), row.next_state()),
+                (u32::from(entry.nb_bits), usize::from(entry.new_state))
+            );
+        }
+        assert_eq!(
+            FseTable::from_distribution(&[32], 5).entry(99),
+            FseEntry::default()
+        );
     }
 
     #[test]

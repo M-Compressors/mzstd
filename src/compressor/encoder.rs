@@ -12,7 +12,7 @@ use super::core::stream::Stream;
 use super::error::EncodeError;
 use super::internal::requested_params;
 use super::session::{EncoderSession, EncoderSessionOwned, StreamConfig};
-use crate::RetentionPolicy;
+use crate::{Backend, RetentionPolicy};
 
 /// A Zstandard compressor that keeps its tables between frames.
 ///
@@ -40,6 +40,7 @@ pub struct Compressor {
     config: EncoderConfig,
     pub(crate) requested: RequestedParams,
     retention: RetentionPolicy,
+    backend: Backend,
     pub(crate) engine: Box<Engine>,
     pub(crate) stream: Stream,
     next_input_id: u64,
@@ -59,18 +60,23 @@ impl Default for Compressor {
     fn default() -> Self {
         // The default configuration holds no explicit parameter, so there
         // is nothing to validate.
-        Self::validated(EncoderConfig::default(), RetentionPolicy::Aggressive)
+        Self::validated(
+            EncoderConfig::default(),
+            RetentionPolicy::Aggressive,
+            Backend::default(),
+        )
     }
 }
 
 impl Compressor {
     /// A compressor for a configuration that passed validation.
-    fn validated(config: EncoderConfig, retention: RetentionPolicy) -> Self {
+    fn validated(config: EncoderConfig, retention: RetentionPolicy, backend: Backend) -> Self {
         Self {
             config,
             requested: requested_params(&config),
             retention,
-            engine: Box::new(Engine::empty()),
+            backend,
+            engine: Box::new(Engine::with_backend(backend)),
             stream: Stream::new(),
             next_input_id: 0,
         }
@@ -111,6 +117,7 @@ impl Compressor {
         CompressorBuilder {
             config,
             retention: RetentionPolicy::Aggressive,
+            backend: None,
         }
     }
 
@@ -118,6 +125,20 @@ impl Compressor {
     #[must_use]
     pub const fn config(&self) -> &EncoderConfig {
         &self.config
+    }
+
+    /// The SIMD backend the compressor runs on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Backend, Compressor};
+    ///
+    /// assert_eq!(Compressor::default().backend(), Backend::default());
+    /// ```
+    #[must_use]
+    pub const fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// The retention policy.
@@ -370,7 +391,7 @@ impl Compressor {
     /// ```
     pub fn trim(&mut self, policy: RetentionPolicy) {
         if !policy.allows(self.retained_bytes()) {
-            *self.engine = Engine::empty();
+            *self.engine = Engine::with_backend(self.backend);
             self.stream.release();
         }
     }
@@ -393,6 +414,7 @@ impl Compressor {
 pub struct CompressorBuilder {
     config: EncoderConfig,
     retention: RetentionPolicy,
+    backend: Option<Backend>,
 }
 
 impl CompressorBuilder {
@@ -403,6 +425,32 @@ impl CompressorBuilder {
         self
     }
 
+    /// Selects the SIMD backend instead of the best one the host supports.
+    ///
+    /// Every backend writes identical frames; this exists for
+    /// reproducible measurements and differential tests.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Backend, Compressor};
+    ///
+    /// let mut detected = Compressor::default();
+    /// for backend in Backend::available() {
+    ///     let mut selected = Compressor::builder(Default::default())
+    ///         .with_backend(backend)
+    ///         .build()?;
+    ///     assert_eq!(selected.backend(), backend);
+    ///     assert_eq!(selected.compress(b"identical bytes")?, detected.compress(b"identical bytes")?);
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub const fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     /// Builds the compressor.
     ///
     /// # Errors
@@ -410,6 +458,10 @@ impl CompressorBuilder {
     /// [`ConfigError`] when a parameter is out of range.
     pub fn build(self) -> Result<Compressor, ConfigError> {
         self.config.validate()?;
-        Ok(Compressor::validated(self.config, self.retention))
+        Ok(Compressor::validated(
+            self.config,
+            self.retention,
+            self.backend.unwrap_or_default(),
+        ))
     }
 }

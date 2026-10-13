@@ -4,10 +4,13 @@
 //! compressed block to the next: the literals Huffman table, the three
 //! sequence tables and the repeat offsets.
 
-use alloc::vec::Vec;
+use fearless_simd::Simd;
 
+use super::BlockError;
+use super::copy::MatchCopy;
 use super::literals::LiteralsDecoder;
-use super::sequences::{BlockContext, SequenceTables};
+use super::sequences::{BlockContext, SequenceSection, SequenceTables};
+use crate::Backend;
 use crate::decompressor::InvalidDataKind;
 use crate::shared::format::{
     BLOCK_COMPRESSED, BLOCK_HEADER_SIZE, BLOCK_RAW, BLOCK_RLE, REP_NUM, REP_START,
@@ -100,54 +103,130 @@ impl BlockDecoder {
         self.reps = REP_START;
     }
 
-    /// Regenerates one block, appending its output to `out`.
+    /// Regenerates one block into `out[op..]`, returning the end of its
+    /// output; `out[context.history_start..op]` is the frame's history.
     ///
     /// `content` holds exactly [`BlockHeader::content_size`] bytes.
+    /// [`BlockError::OutputFull`] reports that `out` ends before the block
+    /// does. Compressed blocks run on `backend`, selected here once per
+    /// block.
     pub(crate) fn decode(
         &mut self,
+        backend: Backend,
         header: &BlockHeader,
         content: &[u8],
-        out: &mut Vec<u8>,
+        out: &mut [u8],
+        op: usize,
         context: BlockContext,
-    ) -> Result<(), InvalidDataKind> {
+    ) -> Result<usize, BlockError> {
         match header.kind {
-            BlockKind::Raw => out.extend_from_slice(content),
+            BlockKind::Raw => {
+                let end = op + content.len();
+                let target = out.get_mut(op..end).ok_or(BlockError::OutputFull)?;
+                target.copy_from_slice(content);
+                Ok(end)
+            }
             BlockKind::Rle => {
                 let &byte = content.first().ok_or(InvalidDataKind::BlockSize)?;
-                out.resize(out.len() + header.size, byte);
+                let end = op + header.size;
+                let target = out.get_mut(op..end).ok_or(BlockError::OutputFull)?;
+                target.fill(byte);
+                Ok(end)
             }
             BlockKind::Compressed => {
-                let (literals, used) = self.literals.decode(content, context.block_max)?;
-                let sequences = content.get(used..).unwrap_or(&[]);
-                let (count, header_size) = self.sequences.read_header(sequences)?;
-                if count == 0 {
-                    out.extend_from_slice(literals);
+                let copy = if backend.has_fast_shuffle() {
+                    MatchCopy::Shuffle
                 } else {
-                    let stream = sequences.get(header_size..).unwrap_or(&[]);
-                    self.sequences.execute(
-                        count,
-                        stream,
-                        literals,
-                        &mut self.reps,
-                        out,
-                        context,
-                    )?;
-                }
+                    MatchCopy::Scalar
+                };
+                let target = Target { out, op, context };
+                fearless_simd::dispatch!(backend.0, simd => self.decode_compressed(simd, copy, content, target))
             }
         }
-        Ok(())
     }
+
+    /// Decodes a compressed block's literals and sequences; the two hot
+    /// loops run with `simd`'s target features.
+    fn decode_compressed<S: Simd>(
+        &mut self,
+        simd: S,
+        copy: MatchCopy,
+        content: &[u8],
+        target: Target<'_>,
+    ) -> Result<usize, BlockError> {
+        let Target { out, op, context } = target;
+        let (literals, used) = self.literals.decode(simd, content, context.block_max)?;
+        let sequences = content.get(used..).unwrap_or(&[]);
+        let (count, header_size) = self.sequences.read_header(sequences)?;
+        if count == 0 {
+            // The literals section already bounds its size by the block's.
+            let end = op + literals.len;
+            let target = out.get_mut(op..end).ok_or(BlockError::OutputFull)?;
+            target.copy_from_slice(&literals.bytes[..literals.len]);
+            return Ok(end);
+        }
+        let stream = sequences.get(header_size..).unwrap_or(&[]);
+        let section = SequenceSection {
+            count,
+            stream,
+            literals,
+        };
+        self.sequences.execute(
+            simd,
+            copy,
+            section,
+            &mut self.reps,
+            Target { out, op, context },
+        )
+    }
+}
+
+/// Where a block's output goes: `out[op..]`, after the history that
+/// `context` bounds.
+#[derive(Debug)]
+pub(crate) struct Target<'a> {
+    /// The output buffer, history included.
+    pub(crate) out: &'a mut [u8],
+    /// Where the block's output starts.
+    pub(crate) op: usize,
+    /// The history's start and the frame's limits.
+    pub(crate) context: BlockContext,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompressor::core::copy::WILDCOPY_OVERLENGTH;
+    use alloc::vec::Vec;
 
     const CONTEXT: BlockContext = BlockContext {
         history_start: 0,
         window: 1 << 17,
         block_max: 1 << 17,
     };
+
+    /// Decodes one block after `out` and appends its output.
+    fn decode(
+        decoder: &mut BlockDecoder,
+        header: &BlockHeader,
+        content: &[u8],
+        out: &mut Vec<u8>,
+        context: BlockContext,
+    ) -> Result<(), BlockError> {
+        let start = out.len();
+        let mut buffer = out.clone();
+        buffer.resize(start + context.block_max + WILDCOPY_OVERLENGTH, 0);
+        let end = decoder.decode(
+            Backend::SCALAR,
+            header,
+            content,
+            &mut buffer,
+            start,
+            context,
+        )?;
+        out.extend_from_slice(&buffer[start..end]);
+        Ok(())
+    }
 
     #[test]
     fn headers_carry_the_last_flag_type_and_size() {
@@ -188,21 +267,24 @@ mod tests {
         let mut decoder = BlockDecoder::default();
         let mut out = Vec::new();
         let raw = BlockHeader::parse([0x18, 0, 0], 100).expect("raw");
-        decoder
-            .decode(&raw, b"abc", &mut out, CONTEXT)
-            .expect("raw");
+        decode(&mut decoder, &raw, b"abc", &mut out, CONTEXT).expect("raw");
         let rle = BlockHeader::parse([0x1a, 0, 0], 100).expect("rle");
-        decoder.decode(&rle, b"z", &mut out, CONTEXT).expect("rle");
+        decode(&mut decoder, &rle, b"z", &mut out, CONTEXT).expect("rle");
         assert_eq!(out, b"abczzz");
         // Raw literals "hi" and no sequences.
         let compressed = BlockHeader::parse([0x1c, 0, 0], 100).expect("compressed");
-        decoder
-            .decode(&compressed, &[2 << 3, b'h', b'i', 0], &mut out, CONTEXT)
-            .expect("compressed");
+        decode(
+            &mut decoder,
+            &compressed,
+            &[2 << 3, b'h', b'i', 0],
+            &mut out,
+            CONTEXT,
+        )
+        .expect("compressed");
         assert_eq!(out, b"abczzzhi");
         assert_eq!(
-            decoder.decode(&rle, b"", &mut out, CONTEXT),
-            Err(InvalidDataKind::BlockSize)
+            decode(&mut decoder, &rle, b"", &mut out, CONTEXT),
+            Err(BlockError::Invalid(InvalidDataKind::BlockSize))
         );
     }
 
@@ -218,9 +300,7 @@ mod tests {
             kind: BlockKind::Compressed,
             size: content.len(),
         };
-        decoder
-            .decode(&header, &content, &mut out, CONTEXT)
-            .expect("valid");
+        decode(&mut decoder, &header, &content, &mut out, CONTEXT).expect("valid");
         assert_eq!(out, b"abcxxxx");
         decoder.reset();
         assert_eq!(decoder.reps, REP_START);

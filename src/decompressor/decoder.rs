@@ -5,7 +5,7 @@ use super::core::Stream;
 use super::{
     DecodeError, DecodeOperation, DecoderConfig, DecoderSession, DecoderSessionOwned, DecoderStatus,
 };
-use crate::RetentionPolicy;
+use crate::{Backend, RetentionPolicy};
 
 /// A reusable Zstandard decoder.
 ///
@@ -56,6 +56,7 @@ pub struct Decompressor {
 pub struct DecompressorBuilder {
     config: DecoderConfig,
     retention: RetentionPolicy,
+    backend: Option<Backend>,
 }
 
 impl DecompressorBuilder {
@@ -66,13 +67,39 @@ impl DecompressorBuilder {
         self
     }
 
+    /// Selects the SIMD backend instead of the best one the host supports.
+    ///
+    /// Every backend produces identical output and accepts exactly the
+    /// same frames; this exists for reproducible measurements and
+    /// differential tests.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Backend, Decompressor};
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// for backend in Backend::available() {
+    ///     let mut decoder = Decompressor::builder(Default::default())
+    ///         .with_backend(backend)
+    ///         .build();
+    ///     assert_eq!(decoder.backend(), backend);
+    ///     assert_eq!(decoder.decompress(&frame)?, b"ok");
+    /// }
+    /// # Ok::<(), mzstd::DecodeError>(())
+    /// ```
+    #[must_use]
+    pub const fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     /// Builds the decoder; nothing is allocated until it decodes.
     #[must_use]
     pub fn build(self) -> Decompressor {
         Decompressor {
             config: self.config,
             retention: self.retention,
-            stream: Stream::new(self.config),
+            stream: Stream::new(self.config, self.backend.unwrap_or_default()),
         }
     }
 }
@@ -104,7 +131,21 @@ impl Decompressor {
         DecompressorBuilder {
             config,
             retention: RetentionPolicy::Aggressive,
+            backend: None,
         }
+    }
+
+    /// The SIMD backend the decoder runs on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{Backend, Decompressor};
+    /// assert_eq!(Decompressor::default().backend(), Backend::default());
+    /// ```
+    #[must_use]
+    pub const fn backend(&self) -> Backend {
+        self.stream.backend()
     }
 
     /// The decoder's policy.
@@ -287,6 +328,15 @@ impl Decompressor {
         src: &[u8],
         dst: &mut [u8],
     ) -> Result<usize, DecodeError> {
+        // Frames that declare sizes that fit decode straight into `dst`;
+        // anything else, errors included, takes the incremental path, which
+        // defines this method's results.
+        self.stream.reset(self.config);
+        let direct = self.stream.decode_to_slice(src, dst);
+        if let Some(written) = direct {
+            self.apply_retention();
+            return Ok(written);
+        }
         let mut session = self.start();
         let progress = session.process(src, dst, DecodeOperation::Finish)?;
         match progress.status {

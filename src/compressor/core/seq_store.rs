@@ -149,7 +149,8 @@ impl SeqStore {
         self.max_nb_seq = block_size / divider;
         self.max_nb_lit = block_size;
         self.sequences.reserve(self.max_nb_seq);
-        self.literals.reserve(self.max_nb_lit);
+        // Room for the 16-byte chunk `store_seq_from` writes past the end.
+        self.literals.reserve(self.max_nb_lit + 16);
     }
 
     /// Bytes held between blocks.
@@ -174,6 +175,7 @@ impl SeqStore {
     }
 
     /// Appends a sequence without its literals (`ZSTD_storeSeqOnly`).
+    #[inline(always)]
     pub(crate) fn store_seq_only(&mut self, lit_length: usize, off_base: u32, match_length: usize) {
         debug_assert!(self.sequences.len() < self.max_nb_seq);
         debug_assert!(match_length >= MIN_MATCH);
@@ -201,6 +203,36 @@ impl SeqStore {
         self.store_seq_only(literals.len(), off_base, match_length);
     }
 
+    /// [`Self::store_seq`] for the literals `src[anchor..anchor + lit_length]`,
+    /// copied as `ZSTD_storeSeq` does: a run of at most 16 bytes is copied as
+    /// one fixed 16-byte chunk (`ZSTD_copy16`) when `src` holds that many,
+    /// and the excess is cut off again, so short runs cost no length-driven
+    /// copy.
+    #[inline(always)]
+    pub(crate) fn store_seq_from(
+        &mut self,
+        src: &[u8],
+        anchor: usize,
+        lit_length: usize,
+        off_base: u32,
+        match_length: usize,
+    ) {
+        debug_assert!(self.literals.len() + lit_length <= self.max_nb_lit);
+        match src.get(anchor..anchor + 16) {
+            Some(chunk) if lit_length <= 16 => {
+                let start = self.literals.len();
+                let mut wild = [0u8; 16];
+                wild.copy_from_slice(chunk);
+                self.literals.extend_from_slice(&wild);
+                self.literals.truncate(start + lit_length);
+            }
+            _ => self
+                .literals
+                .extend_from_slice(&src[anchor..anchor + lit_length]),
+        }
+        self.store_seq_only(lit_length, off_base, match_length);
+    }
+
     /// Appends the block's trailing literals (`ZSTD_storeLastLiterals`).
     pub(crate) fn store_last_literals(&mut self, literals: &[u8]) {
         self.literals.extend_from_slice(literals);
@@ -212,10 +244,15 @@ impl SeqStore {
         self.ll_code.resize(n, 0);
         self.ml_code.resize(n, 0);
         self.of_code.resize(n, 0);
-        for (u, seq) in self.sequences.iter().enumerate() {
-            self.ll_code[u] = ll_code(u32::from(seq.lit_length));
-            self.of_code[u] = highbit32(seq.off_base) as u8;
-            self.ml_code[u] = ml_code(u32::from(seq.ml_base));
+        let codes = self
+            .ll_code
+            .iter_mut()
+            .zip(self.of_code.iter_mut())
+            .zip(self.ml_code.iter_mut());
+        for (seq, ((ll, of), ml)) in self.sequences.iter().zip(codes) {
+            *ll = ll_code(u32::from(seq.lit_length));
+            *of = highbit32(seq.off_base) as u8;
+            *ml = ml_code(u32::from(seq.ml_base));
         }
         match self.long_length {
             LongLength::Literal(pos) if (pos as usize) < n => self.ll_code[pos as usize] = MAX_LL,
@@ -269,6 +306,27 @@ mod tests {
         assert_eq!(ml_code(0), 0);
         assert_eq!(ml_code(127), 42);
         assert_eq!(ml_code(128), 43);
+    }
+
+    #[test]
+    fn wild_literal_copies_store_what_exact_copies_store() {
+        let src: alloc::vec::Vec<u8> = (0..64u8).collect();
+        // Short runs far from the end take the 16-byte chunk; runs near
+        // the end or longer than 16 bytes copy exactly.
+        for anchor in [0usize, 10, 47, 48, 50, 60] {
+            for lit_length in 0..=(src.len() - anchor).min(20) {
+                let mut wild = SeqStore::default();
+                wild.reserve(1 << 10, 4);
+                wild.store_seq_from(&src, anchor, lit_length, offset_to_offbase(7), 5);
+                wild.store_seq_from(&src, 0, 3, repcode_to_offbase(1), 4);
+                let mut exact = SeqStore::default();
+                exact.reserve(1 << 10, 4);
+                exact.store_seq(&src[anchor..anchor + lit_length], offset_to_offbase(7), 5);
+                exact.store_seq(&src[..3], repcode_to_offbase(1), 4);
+                assert_eq!(wild.literals, exact.literals, "{anchor} {lit_length}");
+                assert_eq!(wild.sequences, exact.sequences);
+            }
+        }
     }
 
     #[test]

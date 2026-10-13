@@ -2,6 +2,7 @@
 
 use super::HufTables;
 use super::huf::{self, Flags, Options, Streams};
+use crate::Backend;
 use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::Strategy;
 use crate::shared::format::{EncodingType, LIT_HUF_LOG};
@@ -73,6 +74,8 @@ pub(crate) struct LiteralsSettings {
     pub(crate) disable_compression: bool,
     /// The block looks incompressible; sample before counting.
     pub(crate) suspect_uncompressible: bool,
+    /// The SIMD level the Huffman stream encoder runs with.
+    pub(crate) backend: Backend,
 }
 
 /// Writes the literals section (`ZSTD_compressLiterals`).
@@ -127,6 +130,7 @@ pub(crate) fn compress(
             Streams::Four
         },
         flags,
+        backend: settings.backend,
     };
     let result = huf::compress(
         &mut dst[lh_size..],
@@ -185,6 +189,7 @@ mod tests {
             strategy,
             disable_compression: false,
             suspect_uncompressible: false,
+            backend: Backend::SCALAR,
         }
     }
 

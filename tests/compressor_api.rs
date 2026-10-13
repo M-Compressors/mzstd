@@ -6,7 +6,7 @@
 use std::mem::MaybeUninit;
 
 use mzstd::{
-    CompressionParams, Compressor, ConfigError, EncodeError, EncoderConfig, EncoderStatus,
+    Backend, CompressionParams, Compressor, ConfigError, EncodeError, EncoderConfig, EncoderStatus,
     InputSize, LdmParams, Level, LongDistanceMatching, Operation, Parameter, Progress,
     RetentionPolicy, Strategy, StreamConfig,
 };
@@ -858,4 +858,31 @@ fn owned_sessions_apply_the_retention_policy_when_the_frame_ends() {
         .expect("compresses");
     assert_eq!(progress.status, EncoderStatus::Finished);
     assert_eq!(session.into_compressor().retained_bytes(), 0);
+}
+
+#[test]
+fn every_backend_writes_the_reference_frame() {
+    let input = corpus::mixed(300_000, 17);
+    for value in [-5, 1, 3, 5, 9, 13, 16, 19] {
+        let reference =
+            oracle::compress2(&input, &Params::level(value)).expect("the reference compresses");
+        for backend in Backend::available() {
+            let mut encoder =
+                Compressor::builder(EncoderConfig::default().with_level(level(value)))
+                    .with_backend(backend)
+                    .build()
+                    .expect("a valid configuration");
+            assert_eq!(encoder.backend(), backend);
+            assert_eq!(
+                encoder.compress(&input).expect("compresses"),
+                reference,
+                "{backend} level {value}"
+            );
+            // Trimming keeps the selected backend.
+            encoder.trim(RetentionPolicy::ReleaseAll);
+            assert_eq!(encoder.backend(), backend);
+            assert_eq!(encoder.compress(&input).expect("compresses"), reference);
+        }
+    }
+    assert_eq!(Compressor::default().backend(), Backend::default());
 }

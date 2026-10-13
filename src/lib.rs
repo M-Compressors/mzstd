@@ -69,7 +69,7 @@
 //! features to select one codec, alongside `std` or `no_std` (which needs `alloc`):
 //!
 //! ```toml
-//! mzstd = { version = "0.1", default-features = false, features = ["std", "decompression"] }
+//! mzstd = { version = "0.2", default-features = false, features = ["std", "decompression"] }
 //! ```
 //!
 //! A disabled codec has no module and no re-exports. The `std::io` adapters
@@ -191,9 +191,13 @@
 extern crate alloc;
 
 #[cfg(any(feature = "compression", feature = "decompression"))]
+mod backend;
+#[cfg(any(feature = "compression", feature = "decompression"))]
 mod retention;
 #[cfg(any(feature = "compression", feature = "decompression"))]
 mod shared;
+#[cfg(any(feature = "compression", feature = "decompression"))]
+pub use backend::Backend;
 #[cfg(any(feature = "compression", feature = "decompression"))]
 pub use retention::RetentionPolicy;
 

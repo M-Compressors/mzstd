@@ -12,6 +12,7 @@ pub(crate) mod ldm_geartab;
 pub(crate) mod match_state;
 pub(crate) mod mem;
 pub(crate) mod opt;
+mod opt_count;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod seq_store;
@@ -95,6 +96,31 @@ mod tests {
         let inputs = zstd_ffi::corpus::standard();
         for level in [1, 2, 3, 4, -1, -2, -5, -100, -131072] {
             check_level(level, &inputs);
+        }
+    }
+
+    /// The fast and dfast finders and the entropy coders dispatch on the
+    /// engine's backend: every backend, scalar included, writes the
+    /// reference's frames, and a reused engine (whose tables keep stale
+    /// entries) writes them too.
+    #[test]
+    fn fast_and_dfast_levels_match_the_reference_on_every_backend() {
+        let inputs = zstd_ffi::corpus::standard();
+        for backend in crate::Backend::available() {
+            let mut engine = Engine::with_backend(backend);
+            for level in [-5, 1, 2, 3, 4] {
+                for (name, input) in &inputs {
+                    let requested = RequestedParams {
+                        compression_level: level,
+                        ..RequestedParams::default()
+                    };
+                    let ours = compress_once(&mut engine, &requested, input, 1).expect("compress");
+                    let expected =
+                        zstd_ffi::oracle::compress2(input, &zstd_ffi::oracle::Params::level(level))
+                            .expect("oracle");
+                    assert!(ours == expected, "{backend} level {level}, input {name}");
+                }
+            }
         }
     }
 
@@ -493,6 +519,64 @@ mod stream_tests {
                         .expect("oracle");
                 let ours = stream(&mut engine, &requested, &steps);
                 assert!(ours == theirs, "{strategy:?} window {window_log}");
+            }
+        }
+    }
+
+    /// Every minimum match length of the fast and dfast extDict finders,
+    /// on every backend, over streams that wrap a small window.
+    #[test]
+    fn fast_ext_dict_finders_match_the_reference_on_every_backend() {
+        let input = [corpus::text(60_000, 41), corpus::binary(60_000, 42)].concat();
+        let steps: Vec<(&[u8], EndOp)> = input
+            .chunks(7_001)
+            .map(|chunk| (chunk, EndOp::Continue))
+            .collect();
+        let theirs_steps: Vec<(&[u8], Directive)> = steps
+            .iter()
+            .map(|&(data, op)| (data, directive(op)))
+            .collect();
+        for strategy in [Strategy::Fast, Strategy::DFast] {
+            for min_match in 4..=7 {
+                let mut requested = RequestedParams::default();
+                requested.cparams.strategy = Some(strategy);
+                requested.cparams.window_log = 12;
+                requested.cparams.min_match = min_match;
+                let theirs =
+                    zstd_ffi::oracle::compress_stream(&oracle_params(&requested), &theirs_steps)
+                        .expect("oracle");
+                for backend in crate::Backend::available() {
+                    let mut engine = Engine::with_backend(backend);
+                    let ours = stream(&mut engine, &requested, &steps);
+                    assert!(
+                        ours == theirs,
+                        "{strategy:?} min match {min_match} {backend}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The noDict variants for every minimum match length, on every
+    /// backend.
+    #[test]
+    fn fast_finders_match_the_reference_for_every_min_match_and_backend() {
+        let input = [corpus::text(200_000, 43), corpus::binary(100_000, 44)].concat();
+        for strategy in [Strategy::Fast, Strategy::DFast] {
+            for min_match in 4..=7 {
+                let mut requested = RequestedParams::default();
+                requested.cparams.strategy = Some(strategy);
+                requested.cparams.min_match = min_match;
+                let theirs = zstd_ffi::oracle::compress2(&input, &oracle_params(&requested))
+                    .expect("oracle");
+                for backend in crate::Backend::available() {
+                    let mut engine = Engine::with_backend(backend);
+                    let ours = compress_once(&mut engine, &requested, &input, 1).expect("ours");
+                    assert!(
+                        ours == theirs,
+                        "{strategy:?} min match {min_match} {backend}"
+                    );
+                }
             }
         }
     }

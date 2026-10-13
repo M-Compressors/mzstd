@@ -13,6 +13,7 @@ graph TD
     Root[mzstd public facade] --> Encode[compressor: compression feature]
     Root --> Decode[decompressor: decompression feature]
     Root --> Ret[RetentionPolicy]
+    Root --> Back[Backend: SIMD level]
     Root --> IO["io: reader and writer adapters (std)"]
     Encode --> Cfg[config + internal lowering]
     Encode --> ECore["compressor::core (private): engine, match finders, entropy, streaming"]
@@ -40,10 +41,12 @@ signatures. Each codec compiles on its own, with or without `std`.
 | --- | --- |
 | [Codec features](codec-features.md) | Feature gates, `no_std`, std-only modules, hotpath anchors and the checked configurations. |
 | [Compressor](compressor.md) | Public encoder API, configuration lowering, one-shot calls, sessions, I/O adapters, errors and retention. |
-| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle, the segment and address model of the window, the block pipeline, match finders, LDM, entropy coding and streaming. |
+| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding and streaming. |
+| [Optimal parser](optimal-parser.md) | btopt/btultra/btultra2 and LDM: per-block SIMD dispatch, the shared binary-tree walk, match-length kernels, price tables. |
 | [Parallel compression](parallel-compression.md) | Frame plans, overlapped segments, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, streaming state machine, history, block regeneration and compatibility with the reference decoder. |
+| [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman and sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns. |
@@ -54,8 +57,15 @@ signatures. Each codec compiles on its own, with or without `std`.
 - **Scope.** There are no dictionaries (encoding or decoding), no magicless
   frames, no `targetCBlockSize`, no external sequence producers, and no
   legacy (v0.x) frames.
-- **Speed.** It was not a goal of this version. There is no SIMD and no
-  runtime backend dispatch, and both codecs are scalar ports.
+- **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
+  and dispatched once per block. Against zstd 1.5.7 on `cargo bench`
+  (i7-13700KF, AVX2, one core), decoding runs at 0.93-1.18x the
+  reference's time ([decoder fast paths](decoder-performance.md)).
+  Compression runs at 0.88-1.07x on small inputs and levels 16-19, at
+  1.03-1.17x on 1 MiB of text, and at 1.1-1.3x on binary input and in
+  streaming. The remaining encoder gaps are instruction counts in the
+  match finders' inner loops ([Encoder core](encoder-core.md#known-gaps),
+  [optimal parser](optimal-parser.md)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's. Each segment re-compresses its
   overlap instead of loading it as a prefix.

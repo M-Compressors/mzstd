@@ -5,9 +5,12 @@
 //! broken by those exact algorithms, and the resulting code lengths are part
 //! of the compressed bytes.
 
-use super::bits::BitWriter;
+use fearless_simd::Simd;
+use fearless_simd_macros::simd;
+
 use super::fse;
 use super::hist;
+use crate::Backend;
 use crate::compressor::core::error::CoreError;
 use crate::shared::format::highbit32;
 
@@ -99,16 +102,23 @@ const START_NODE: usize = SYMBOL_VALUE_MAX as usize + 1;
 /// Construction scratch: the node array with its leading sentinel slot, so
 /// `node(i)` is `nodes[i + 1]` and `node(-1)` the barrier.
 struct Tree {
-    nodes: [Node; 2 * (SYMBOL_VALUE_MAX as usize + 1)],
+    nodes: [Node; TREE_SLOTS],
 }
 
+/// Node slots; a power of two, so a masked index needs no bounds check.
+const TREE_SLOTS: usize = 2 * (SYMBOL_VALUE_MAX as usize + 1);
+
 impl Tree {
+    // Every node index is in `-1..TREE_SLOTS - 1`, so the mask changes
+    // nothing and removes the bounds check from the tree loops.
+    #[inline(always)]
     fn at(&self, index: isize) -> &Node {
-        &self.nodes[(index + 1) as usize]
+        &self.nodes[(index + 1) as usize & (TREE_SLOTS - 1)]
     }
 
+    #[inline(always)]
     fn at_mut(&mut self, index: isize) -> &mut Node {
-        &mut self.nodes[(index + 1) as usize]
+        &mut self.nodes[(index + 1) as usize & (TREE_SLOTS - 1)]
     }
 }
 
@@ -409,7 +419,7 @@ impl CTable {
             return Err(CoreError::MaxSymbolValueTooLarge);
         }
         let mut tree = Tree {
-            nodes: [Node::default(); 2 * (SYMBOL_VALUE_MAX as usize + 1)],
+            nodes: [Node::default(); TREE_SLOTS],
         };
         sort(&mut tree, count, max_symbol_value);
         let non_null_rank = build_tree(&mut tree, max_symbol_value);
@@ -498,41 +508,231 @@ impl CTable {
     }
 }
 
-/// Encodes `src` as one stream (`HUF_compress1X_usingCTable`).
+/// Bits of one container of [`HufWriter`].
+const HUF_CONTAINER_BITS: u32 = 64;
+
+/// A table's codes packed for encoding (`HUF_CElt`): the code in the top
+/// `nb_bits` bits and the length in the low byte, so one load yields both.
 ///
-/// Returns `0` when the stream does not fit.
-pub(crate) fn compress_1x(dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
+/// Only the symbols the table describes are converted; the input holds no
+/// others.
+fn packed_codes(table: &CTable) -> [u64; 256] {
+    let mut codes = [0u64; 256];
+    let symbols = (table.max_symbol_value as usize).min(255) + 1;
+    let described = table.nb_bits[..symbols].iter().zip(&table.value[..symbols]);
+    for (code, (&nb_bits, &value)) in codes.iter_mut().zip(described) {
+        let nb_bits = u32::from(nb_bits);
+        if nb_bits != 0 {
+            *code = (u64::from(value) << (HUF_CONTAINER_BITS - nb_bits)) | u64::from(nb_bits);
+        }
+    }
+    codes
+}
+
+/// The Huffman stream writer (`HUF_CStream_t`).
+///
+/// Two containers fill from the top: the newest code lands in the high bits
+/// and older ones shift down, so a flush writes the top `bit_pos` bits as a
+/// little-endian forward stream. The second container lets the loop encode
+/// two groups of symbols without a dependency between them; it is merged
+/// into the first before each flush. The upper bits of `bit_pos` collect
+/// noise from the "fast" adds (the whole packed code is added), and only its
+/// low byte is ever read, as in the reference.
+struct HufWriter<'a> {
+    dst: &'a mut [u8],
+    /// Next byte to write.
+    pos: usize,
+    /// The furthest `pos` may advance: `dst.len() - 8`.
+    end: usize,
+    container: [u64; 2],
+    bit_pos: [u64; 2],
+}
+
+impl<'a> HufWriter<'a> {
+    /// `HUF_initCStream`; `None` when `dst` cannot hold one container.
+    fn new(dst: &'a mut [u8]) -> Option<Self> {
+        if dst.len() <= 8 {
+            return None;
+        }
+        let end = dst.len() - 8;
+        Some(Self {
+            dst,
+            pos: 0,
+            end,
+            container: [0; 2],
+            bit_pos: [0; 2],
+        })
+    }
+
+    /// `HUF_addBits`: with `FAST`, the length byte is left in the low bits of
+    /// the container, below every bit a flush reads.
+    #[inline(always)]
+    fn add<const IDX: usize, const FAST: bool>(&mut self, code: u64) {
+        // The shift reads the low byte; lengths stay below 64.
+        self.container[IDX] = self.container[IDX].wrapping_shr(code as u32);
+        self.container[IDX] |= if FAST { code } else { code & !0xFF };
+        self.bit_pos[IDX] = self.bit_pos[IDX].wrapping_add(if FAST { code } else { code & 0xFF });
+    }
+
+    /// `HUF_zeroIndex1`.
+    #[inline(always)]
+    fn zero_second(&mut self) {
+        self.container[1] = 0;
+        self.bit_pos[1] = 0;
+    }
+
+    /// `HUF_mergeIndex1`.
+    #[inline(always)]
+    fn merge_second(&mut self) {
+        self.container[0] = self.container[0].wrapping_shr((self.bit_pos[1] & 0xFF) as u32);
+        self.container[0] |= self.container[1];
+        self.bit_pos[0] = self.bit_pos[0].wrapping_add(self.bit_pos[1]);
+    }
+
+    /// `HUF_flushBits`: writes the pending whole bytes of the first
+    /// container. With `FAST` the destination is known to hold the whole
+    /// stream (`HUF_tightCompressBound`), so the position needs no clamp.
+    #[inline(always)]
+    fn flush<const FAST: bool>(&mut self) {
+        let nb_bits = (self.bit_pos[0] & 0xFF) as u32;
+        let nb_bytes = (nb_bits >> 3) as usize;
+        let bits = self.container[0].wrapping_shr(HUF_CONTAINER_BITS.wrapping_sub(nb_bits));
+        self.bit_pos[0] &= 7;
+        debug_assert!(self.pos <= self.end);
+        self.dst[self.pos..self.pos + 8].copy_from_slice(&bits.to_le_bytes());
+        self.pos += nb_bytes;
+        debug_assert!(!FAST || self.pos <= self.end);
+        if !FAST && self.pos > self.end {
+            self.pos = self.end;
+        }
+    }
+
+    /// `HUF_closeCStream`: adds the end mark and returns the stream size, or
+    /// `0` when the stream did not fit.
+    fn close(mut self) -> usize {
+        self.add::<0, false>((1 << (HUF_CONTAINER_BITS - 1)) | 1);
+        self.flush::<false>();
+        let nb_bits = self.bit_pos[0] & 0xFF;
+        if self.pos >= self.end {
+            return 0;
+        }
+        self.pos + usize::from(nb_bits > 0)
+    }
+}
+
+/// `HUF_compress1X_usingCTable_internal_body_loop`: encodes `src` backward
+/// in groups of `UNROLL` symbols, alternating containers between groups.
+/// `PAIR` is `2 * UNROLL`.
+#[inline(always)]
+fn encode_loop<
+    const UNROLL: usize,
+    const PAIR: usize,
+    const FAST_FLUSH: bool,
+    const LAST_FAST: bool,
+>(
+    writer: &mut HufWriter<'_>,
+    src: &[u8],
+    codes: &[u64; 256],
+) {
+    debug_assert_eq!(PAIR, 2 * UNROLL);
+    let code = |symbol: u8| codes[usize::from(symbol)];
+    let mut n = src.len();
+    let rem = n % UNROLL;
+    if rem > 0 {
+        for &symbol in src[n - rem..].iter().rev() {
+            writer.add::<0, false>(code(symbol));
+        }
+        writer.flush::<FAST_FLUSH>();
+        n -= rem;
+    }
+    if !n.is_multiple_of(PAIR) {
+        let group = &src[n - UNROLL..n];
+        for u in 1..UNROLL {
+            writer.add::<0, true>(code(group[UNROLL - u]));
+        }
+        writer.add::<0, LAST_FAST>(code(group[0]));
+        writer.flush::<FAST_FLUSH>();
+        n -= UNROLL;
+    }
+    let (_, pairs) = src[..n].as_rchunks::<PAIR>();
+    for pair in pairs.iter().rev() {
+        for u in 1..UNROLL {
+            writer.add::<0, true>(code(pair[PAIR - u]));
+        }
+        writer.add::<0, LAST_FAST>(code(pair[UNROLL]));
+        writer.flush::<FAST_FLUSH>();
+        writer.zero_second();
+        for u in 1..UNROLL {
+            writer.add::<1, true>(code(pair[UNROLL - u]));
+        }
+        writer.add::<1, LAST_FAST>(code(pair[0]));
+        writer.merge_second();
+        writer.flush::<FAST_FLUSH>();
+    }
+}
+
+/// Encodes `src` as one stream with packed codes
+/// (`HUF_compress1X_usingCTable_internal_body`), compiled for one SIMD
+/// level (the reference selects its BMI2 build at run time the same way).
+///
+/// The loop shape follows the table log as in the reference; every shape
+/// writes the same bits.
+#[simd]
+fn compress_1x_packed<S: Simd>(
+    simd: S,
+    dst: &mut [u8],
+    src: &[u8],
+    codes: &[u64; 256],
+    table_log: u32,
+) -> usize {
     if dst.len() < 8 {
         return 0;
     }
-    let Some(mut writer) = BitWriter::new(dst) else {
+    let tight_bound = ((src.len() * table_log as usize) >> 3) + 8;
+    let fits = dst.len() >= tight_bound;
+    let Some(mut writer) = HufWriter::new(dst) else {
         return 0;
     };
-    let mut pending = 0u32;
-    for &symbol in src.iter().rev() {
-        let s = usize::from(symbol);
-        let bits = u32::from(table.nb_bits[s]);
-        writer.add_bits_fast(u64::from(table.value[s]), bits);
-        pending += bits;
-        if pending > 32 {
-            writer.flush();
-            pending = 0;
+    match table_log {
+        _ if !fits || table_log > 11 => {
+            encode_loop::<4, 8, false, false>(&mut writer, src, codes);
         }
+        11 => encode_loop::<5, 10, true, false>(&mut writer, src, codes),
+        10 => encode_loop::<5, 10, true, true>(&mut writer, src, codes),
+        9 => encode_loop::<6, 12, true, false>(&mut writer, src, codes),
+        8 => encode_loop::<7, 14, true, false>(&mut writer, src, codes),
+        7 => encode_loop::<8, 16, true, false>(&mut writer, src, codes),
+        _ => encode_loop::<9, 18, true, true>(&mut writer, src, codes),
     }
     writer.close()
+}
+
+/// Encodes `src` as one stream (`HUF_compress1X_usingCTable`).
+///
+/// Returns `0` when the stream does not fit.
+pub(crate) fn compress_1x(dst: &mut [u8], src: &[u8], table: &CTable, backend: Backend) -> usize {
+    let codes = packed_codes(table);
+    fearless_simd::dispatch!(backend.0, simd => compress_1x_packed(simd, dst, src, &codes, table.table_log))
 }
 
 /// Encodes `src` as four streams behind a jump table
 /// (`HUF_compress4X_usingCTable`).
 ///
 /// Returns `0` when the streams do not fit or the input is too short.
-pub(crate) fn compress_4x(dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
+pub(crate) fn compress_4x(dst: &mut [u8], src: &[u8], table: &CTable, backend: Backend) -> usize {
+    fearless_simd::dispatch!(backend.0, simd => compress_4x_on(simd, dst, src, table))
+}
+
+/// [`compress_4x`] for one SIMD level.
+#[inline(always)]
+fn compress_4x_on<S: Simd>(simd: S, dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
     if dst.len() < 6 + 1 + 1 + 1 + 8 {
         return 0;
     }
     if src.len() < 12 {
         return 0;
     }
+    let codes = packed_codes(table);
     let segment_size = src.len().div_ceil(4);
     let mut op = 6usize;
     let mut ip = 0usize;
@@ -542,7 +742,7 @@ pub(crate) fn compress_4x(dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
         } else {
             ip + segment_size
         };
-        let size = compress_1x(&mut dst[op..], &src[ip..end], table);
+        let size = compress_1x_packed(simd, &mut dst[op..], &src[ip..end], &codes, table.table_log);
         if size == 0 || size > 65535 {
             return 0;
         }
@@ -572,11 +772,12 @@ fn compress_with_table(
     src: &[u8],
     streams: Streams,
     table: &CTable,
+    backend: Backend,
 ) -> usize {
     let target = &mut dst[header..];
     let size = match streams {
-        Streams::Single => compress_1x(target, src, table),
-        Streams::Four => compress_4x(target, src, table),
+        Streams::Single => compress_1x(target, src, table, backend),
+        Streams::Four => compress_4x(target, src, table, backend),
     };
     if size == 0 {
         return 0;
@@ -651,6 +852,8 @@ pub(crate) struct Options {
     pub(crate) streams: Streams,
     /// Reference flags.
     pub(crate) flags: Flags,
+    /// The SIMD level the stream encoder runs with.
+    pub(crate) backend: Backend,
 }
 
 /// Compresses `src`, possibly reusing `old_table` (`HUF_compress_internal`
@@ -678,6 +881,7 @@ pub(crate) fn compress(
         huff_log,
         streams,
         flags,
+        backend,
     } = options;
     if src.is_empty() || dst.is_empty() {
         return Ok(0);
@@ -703,7 +907,9 @@ pub(crate) fn compress(
     };
 
     if flags.prefer_repeat && *repeat == Repeat::Valid {
-        return Ok(compress_with_table(dst, 0, src, streams, old_table));
+        return Ok(compress_with_table(
+            dst, 0, src, streams, old_table, backend,
+        ));
     }
 
     let mut count = [0u32; 256];
@@ -744,7 +950,9 @@ pub(crate) fn compress(
         *repeat = Repeat::None;
     }
     if flags.prefer_repeat && *repeat != Repeat::None {
-        return Ok(compress_with_table(dst, 0, src, streams, old_table));
+        return Ok(compress_with_table(
+            dst, 0, src, streams, old_table, backend,
+        ));
     }
 
     let huff_log = optimal_table_log(huff_log, src.len(), max_symbol_value, &count, flags);
@@ -756,7 +964,9 @@ pub(crate) fn compress(
         let old_size = old_table.estimate_compressed_size(&count, max_symbol_value);
         let new_size = table.estimate_compressed_size(&count, max_symbol_value);
         if old_size <= h_size + new_size || h_size + 12 >= src.len() {
-            return Ok(compress_with_table(dst, 0, src, streams, old_table));
+            return Ok(compress_with_table(
+                dst, 0, src, streams, old_table, backend,
+            ));
         }
     }
     if h_size + 12 >= src.len() {
@@ -764,7 +974,9 @@ pub(crate) fn compress(
     }
     *repeat = Repeat::None;
     *old_table = table;
-    Ok(compress_with_table(dst, h_size, src, streams, old_table))
+    Ok(compress_with_table(
+        dst, h_size, src, streams, old_table, backend,
+    ))
 }
 
 #[cfg(test)]
@@ -854,6 +1066,79 @@ mod tests {
         }
     }
 
+    /// The straightforward one-symbol-at-a-time encoder the packed loops
+    /// must reproduce bit for bit.
+    fn compress_1x_baseline(dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
+        if dst.len() < 8 {
+            return 0;
+        }
+        let Some(mut writer) = super::super::bits::BitWriter::new(dst) else {
+            return 0;
+        };
+        let mut pending = 0u32;
+        for &symbol in src.iter().rev() {
+            let s = usize::from(symbol);
+            let bits = u32::from(table.nb_bits[s]);
+            writer.add_bits_fast(u64::from(table.value[s]), bits);
+            pending += bits;
+            if pending > 32 {
+                writer.flush();
+                pending = 0;
+            }
+        }
+        writer.close()
+    }
+
+    #[test]
+    fn packed_streams_match_the_baseline_encoder() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for alphabet in [2u64, 5, 40, 256] {
+            for skew in 0..4u64 {
+                let src: alloc::vec::Vec<u8> = (0..3000)
+                    .map(|_| {
+                        let r = next();
+                        ((r % alphabet) >> (skew * (r >> 61))) as u8
+                    })
+                    .collect();
+                let mut count = [0u32; 256];
+                for &b in &src {
+                    count[usize::from(b)] += 1;
+                }
+                // The encoder trims the alphabet and never asks for fewer
+                // bits than it needs.
+                let max = count.iter().rposition(|&c| c != 0).unwrap_or(0) as u32;
+                let floor = highbit32(cardinality(&count, max)) + 1;
+                for max_bits in floor.max(6)..=12 {
+                    let mut table = CTable::default();
+                    if table.build(&count, max, max_bits).is_err() {
+                        continue;
+                    }
+                    for len in [0, 1, 4, 5, 9, 10, 17, 18, 19, 100, 1000, 3000] {
+                        let src = &src[..len];
+                        // Room for the tight bound, just below it, and too little.
+                        let tight = ((len * table.table_log as usize) >> 3) + 8;
+                        for capacity in [tight + 64, tight, tight - 1, 9, 8, 7] {
+                            let mut theirs = alloc::vec![0u8; capacity];
+                            let b = compress_1x_baseline(&mut theirs, src, &table);
+                            for backend in Backend::available() {
+                                let mut ours = alloc::vec![0u8; capacity];
+                                let a = compress_1x(&mut ours, src, &table, backend);
+                                assert_eq!(a, b, "len {len} cap {capacity} {backend}");
+                                assert_eq!(ours[..a], theirs[..b]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn two_symbols_get_one_bit_codes() {
         let mut table = CTable::default();
@@ -887,13 +1172,17 @@ mod tests {
             huff_log: 11,
             streams: Streams::Single,
             flags: Flags::default(),
+            backend: Backend::SCALAR,
         };
         let result = compress(&mut dst, &[], options, &mut table, &mut repeat);
         assert_eq!(result, Ok(0));
         let result = compress(&mut dst, &[9; 40], options, &mut table, &mut repeat);
         assert_eq!(result, Ok(1));
         assert_eq!(dst[0], 9);
-        assert_eq!(compress_4x(&mut dst, &[1; 8], &table), 0);
-        assert_eq!(compress_1x(&mut dst[..7], &[1; 8], &table), 0);
+        assert_eq!(compress_4x(&mut dst, &[1; 8], &table, Backend::SCALAR), 0);
+        assert_eq!(
+            compress_1x(&mut dst[..7], &[1; 8], &table, Backend::SCALAR),
+            0
+        );
     }
 }
