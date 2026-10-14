@@ -24,8 +24,8 @@ pub fn differential_c(data: &[u8]) {
     assert_eq!(restored, decoded.rest);
 }
 
-/// A destination of arbitrary capacity yields the reference's frame or its
-/// failure.
+/// A destination of arbitrary capacity, initialized or not, yields the
+/// reference's frame or its failure.
 pub fn output_capacity(data: &[u8]) {
     let Some(mut decoded) = decode_config(data) else {
         return;
@@ -39,15 +39,34 @@ pub fn output_capacity(data: &[u8]) {
     let mut dst = vec![0u8; capacity];
     let ours = encoder.compress_to_slice(decoded.rest, &mut dst);
     let theirs = oracle::compress2_capacity(decoded.rest, &decoded.params, capacity);
-    match (ours, theirs) {
-        (Ok(size), Ok(frame)) => assert_eq!(&dst[..size], &frame[..]),
+    match (&ours, &theirs) {
+        (Ok(size), Ok(frame)) => assert_eq!(&dst[..*size], &frame[..]),
         (Err(EncodeError::OutputTooSmall { .. }), Err(_)) => {}
         (ours, theirs) => panic!("{ours:?} vs {theirs:?}"),
     }
+    let mut uninit = vec![MaybeUninit::new(SENTINEL); capacity];
+    let uninit_result = encoder.compress_to_uninit(decoded.rest, &mut uninit);
+    assert_eq!(uninit_result, ours);
+    if let Ok(size) = ours {
+        let written = initialized_with_sentinel(&uninit);
+        assert_eq!(&written[..size], &dst[..size]);
+    }
+}
+
+/// Reads back an output buffer that was filled with [`SENTINEL`] before the
+/// encoder wrote into it.
+fn initialized_with_sentinel(buffer: &[MaybeUninit<u8>]) -> Vec<u8> {
+    buffer
+        .iter()
+        // SAFETY: every slot was initialized with the sentinel, and the
+        // encoder only ever writes initialized bytes.
+        .map(|slot| unsafe { slot.assume_init() })
+        .collect()
 }
 
 /// A session driven with arbitrary chunks, operations and output capacity
-/// matches `ZSTD_compressStream2` driven the same way.
+/// matches `ZSTD_compressStream2` driven the same way, with calls
+/// alternating between `process` and `process_uninit`.
 pub fn encoder_session(data: &[u8]) {
     let Some(decoded) = decode_config(data) else {
         return;
@@ -102,11 +121,25 @@ pub fn encoder_session(data: &[u8]) {
     let mut session = encoder.start(size.into());
     let mut out = Vec::new();
     let mut buffer = vec![0u8; output_capacity];
+    let mut uninit = vec![MaybeUninit::new(SENTINEL); output_capacity];
+    let mut call = 0usize;
     for (mut chunk, op) in steps {
         loop {
-            let progress = session.process(chunk, &mut buffer, op).expect("session");
+            let progress = if call.is_multiple_of(2) {
+                let progress = session.process(chunk, &mut buffer, op).expect("session");
+                out.extend_from_slice(&buffer[..progress.produced]);
+                progress
+            } else {
+                let progress = session
+                    .process_uninit(chunk, &mut uninit, op)
+                    .expect("session");
+                let written = initialized_with_sentinel(&uninit);
+                out.extend_from_slice(&written[..progress.produced]);
+                uninit.fill(MaybeUninit::new(SENTINEL));
+                progress
+            };
+            call += 1;
             chunk = &chunk[progress.consumed..];
-            out.extend_from_slice(&buffer[..progress.produced]);
             let done = match op {
                 Operation::Continue => chunk.is_empty(),
                 _ => progress.status != EncoderStatus::NeedsOutput,

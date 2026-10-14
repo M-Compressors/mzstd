@@ -5,7 +5,9 @@
 //! buffers, after checking that both write identical frames, so every speed
 //! figure is read against an identical ratio (printed before timing). A
 //! streaming group drives `EncoderSession` and `ZSTD_compressStream2` with the
-//! same 64 KiB chunks.
+//! same 64 KiB chunks. The uninitialized-output group drives sessions into
+//! page-sized and block-sized outputs through `process` and `process_uninit`,
+//! as a web server's response filter does, and times `compress_to_uninit`.
 //!
 //! Inputs: zstd's own compression regression files (text-like HTTP headers,
 //! long literal and match lengths), synthetic text and structured binary,
@@ -14,6 +16,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mzstd::{Compressor, EncoderConfig, EncoderStatus, InputSize, Level, Operation};
 use std::hint::black_box;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use zstd_ffi::corpus;
 use zstd_ffi::oracle::{self, Directive, Params};
@@ -138,9 +141,127 @@ fn streaming(c: &mut Criterion) {
     group.finish();
 }
 
+/// Drives a session over `input` in `chunk`-sized pieces, each output call
+/// into `buffer`, through `process` or `process_uninit`.
+fn stream_into(
+    encoder: &mut Compressor,
+    input: &[u8],
+    chunk: usize,
+    buffer: &mut [MaybeUninit<u8>],
+    uninit: bool,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let mut session = encoder.start(InputSize::Unknown.into());
+    let pieces = input
+        .chunks(chunk)
+        .map(|piece| (piece, Operation::Continue))
+        .chain([(&[][..], Operation::End)]);
+    for (mut piece, operation) in pieces {
+        loop {
+            let progress = if uninit {
+                session.process_uninit(piece, buffer, operation)
+            } else {
+                // The initialized case: a buffer zeroed once, as a caller
+                // that recycles its output buffers would keep it.
+                let buffer = initialized_mut(buffer);
+                session.process(piece, buffer, operation)
+            }
+            .expect("compresses");
+            piece = &piece[progress.consumed..];
+            out.extend_from_slice(initialized_mut(&mut buffer[..progress.produced]));
+            let done = match operation {
+                Operation::End => progress.status == EncoderStatus::Finished,
+                _ => piece.is_empty(),
+            };
+            if done {
+                break;
+            }
+        }
+    }
+}
+
+/// Views bytes that are all initialized: created with `MaybeUninit::new`,
+/// or reported written by the encoder.
+fn initialized_mut(buffer: &mut [MaybeUninit<u8>]) -> &mut [u8] {
+    // SAFETY: callers pass only initialized bytes (see above), and the
+    // encoders write only initialized bytes, so none is de-initialized.
+    unsafe { &mut *(buffer as *mut [MaybeUninit<u8>] as *mut [u8]) }
+}
+
+fn uninit_output(c: &mut Criterion) {
+    let input = corpus::mixed(1 << 20, 10);
+    let chunk = 16 << 10;
+    let steps: Vec<(&[u8], Directive)> = input
+        .chunks(chunk)
+        .map(|piece| (piece, Directive::Continue))
+        .chain([(&[][..], Directive::End)])
+        .collect();
+    let mut out = Vec::with_capacity(input.len());
+    for capacity in [4 << 10, 128 << 10] {
+        let mut group =
+            c.benchmark_group(format!("stream-output-{}KiB/mixed-1MiB", capacity >> 10));
+        group.throughput(Throughput::Bytes(input.len() as u64));
+        let mut buffer = vec![MaybeUninit::new(0u8); capacity];
+        for level in [1, 3] {
+            let params = Params::level(level);
+            let theirs =
+                oracle::compress_stream_with_output(&params, &steps, capacity).expect("reference");
+            let mut mzstd = encoder(level);
+            for (id, uninit) in [("mzstd-process", false), ("mzstd-process_uninit", true)] {
+                stream_into(&mut mzstd, &input, chunk, &mut buffer, uninit, &mut out);
+                assert_eq!(out, theirs, "{id} level {level} output {capacity}");
+                group.bench_function(BenchmarkId::new(id, level), |b| {
+                    b.iter(|| {
+                        stream_into(
+                            &mut mzstd,
+                            black_box(&input),
+                            chunk,
+                            &mut buffer,
+                            uninit,
+                            &mut out,
+                        );
+                    });
+                });
+            }
+            group.bench_function(BenchmarkId::new("zstd", level), |b| {
+                b.iter(|| {
+                    oracle::compress_stream_with_output(&params, black_box(&steps), capacity)
+                });
+            });
+        }
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("compress_to_uninit/text-1MiB");
+    let input = corpus::text(1 << 20, 1);
+    group.throughput(Throughput::Bytes(input.len() as u64));
+    let bound = Compressor::max_compressed_size(input.len()).expect("a bound");
+    let mut destination: Vec<u8> = Vec::with_capacity(bound);
+    for level in [1, 3] {
+        let mut mzstd = encoder(level);
+        let theirs = oracle::compress2(&input, &Params::level(level)).expect("reference");
+        let size = mzstd
+            .compress_to_uninit(&input, destination.spare_capacity_mut())
+            .expect("compresses");
+        assert_eq!(
+            initialized_mut(&mut destination.spare_capacity_mut()[..size]),
+            &theirs[..]
+        );
+        group.bench_function(BenchmarkId::new("mzstd", level), |b| {
+            b.iter(|| {
+                mzstd
+                    .compress_to_uninit(black_box(&input), destination.spare_capacity_mut())
+                    .expect("compresses")
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = compress, streaming
+    targets = compress, streaming, uninit_output
 }
 criterion_main!(benches);

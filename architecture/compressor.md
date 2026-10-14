@@ -108,8 +108,12 @@ sequenceDiagram
 The slice entry points use `core::compress_once_into`, which is
 `ZSTD_compress2` with a stable input: the input is a segment of its own
 (`Segment::Input(id)`, with a fresh id per call), so the engine matches
-directly in caller memory and never copies it. `compress_to_uninit` writes
-through a temporary initialized buffer only as large as the destination.
+directly in caller memory and never copies it. `compress_to_uninit` runs the
+same pipeline through `core::compress_once_uninit`, which writes into the
+caller's `MaybeUninit` memory via `core::output::UninitOutput`: the
+destination is zeroed just ahead of each block instead of being copied from
+a temporary buffer (see [encoder core](encoder-core.md#destinations)). It
+succeeds, fails and writes exactly as `compress_to_slice`.
 
 `compress` and `compress_into` use `core::compress_once_append`: they reserve
 `compressBound` capacity, but for inputs larger than 128 KiB initialize only
@@ -137,7 +141,7 @@ stateDiagram-v2
     Open --> Open: process(Continue) / Flush with output drained
     Open --> Open: Flush or End needing output (NeedsOutput)
     Open --> Finished: End with nothing left to write
-    Open --> Failed: core error
+    Open --> Failed: core error, or first End contradicting a declared size
     Finished --> Finished: further calls report Finished, consume nothing
     Failed --> Failed: further calls return InvalidState
     Finished --> Open: reinit (owned session)
@@ -149,7 +153,33 @@ stateDiagram-v2
   `InputSizeMismatch`. `InputSize::Unknown` leaves the header without a
   content size unless the whole input arrives with the first `End`, as in the
   reference.
-- `process_uninit` writes into `MaybeUninit` output through the same path.
+- A first call that is already `End` deviates from the reference on
+  purpose. `ZSTD_compressStream2` replaces the pledged size with that call's
+  input length and writes a frame for it; the session instead fails with
+  `InputSizeMismatch` before touching the stream, as it does for every later
+  mismatch, so a truncated or overlong input never produces a frame. The
+  check lives in `session::Core`; the core stream remains a faithful port.
+  When the length matches, the bytes are the reference's.
+- `process_uninit` is `process` over a `[MaybeUninit<u8>]` destination: the
+  same generic `Core::process` and `Stream::compress`, with blocks written
+  straight to the caller zeroed just ahead and buffered output copied in.
+  Bytes, counts, statuses and errors equal `process`, and the two may be
+  mixed on one frame; nothing is allocated per call. Past `produced` the
+  output may hold zeros or the engine's scratch bytes (a block it replaced
+  with a raw or RLE block, for instance), exactly as a slice would; only
+  the reported prefix is meaningful.
+
+```mermaid
+flowchart TD
+    Process["Core::process(input, output: &mut D, op)"] --> St{state}
+    St -- Failed --> Invalid[InvalidState]
+    St -- Finished --> Done["Finished, nothing moved"]
+    St -- Open --> First{"op == End, stream idle, declared != input.len()?"}
+    First -- yes --> Mismatch["state = Failed, reset stream, InputSizeMismatch"]
+    First -- no --> Stream["Stream::compress (D = [u8] or [MaybeUninit u8])"]
+    Stream -- CoreError --> Failed["state = Failed, mapped EncodeError"]
+    Stream -- step --> Status[NeedsInput / NeedsOutput / Finished]
+```
 - `flush` and `finish` are `process` with `Flush` and `End`.
 - Dropping a session mid-frame leaves the compressor reusable: the next
   `start` resets the stream state.

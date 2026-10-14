@@ -596,6 +596,29 @@ fn compress_to_uninit_reports_a_destination_that_is_too_small() {
 }
 
 #[test]
+fn compress_to_uninit_succeeds_exactly_when_the_reference_does() {
+    // Several blocks each, so the destination is zeroed ahead of every one;
+    // random input exercises the raw-block fallback near the capacity.
+    let inputs = [corpus::text(300_000, 31), corpus::random(300_000, 32)];
+    let mut encoder = Compressor::default();
+    for input in &inputs {
+        let frame = oracle::compress2(input, &Params::level(3)).expect("reference");
+        let bound = Compressor::max_compressed_size(input.len()).expect("fits");
+        for capacity in (frame.len() - 4..frame.len() + 16).chain([bound]) {
+            let theirs = oracle::compress2_capacity(input, &Params::level(3), capacity);
+            let mut destination = vec![MaybeUninit::<u8>::uninit(); capacity];
+            match encoder.compress_to_uninit(input, &mut destination) {
+                Ok(written) => assert_eq!(Ok(initialized(&destination, written)), theirs),
+                Err(error) => {
+                    assert_eq!(error, EncodeError::OutputTooSmall { provided: capacity });
+                    assert!(theirs.is_err(), "the reference fits {capacity} bytes");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn input_sizes_convert_from_byte_counts() {
     assert_eq!(InputSize::from(0u64), InputSize::Exact(0));
     assert_eq!(InputSize::from(u64::MAX), InputSize::Exact(u64::MAX));
@@ -725,16 +748,97 @@ fn a_session_fails_on_input_beyond_its_declared_size() {
 }
 
 #[test]
-fn a_first_end_call_replaces_the_declared_size_like_the_reference() {
+fn a_first_end_call_longer_than_the_declared_size_fails() {
     let input = b"more than four";
     let mut encoder = Compressor::default();
-    let mut session = encoder.start(InputSize::Exact(4).into());
-    let ours = drive(1 << 17, &[(input, Operation::End)], |data, out, op| {
-        session.process(data, out, op).expect("compresses")
-    });
+    {
+        let mut session = encoder.start(InputSize::Exact(4).into());
+        let mut out = [0u8; 256];
+        assert_eq!(
+            session.process(input, &mut out, Operation::End),
+            Err(EncodeError::InputSizeMismatch { declared: 4 })
+        );
+        assert_eq!(session.finish(&mut out), Err(EncodeError::InvalidState));
+        assert!(!session.is_finished());
+    }
+    // The reference instead replaces the pledge with the input's length.
     let params = Params::level(3).with_pledged(4);
-    let theirs = oracle::compress_stream(&params, &[(input, Directive::End)]).expect("reference");
+    assert!(oracle::compress_stream(&params, &[(input, Directive::End)]).is_ok());
+    // The compressor is left as good as new.
+    let fresh = Compressor::default().compress(input).expect("compresses");
+    assert_eq!(encoder.compress(input).expect("compresses"), fresh);
+}
+
+#[test]
+fn a_first_end_call_shorter_than_the_declared_size_fails() {
+    let mut session = Compressor::default().into_session(InputSize::Exact(100).into());
+    let mut out = [MaybeUninit::<u8>::uninit(); 256];
+    assert_eq!(
+        session.process_uninit(b"short", &mut out, Operation::End),
+        Err(EncodeError::InputSizeMismatch { declared: 100 })
+    );
+    assert_eq!(
+        session.process_uninit(b"", &mut out, Operation::End),
+        Err(EncodeError::InvalidState)
+    );
+    session.reinit(InputSize::Exact(5).into());
+    let progress = session
+        .process_uninit(b"short", &mut out, Operation::End)
+        .expect("matches the new declaration");
+    assert_eq!(progress.status, EncoderStatus::Finished);
+    let mut expected = Compressor::default();
+    let mut reference = expected.start(InputSize::Exact(5).into());
+    let mut frame = [0u8; 256];
+    let written = reference
+        .process(b"short", &mut frame, Operation::End)
+        .expect("compresses")
+        .produced;
+    assert_eq!(initialized(&out, progress.produced), frame[..written]);
+}
+
+#[test]
+fn borrowed_session_process_uninit_matches_the_reference_with_large_outputs() {
+    // Outputs that hold a block's bound take the direct paths: blocks are
+    // written straight into the caller's memory, and the final `End` is
+    // compressed from the caller's input.
+    let input = leaked(corpus::text(400_000, 33));
+    let steps = [
+        (&input[..250_000], Operation::Continue),
+        (&[][..], Operation::Flush),
+        (&input[250_000..], Operation::End),
+    ];
+    let capacity = 1 << 19;
+    let mut encoder = Compressor::default();
+    let mut session = encoder.start(StreamConfig::default());
+    let mut scratch = vec![MaybeUninit::<u8>::uninit(); capacity];
+    let ours = drive(capacity, &steps, |data, out, op| {
+        let progress = session
+            .process_uninit(data, &mut scratch, op)
+            .expect("compresses");
+        out[..progress.produced].copy_from_slice(&initialized(&scratch, progress.produced));
+        progress
+    });
+    assert!(session.is_finished());
+    let theirs =
+        oracle::compress_stream_with_output(&Params::level(3), &directives(&steps), capacity)
+            .expect("reference");
     assert_eq!(ours, theirs);
+}
+
+#[test]
+fn a_single_end_call_through_process_uninit_writes_the_one_shot_frame() {
+    let input = corpus::random(300_000, 34);
+    let mut encoder = Compressor::default();
+    let one_shot = encoder.compress(&input).expect("compresses");
+    let bound = Compressor::max_compressed_size(input.len()).expect("fits");
+    let mut out = vec![MaybeUninit::<u8>::uninit(); bound];
+    let mut session = encoder.start(InputSize::from(input.len() as u64).into());
+    let progress = session
+        .process_uninit(&input, &mut out, Operation::End)
+        .expect("compresses");
+    assert_eq!(progress.consumed, input.len());
+    assert_eq!(progress.status, EncoderStatus::Finished);
+    assert_eq!(initialized(&out, progress.produced), one_shot);
 }
 
 #[test]

@@ -1,5 +1,33 @@
 # Changelog
 
+## [v0.2.2](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.2) - 2026-10-14
+
+- **A session holds a first `End` call to its declared size.** With
+  `InputSize::Exact(n)`, a session whose whole input arrived in one
+  `Operation::End` call of any other length used to write a complete frame
+  for that length, as `ZSTD_compressStream2` does when it replaces the
+  pledged size. It now fails with `EncodeError::InputSizeMismatch`, like
+  every other contradiction of a declared size, so a truncated or overlong
+  input never yields a frame. Frames whose input matches its declaration
+  are unchanged and still byte-identical to zstd 1.5.7.
+
+- **`process_uninit` and `compress_to_uninit` write in place.** Both used to
+  allocate and zero a temporary buffer as large as the destination on every
+  call, then copy the result over. The encoder now writes into the caller's
+  `MaybeUninit` memory directly, zeroing it only just ahead of each block it
+  writes there (tracked with `borrowed-buf`, without `unsafe`), and copies
+  buffered output in. Bytes, counts, statuses and errors are those of
+  `process` and `compress_to_slice`. As with those, bytes past the reported
+  output may now hold zeros or scratch bytes; only the reported prefix is
+  meaningful. The `encoder_session` and `output_capacity` fuzz targets cover
+  both paths, and `benches/compress.rs` times them: with 128 KiB outputs
+  over 1 MiB of mixed data in 16 KiB chunks, `process_uninit` at level 1
+  takes 1.25 ms (was 1.35 ms; `process` 1.26 ms), and with 4 KiB outputs
+  1.22 ms (was 1.28 ms). `compress_to_uninit` of 1 MiB of text is 1-2%
+  faster (level 3: 1.334 ms, was 1.350-1.363 ms). Measured with
+  `cargo bench --bench compress -- 'stream-output|compress_to_uninit'` on
+  Apple Silicon (aarch64-apple-darwin); output is identical.
+
 ## [v0.2.1](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.1) - 2026-10-14
 
 - **Reuse the Huffman tree during depth selection.** Optimal-depth trials

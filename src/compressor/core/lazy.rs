@@ -1622,7 +1622,7 @@ mod tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut buffer, &data[in_pos..], op)
+                    .compress(engine, requested, &mut buffer[..], &data[in_pos..], op)
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&buffer[..step.produced]);

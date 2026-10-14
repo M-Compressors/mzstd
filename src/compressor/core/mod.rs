@@ -13,7 +13,7 @@ pub(crate) mod match_state;
 pub(crate) mod mem;
 pub(crate) mod opt;
 mod opt_count;
-mod output;
+pub(crate) mod output;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod seq_store;
@@ -24,6 +24,7 @@ pub(crate) mod window;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 use cctx::{Engine, RequestedParams};
 use error::CoreError;
@@ -40,6 +41,40 @@ pub(crate) fn compress_once_into(
     input_id: u64,
     dst: &mut [u8],
 ) -> Result<usize, CoreError> {
+    compress_once_to(
+        engine,
+        requested,
+        input,
+        input_id,
+        &mut output::SliceOutput(dst),
+    )
+}
+
+/// [`compress_once_into`] into memory that may be uninitialized, zeroed just
+/// ahead of each block; on success exactly `dst[..size]` is initialized.
+pub(crate) fn compress_once_uninit(
+    engine: &mut Engine,
+    requested: &RequestedParams,
+    input: &[u8],
+    input_id: u64,
+    dst: &mut [MaybeUninit<u8>],
+) -> Result<usize, CoreError> {
+    compress_once_to(
+        engine,
+        requested,
+        input,
+        input_id,
+        &mut output::UninitOutput::from(dst),
+    )
+}
+
+fn compress_once_to<O: output::Output>(
+    engine: &mut Engine,
+    requested: &RequestedParams,
+    input: &[u8],
+    input_id: u64,
+    dst: &mut O,
+) -> Result<usize, CoreError> {
     let pledged = input.len() as u64;
     let applied = requested.resolve(pledged);
     engine.begin(applied, pledged);
@@ -48,7 +83,7 @@ pub(crate) fn compress_once_into(
         input: (input, input_id),
     };
     let src = Addr::new(Segment::Input(input_id), 0);
-    engine.compress_end(&segments, dst, src, input.len())
+    engine.compress_end_to(&segments, dst, src, input.len())
 }
 
 /// The same frame pipeline with output initialized one block at a time.
@@ -414,7 +449,7 @@ mod stream_tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut chunk, &data[in_pos..], op)
+                    .compress(engine, requested, &mut chunk[..], &data[in_pos..], op)
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&chunk[..step.produced]);
@@ -642,7 +677,7 @@ mod stream_tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut chunk, &data[in_pos..], op)
+                    .compress(engine, requested, &mut chunk[..], &data[in_pos..], op)
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&chunk[..step.produced]);

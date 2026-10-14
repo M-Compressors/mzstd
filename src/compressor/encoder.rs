@@ -1,7 +1,6 @@
 //! The reusable compressor.
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::ops::Range;
@@ -301,9 +300,14 @@ impl Compressor {
         result
     }
 
-    /// Writes the frame for `src` into uninitialized memory.
+    /// Writes the frame for `src` into uninitialized memory, such as
+    /// [`Vec::spare_capacity_mut`], without a temporary buffer.
     ///
-    /// On success exactly `dst[..written]` is initialized.
+    /// It writes the same bytes and fails exactly when
+    /// [`Self::compress_to_slice`] does. On success exactly `dst[..written]`
+    /// holds the frame. As with [`Self::compress_to_slice`], the encoder may
+    /// also have written scratch bytes after it, so treat only
+    /// `dst[..written]` as initialized, and none of `dst` after an error.
     ///
     /// # Errors
     ///
@@ -325,12 +329,14 @@ impl Compressor {
         src: &[u8],
         dst: &mut [MaybeUninit<u8>],
     ) -> Result<usize, EncodeError> {
-        let mut scratch = vec![0u8; dst.len()];
-        let written = self.compress_to_slice(src, &mut scratch)?;
-        for (slot, &byte) in dst.iter_mut().zip(&scratch[..written]) {
-            slot.write(byte);
-        }
-        Ok(written)
+        self.stream.reset_session();
+        let id = self.next_id();
+        let capacity = dst.len();
+        let result =
+            super::core::compress_once_uninit(&mut self.engine, &self.requested, src, id, dst)
+                .map_err(|error| EncodeError::from_core(error, capacity, Some(src.len() as u64)));
+        self.apply_retention();
+        result
     }
 
     /// Starts an incremental frame borrowing this compressor.

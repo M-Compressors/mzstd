@@ -44,8 +44,8 @@ the payload, so every target shares one seed corpus.
 | Target | Oracle |
 | --- | --- |
 | `differential_c` | `Compressor::compress` equals `ZSTD_compress2` with the same parameters, and the frame decodes. |
-| `output_capacity` | `compress_to_slice` into an arbitrary capacity returns the reference's frame, or `OutputTooSmall` exactly when `ZSTD_compress2` fails. |
-| `encoder_session` | A session driven by random chunks, flushes and output capacity equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
+| `output_capacity` | `compress_to_slice` into an arbitrary capacity returns the reference's frame, or `OutputTooSmall` exactly when `ZSTD_compress2` fails; `compress_to_uninit` into the same capacity returns the same result and frame. |
+| `encoder_session` | A session driven by random chunks, flushes and output capacity, with calls alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
 | `compressor_lifecycle` | Reuse, `reconfigure` and `trim(ReleaseAll)` never change a frame. |
 | `parallel` | Parallel frames decode with the reference and are identical for 1–8 tasks run in reverse order. A session (windows 1–4, an optional flush, calls alternating `process` and `process_uninit`, which must leave every byte past `produced` untouched) and the `ParallelEncoderWriter`/`ParallelEncoderReader` adapters (one executor thread each) decode; with a declared size, or an input within one segment, and no flush they equal the batch frame; the writer always equals the session driven with the same writes and flush. |
 | `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`. |

@@ -8,10 +8,10 @@
 //! output to hold its worst case is compressed straight from the caller's
 //! memory.
 
-use alloc::vec;
 use core::mem::MaybeUninit;
 
 use super::core::error::CoreError;
+use super::core::output::Destination;
 use super::core::stream::EndOp;
 use super::encoder::Compressor;
 use super::error::EncodeError;
@@ -19,7 +19,8 @@ use super::error::EncodeError;
 /// How much input a frame will carry, when that is known in advance.
 ///
 /// A declared size selects the parameters for that size and is written into
-/// the frame header; the frame fails if the input differs.
+/// the frame header; the frame fails if the input differs, including when the
+/// whole input arrives with a first [`Operation::End`].
 ///
 /// # Examples
 ///
@@ -175,11 +176,11 @@ impl Core {
         }
     }
 
-    fn process(
+    fn process<D: Destination + ?Sized>(
         &mut self,
         compressor: &mut Compressor,
         input: &[u8],
-        output: &mut [u8],
+        output: &mut D,
         operation: Operation,
     ) -> Result<Progress, EncodeError> {
         match self.state {
@@ -193,6 +194,20 @@ impl Core {
             }
             State::Open => {}
         }
+        // On a first `End` call the reference replaces the pledged size
+        // with the input's length (`ZSTD_CCtx_init_compressStream2`) and
+        // writes a frame for that; a session holds the input to its
+        // declaration instead, as later calls already are.
+        if operation == Operation::End
+            && compressor.stream.is_idle()
+            && let Some(declared) = self.declared
+            && declared != input.len() as u64
+        {
+            self.state = State::Failed;
+            compressor.stream.reset_session();
+            return Err(EncodeError::InputSizeMismatch { declared });
+        }
+        let output_len = output.capacity();
         let result = compressor.stream.compress(
             &mut compressor.engine,
             &compressor.requested,
@@ -206,7 +221,7 @@ impl Core {
                 self.state = State::Failed;
                 return Err(match error {
                     CoreError::DstSizeTooSmall => EncodeError::Internal,
-                    other => EncodeError::from_core(other, output.len(), self.declared),
+                    other => EncodeError::from_core(other, output_len, self.declared),
                 });
             }
         };
@@ -226,21 +241,6 @@ impl Core {
             status,
         })
     }
-
-    fn process_uninit(
-        &mut self,
-        compressor: &mut Compressor,
-        input: &[u8],
-        output: &mut [MaybeUninit<u8>],
-        operation: Operation,
-    ) -> Result<Progress, EncodeError> {
-        let mut scratch = vec![0u8; output.len()];
-        let progress = self.process(compressor, input, &mut scratch, operation)?;
-        for (slot, &byte) in output.iter_mut().zip(&scratch[..progress.produced]) {
-            slot.write(byte);
-        }
-        Ok(progress)
-    }
 }
 
 macro_rules! session_methods {
@@ -256,7 +256,10 @@ macro_rules! session_methods {
         /// # Errors
         ///
         /// [`EncodeError::InputSizeMismatch`] when the input contradicts a
-        /// declared size, and [`EncodeError::InvalidState`] after a failure.
+        /// declared size: when more arrives than was declared, when the
+        /// frame ends short of it, or when a first [`Operation::End`] call
+        /// carries any other length. [`EncodeError::InvalidState`] after a
+        /// failure.
         /// A failed session encodes nothing further.
         ///
         /// # Examples
@@ -282,8 +285,16 @@ macro_rules! session_methods {
             self.core.process(compressor, input, output, operation)
         }
 
-        /// [`Self::process`] into uninitialized memory: exactly
-        /// `output[..produced]` is initialized on success.
+        /// [`Self::process`] into uninitialized memory, such as
+        /// [`Vec::spare_capacity_mut`], without a temporary buffer.
+        ///
+        /// It produces the same bytes, `consumed` and `produced` counts,
+        /// statuses and errors as [`Self::process`], and calls of the two
+        /// may be mixed on one frame. On success exactly
+        /// `output[..produced]` holds compressed bytes. As with
+        /// [`Self::process`], the encoder may also have written scratch
+        /// bytes after them, so treat only `output[..produced]` as
+        /// initialized, and none of `output` after an error.
         ///
         /// # Errors
         ///
@@ -310,8 +321,7 @@ macro_rules! session_methods {
             operation: Operation,
         ) -> Result<Progress, EncodeError> {
             let compressor = &mut *self.$compressor;
-            self.core
-                .process_uninit(compressor, input, output, operation)
+            self.core.process(compressor, input, output, operation)
         }
 
         /// Makes everything accepted so far decodable, without taking input.

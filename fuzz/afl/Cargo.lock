@@ -15,6 +15,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrowed-buf"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f17ad7280ae7c89e7f53e05a9cd48d66b77b51c4ad7fb7a5195cec0e2548b50"
+
+[[package]]
 name = "branches"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -70,8 +76,9 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "mzstd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
+ "borrowed-buf",
  "branches",
  "fearless_simd",
  "fearless_simd_macros",

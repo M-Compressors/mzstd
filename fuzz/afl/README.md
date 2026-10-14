@@ -46,8 +46,8 @@ logs (one byte), `0x80` source size hint (two bytes). The rest, capped at
 | Target | Extra bytes | Checks |
 | --- | --- | --- |
 | `differential_c` | none | `compress` equals `ZSTD_compress2` with the same parameters; the frame decodes |
-| `output_capacity` | 2: capacity | `compress_to_slice` into any capacity returns the reference's frame, or fails exactly when `ZSTD_compress2` does |
-| `encoder_session` | 4: output size, declared size, chunk seed | A session fed random chunks, flushes and output windows equals `ZSTD_compressStream2` driven the same way |
+| `output_capacity` | 2: capacity | `compress_to_slice` and `compress_to_uninit` into any capacity return the reference's frame, or fail exactly when `ZSTD_compress2` does |
+| `encoder_session` | 4: output size, declared size, chunk seed | A session fed random chunks, flushes and output windows, alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way |
 | `compressor_lifecycle` | a second header mid-payload | Reuse, `reconfigure` and `trim` never change a frame |
 | `parallel` | 1: task count (bits 0-2), stream window (3-4), flush (5), chunk size (6-7 with 0-2) | Parallel frames decode and are identical for 1–8 tasks run in reverse order; a session alternating `process` and `process_uninit` and the writer and reader adapters, with and without a declared size, decode and reproduce the batch frame whenever no flush moved a boundary |
 | `parameter_parsing` | none | Header decoding never panics; window logs are accepted exactly in `10..=31` |

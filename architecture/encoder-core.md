@@ -12,12 +12,13 @@ deviation changes some frame.
 
 ```mermaid
 graph TD
-    Mod["core::mod: compress_once_into, compress_once_append"] --> Cctx[cctx: Engine, params, frame chunks]
+    Mod["core::mod: compress_once_into, compress_once_uninit, compress_once_append"] --> Cctx[cctx: Engine, params, frame chunks]
     Stream[stream: ZSTD_compressStream2] --> Cctx
+    Stream --> Output
     Cctx --> Params[params: levels, bounds, adjust, resolve]
     Cctx --> Window[window: Segment, Addr, WindowState]
     Cctx --> Block[block: buildSeqStore, entropy, block emit]
-    Cctx --> Output["output: fixed slice or incrementally initialized Vec"]
+    Cctx --> Output["output: fixed slice, incrementally initialized Vec or zeroed-ahead uninit memory"]
     Cctx --> Presplit[presplit: pre-splitter]
     Block --> Split[split_block: post splitter]
     Block --> MS[match_state: tables, opt state]
@@ -463,8 +464,43 @@ the reference's shortcut condition holds — an `End` call, an empty input
 buffer, and an output with room for `compressBound` of the remaining input —
 the input is compressed straight from the caller's memory into the caller's
 output, which changes the bytes and is reproduced. A first call that is
-already `End` also pledges the input size, so the header records it.
+already `End` also pledges the input size, so the header records it; the
+public session rejects that call first when its length contradicts a
+declared size (see [compressor](compressor.md#sessions)).
 `StreamStep` reports bytes consumed, produced and still buffered.
+
+## Destinations
+
+The engine writes frames through `output::Output::prepare(position,
+needed)`, which returns the writable tail at `position`; `needed` is the
+largest amount the next write can take (a frame header, `compressBound` of
+the next block, the epilogue). `SliceOutput` returns the caller's exact
+tail. `VecOutput` and `UninitOutput` initialize only up to
+`min(position + needed, limit)`, so the encoder sees either at least a
+block's bound or the exact remaining capacity, the two cases in which its
+capacity checks behave as with the whole slice. `UninitOutput` keeps a
+`borrowed_buf::BorrowedBuf` over the caller's `MaybeUninit` bytes, zeroes
+its filled prefix forward and hands out `filled_mut()[position..]`, so no
+`unsafe` code is involved and each byte is zeroed at most once per call.
+
+`Stream::compress` is generic over `output::Destination`, implemented for
+`[u8]` and `[MaybeUninit<u8>]`. Its `tail(at)` is the `Output` for blocks
+written straight to the caller (the shortcut and `direct` blocks), and
+`put(at, bytes)` copies what was compressed into `out_buff`. The `[u8]`
+instance compiles to the code the stream had before the abstraction.
+
+```mermaid
+flowchart TD
+    Call["Stream::compress(output: &mut D)"] --> Path{block path}
+    Path -- "End shortcut or direct block" --> Tail["output.tail(op): Output"]
+    Path -- "otherwise" --> OutBuff["SliceOutput(out_buff)"]
+    OutBuff --> Put["Flush stage: output.put(op, out_buff[..])"]
+    Tail --> Kind{D}
+    Kind -- "[u8]" --> Slice["SliceOutput: exact caller tail"]
+    Kind -- "[MaybeUninit u8]" --> Uninit["UninitOutput: zero up to position + needed, then filled tail"]
+    Slice --> Engine["Engine::compress_end_to / compress_continue_to"]
+    Uninit --> Engine
+```
 
 ## Errors
 

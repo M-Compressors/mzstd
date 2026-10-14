@@ -14,7 +14,7 @@ use super::entropy::{FseRepeat, Tables};
 use super::error::CoreError;
 use super::ldm::{LdmState, RawSeqStore};
 use super::match_state::MatchState;
-use super::output::{Output, SliceOutput};
+use super::output::Output;
 use super::params::{
     self, CONTENT_SIZE_UNKNOWN, CParamOverrides, CParams, LDM_DEFAULT_WINDOW_LOG, ParamSwitch,
     Strategy,
@@ -391,7 +391,8 @@ impl Engine {
     }
 
     /// Compresses `len` bytes at `src` (`ZSTD_compressContinue_internal` in
-    /// frame mode).
+    /// frame mode), for the parallel encoder's fragments.
+    #[cfg(not(feature = "no_std"))]
     pub(crate) fn compress_continue(
         &mut self,
         segments: &Segments<'_>,
@@ -400,10 +401,16 @@ impl Engine {
         len: usize,
         last_frame_chunk: bool,
     ) -> Result<usize, CoreError> {
-        self.compress_continue_to(segments, &mut SliceOutput(dst), src, len, last_frame_chunk)
+        self.compress_continue_to(
+            segments,
+            &mut super::output::SliceOutput(dst),
+            src,
+            len,
+            last_frame_chunk,
+        )
     }
 
-    fn compress_continue_to<O: Output>(
+    pub(crate) fn compress_continue_to<O: Output>(
         &mut self,
         segments: &Segments<'_>,
         dst: &mut O,
@@ -450,16 +457,6 @@ impl Engine {
 
     /// Compresses the last input of a frame and writes its epilogue
     /// (`ZSTD_compressEnd_public`).
-    pub(crate) fn compress_end(
-        &mut self,
-        segments: &Segments<'_>,
-        dst: &mut [u8],
-        src: Addr,
-        len: usize,
-    ) -> Result<usize, CoreError> {
-        self.compress_end_to(segments, &mut SliceOutput(dst), src, len)
-    }
-
     pub(crate) fn compress_end_to<O: Output>(
         &mut self,
         segments: &Segments<'_>,

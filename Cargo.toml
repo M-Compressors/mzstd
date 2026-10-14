@@ -1,6 +1,6 @@
 [package]
 name = "mzstd"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -49,6 +49,13 @@ features = ["prefetch"]
 
 # Profiling instrumentation only; every anchor in `src/` is written as
 # `#[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]`.
+# Safe bookkeeping for uninitialized session output: the encoder writes
+# into a zeroed-ahead prefix instead of a temporary buffer.
+[dependencies.borrowed-buf]
+version = "0.1.1"
+optional = true
+default-features = false
+
 [dependencies.hotpath]
 version = "0.28"
 optional = true
@@ -87,6 +94,7 @@ required-features = ["decompression"]
 default = ["std", "compression", "decompression"]
 # Independently selectable public codecs and their private implementations.
 compression = [
+    "dep:borrowed-buf",
     "dep:branches",
     "dep:fearless_simd",
     "dep:fearless_simd_macros",

@@ -43,7 +43,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | --- | --- |
 | [Codec features](codec-features.md) | Feature gates, `no_std`, std-only modules, hotpath anchors and the checked configurations. |
 | [Compressor](compressor.md) | Public encoder API, configuration lowering, one-shot calls, sessions, I/O adapters, errors and retention. |
-| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding and streaming. |
+| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding, streaming and output destinations (slice, Vec, uninitialized memory). |
 | [Optimal parser](optimal-parser.md) | btopt/btultra/btultra2 and LDM: per-block SIMD dispatch, the shared binary-tree walk, match-length kernels, price tables. |
 | [Parallel compression](parallel-compression.md) | Frame plans, overlapped segments, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |

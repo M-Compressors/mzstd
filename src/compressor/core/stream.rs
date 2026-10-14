@@ -8,11 +8,15 @@
 //! early, and an `End` whose remaining input fits a `compressBound` worth of
 //! output while the buffer is empty is compressed straight from the caller's
 //! memory, which the window then sees as a new segment.
+//!
+//! The caller's output is a [`Destination`]: initialized bytes, or memory that
+//! the engine zeroes just ahead of each block it writes there directly.
 
 use alloc::vec::Vec;
 
 use super::cctx::{Engine, RequestedParams, compress_bound};
 use super::error::CoreError;
+use super::output::{Destination, Output, SliceOutput};
 use super::window::{Addr, Segment, Segments};
 
 /// What a streaming call asks for (`ZSTD_EndDirective`).
@@ -157,11 +161,11 @@ impl Stream {
     ///
     /// Any failure of the block compressor, and
     /// [`CoreError::SrcSizeWrong`] when the input contradicts a declared size.
-    pub(crate) fn compress(
+    pub(crate) fn compress<D: Destination + ?Sized>(
         &mut self,
         engine: &mut Engine,
         requested: &RequestedParams,
-        output: &mut [u8],
+        output: &mut D,
         input: &[u8],
         end_op: EndOp,
     ) -> Result<StreamStep, CoreError> {
@@ -183,17 +187,17 @@ impl Stream {
     }
 
     /// `ZSTD_compressStream_generic` in buffered mode.
-    fn generic(
+    fn generic<D: Destination + ?Sized>(
         &mut self,
         engine: &mut Engine,
-        output: &mut [u8],
+        output: &mut D,
         out_pos: &mut usize,
         input: &[u8],
         in_pos: &mut usize,
         flush_mode: EndOp,
     ) -> Result<(), CoreError> {
         let iend = input.len();
-        let oend = output.len();
+        let oend = output.capacity();
         let mut ip = *in_pos;
         let mut op = *out_pos;
         let input_id = self.next_input_id;
@@ -213,8 +217,12 @@ impl Stream {
                             input: (input, input_id),
                         };
                         let src = Addr::new(Segment::Input(input_id), ip as i64);
-                        let c_size =
-                            engine.compress_end(&segments, &mut output[op..], src, iend - ip)?;
+                        let c_size = engine.compress_end_to(
+                            &segments,
+                            &mut output.tail(op),
+                            src,
+                            iend - ip,
+                        )?;
                         ip = iend;
                         op += c_size;
                         self.frame_ended = true;
@@ -243,15 +251,24 @@ impl Stream {
                         input: (&[], 0),
                     };
                     let src = Addr::new(Segment::Buffer, self.in_to_compress as i64);
-                    let target: &mut [u8] = if direct {
-                        &mut output[op..]
+                    let c_size = if direct {
+                        compress_block(
+                            engine,
+                            &segments,
+                            &mut output.tail(op),
+                            src,
+                            i_size,
+                            last_block,
+                        )?
                     } else {
-                        &mut self.out_buff
-                    };
-                    let c_size = if last_block {
-                        engine.compress_end(&segments, target, src, i_size)?
-                    } else {
-                        engine.compress_continue(&segments, target, src, i_size, false)?
+                        compress_block(
+                            engine,
+                            &segments,
+                            &mut SliceOutput(&mut self.out_buff),
+                            src,
+                            i_size,
+                            last_block,
+                        )?
                     };
                     self.frame_ended = last_block;
                     self.in_buff_target = self.in_buff_pos + engine.block_size_max;
@@ -275,7 +292,8 @@ impl Stream {
                 Stage::Flush => {
                     let to_flush = self.out_buff_content_size - self.out_buff_flushed_size;
                     let flushed = to_flush.min(oend - op);
-                    output[op..op + flushed].copy_from_slice(
+                    output.put(
+                        op,
                         &self.out_buff
                             [self.out_buff_flushed_size..self.out_buff_flushed_size + flushed],
                     );
@@ -297,5 +315,21 @@ impl Stream {
         *in_pos = ip;
         *out_pos = op;
         result
+    }
+}
+
+/// Compresses the gathered input as the frame's last chunk or as one more.
+fn compress_block<O: Output>(
+    engine: &mut Engine,
+    segments: &Segments<'_>,
+    dst: &mut O,
+    src: Addr,
+    len: usize,
+    last_block: bool,
+) -> Result<usize, CoreError> {
+    if last_block {
+        engine.compress_end_to(segments, dst, src, len)
+    } else {
+        engine.compress_continue_to(segments, dst, src, len, false)
     }
 }
