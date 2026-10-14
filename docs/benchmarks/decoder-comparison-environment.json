@@ -1,0 +1,57 @@
+{
+  "baseline": "dec-2026-10-13",
+  "date": "2026-10-13",
+  "baseline_commit": "e6db371916ced636d14e477e04d62855628ae1ff",
+  "source_state": "Working tree on top of baseline_commit with the uncommitted changes listed in CHANGELOG.md (Unreleased): per-block optimal-parser tables, chunked RLE test and match counting, single-pass raw/RLE blocks and bounded vector growth in the decoder. sha256 below identifies the measured sources.",
+  "c_library": "zstd 1.5.7 (zstd-ffi vendored submodule f8745da6ff1ad1e7bab384bd1f9d742439278e99), cc -O3, ZSTD_DISABLE_ASM, ZSTD_LEGACY_SUPPORT=0, single-threaded",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "c_compiler": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+  "kernel": "Linux DESKTOP-NCF2LLB 6.18.33.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+  "target": "x86_64-unknown-linux-gnu",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-13700KF",
+  "affinity": "One single-threaded Criterion process pinned to logical CPU 6; the encoder and decoder sweeps ran concurrently on logical CPUs 2 and 6 (separate physical cores) and nothing else ran.",
+  "rustflags": "unset; Cargo release defaults (bench profile), runtime SIMD dispatch (AVX2 level on this host)",
+  "api_mode": "cold one-shot APIs: construction, allocation, the call and disposal",
+  "levels": "-5, -1, 1-22",
+  "versions": {
+    "c-zstd": "1.5.7",
+    "mzstd": "0.2.0 + unreleased"
+  },
+  "sampling": {
+    "samples": 20,
+    "warmup_seconds": 1,
+    "requested_measurement_seconds": 3,
+    "note": "Criterion extends slow cases to collect all samples."
+  },
+  "plotting": "Matplotlib 3.10.8",
+  "size_manifest": "decoder-comparison-2026-10-13/sizes.csv",
+  "command": [
+    "cd benchmarks/comparison && taskset -c 6 target/release/deps/decoders-<hash> --bench --save-baseline dec-2026-10-13"
+  ],
+  "started_at_utc": "2026-10-13T18:44:43+00:00",
+  "finished_at_utc": "2026-10-13T19:27:25+00:00",
+  "sha256": {
+    "Cargo.toml": "e57881650539d0d42c143fba0d82eddfd836c21efa558cc25151bbd208986ec7",
+    "benchmarks/comparison/Cargo.toml": "c840774ee396e5d78a32e0e9c7ee27625796900ce7765f625dc522c88c780295",
+    "benchmarks/comparison/Cargo.lock": "a13d691780d07aa17e692eb8243404650a99233b9cb5ee8fff913159c9f2c8ec",
+    "benchmarks/comparison/src/core.rs": "f1f6de412d6762f42b03df70c56b75d4c4b386053cd4193280c751940395b231",
+    "benchmarks/comparison/src/core/decoder.rs": "cf2f116748286333a0c8a73f029ac9da30a1bdff616dea7ab73889aacc203cb5",
+    "benchmarks/comparison/report.py": "56c89d15dcc359384733c90242b06d38c2b7136dc8bd08311beb6da8cc9aa22e",
+    "benchmarks/comparison/level_docs.py": "cfde10c912c02deebc3f2a9973fdff98661ba508cd95ef3b53a0c94f866b440c",
+    "benchmarks/comparison/plot.py": "3e1001cb61fa7ae57e37e00c8581008a3b019c7526e964f379fad38471fc71ee",
+    "benchmarks/comparison/decoder_docs.py": "08a438949d505e8c35b764bb9f9b820e0cb9579c33b838f2e396c655f84bc35f",
+    "testdata/alice29.txt": "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0",
+    "zstd-ffi/build.rs": "287c9fc3c6a7bf089a39aca65a2bee5569fd99c7187ad372790e616250dadafb",
+    "src/compressor/core/opt.rs": "c2b3e7a925b363402bb18a7e9a9dab9f2fd68050d36b5811fe316c82e9acfc0f",
+    "src/compressor/core/mem.rs": "e17457bb5a29c0ef8d2bfd68db777dc1b83c2f50322888a16395c2352c9531d8",
+    "src/compressor/core/block.rs": "2d8f9989e5b4471ee8a1a2f501e7aca0107a0245fe51b8182a9a2616b6ec2dca",
+    "src/decompressor/core/stream.rs": "095d6bc8c633296808767ad2c2947021ab8050db80e2b107aedbe574c5f3d6ab",
+    "src/decompressor/core/frame.rs": "db6d5986747976b94f48170ba330a1fb4aeb64cc4539140792d1fafae415a0f3"
+  },
+  "limitations": [
+    "Single WSL2 host; frequency, thermal state and host scheduling uncontrolled.",
+    "Encoders and decoders were swept concurrently on two cores sharing the L3 cache.",
+    "Cold APIs: allocation strategy and glibc's mmap threshold state are part of every timing; warm reuse and streaming are measured only by the root benches.",
+    "The C library is built by zstd-ffi with cc defaults and without its Huffman assembly decoder."
+  ]
+}

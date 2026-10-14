@@ -63,7 +63,14 @@ The control flow is `ZSTD_compressBlock_opt_generic` line for line. The
 position table (`opt`, `ZSTD_optimal_t`) and the match buffer live in
 `OptState` and are moved out for the block, as is the LDM candidate store
 (lent by `ldm::block_compress` and handed back with its cursor unchanged,
-which is what the reference's header copy amounts to).
+which is what the reference's header copy amounts to). The reference carves
+both tables uninitialized from its workspace; `OptState::reserve_positions`
+grows them on the first block that needs them to `min(block length + 3,
+ZSTD_OPT_SIZE)` entries, the most any position or match index reaches (a
+match ends inside the block and below `ZSTD_OPT_NUM`; the list holds one
+match per distinct length plus an LDM candidate). `OptState::allocate` at
+frame start sizes only the frequency tables, so an empty frame never fills
+them and a tiny one fills a few dozen entries instead of 4099.
 
 ### Prices
 

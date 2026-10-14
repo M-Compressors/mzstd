@@ -4,7 +4,6 @@
 //! statistics, exactly as the reference computes them, so the chosen parse
 //! — and therefore every emitted byte — matches it.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use fearless_simd::{Simd, dispatch};
@@ -154,14 +153,33 @@ impl PriceTables {
 }
 
 impl OptState {
-    /// Sizes the tables (`ZSTD_reset_matchState`'s opt space).
+    /// Sizes the frequency tables (`ZSTD_reset_matchState`'s opt space).
+    ///
+    /// The position and match tables are left to [`Self::reserve_positions`]:
+    /// the reference carves them uninitialized from its workspace, and
+    /// filling all [`OPT_SIZE`] entries here dominated frames that never
+    /// reach the parser (empty input) or use a few of them (tiny input).
     pub(crate) fn allocate(&mut self) {
         self.lit_freq.resize(MAX_LIT as usize + 1, 0);
         self.lit_length_freq.resize(MAX_LL as usize + 1, 0);
         self.match_length_freq.resize(MAX_ML as usize + 1, 0);
         self.off_code_freq.resize(MAX_OFF as usize + 1, 0);
-        self.match_table.resize(OPT_SIZE, Match::default());
-        self.price_table.resize(OPT_SIZE, Optimal::default());
+    }
+
+    /// Grows the position and match tables to cover a block of
+    /// `block_len` bytes.
+    ///
+    /// The parser reads and writes positions up to two past the furthest
+    /// match end, which lies within the block and below [`OPT_NUM`]; the
+    /// match list holds one entry per distinct length plus an LDM
+    /// candidate. `block_len + 3` entries, capped at [`OPT_SIZE`], cover
+    /// both. A table only grows, so each entry is written once per engine.
+    fn reserve_positions(&mut self, block_len: usize) {
+        let len = OPT_SIZE.min(block_len + 3);
+        if self.price_table.len() < len {
+            self.price_table.resize(len, Optimal::default());
+            self.match_table.resize(len, Match::default());
+        }
     }
 
     /// Bytes held by the parser's position and match tables.
@@ -1098,12 +1116,9 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
     let mut next_to_update3 = ms.next_to_update;
     let ctx = Ctx::new(simd, block, cparams.min_match.clamp(3, 6));
 
+    ms.opt.reserve_positions((iend - istart) as usize);
     let mut opt = core::mem::take(&mut ms.opt.price_table);
     let mut matches = core::mem::take(&mut ms.opt.match_table);
-    if opt.len() < OPT_SIZE {
-        opt = vec![Optimal::default(); OPT_SIZE];
-        matches = vec![Match::default(); OPT_SIZE];
-    }
     let mut last_stretch = Optimal::default();
     // The reference copies the store's header; here the store is moved out
     // for the block and returned with its cursor as it was.
@@ -1513,6 +1528,7 @@ mod tests {
     use super::*;
     use crate::Backend;
     use crate::shared::format::BLOCK_SIZE_MAX;
+    use alloc::vec;
 
     /// The reference's `ZSTD_litLengthPrice`, from the frequencies.
     fn reference_lit_length_price(os: &OptState, lit_length: u32, opt_level: u32) -> i32 {
@@ -1666,6 +1682,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn position_tables_grow_with_the_block_up_to_the_parser_window() {
+        let mut os = OptState::default();
+        os.allocate();
+        assert_eq!(os.table_bytes(), 0);
+        os.reserve_positions(44);
+        assert_eq!((os.price_table.len(), os.match_table.len()), (47, 47));
+        // A smaller block keeps the larger tables.
+        os.reserve_positions(5);
+        assert_eq!(os.price_table.len(), 47);
+        os.reserve_positions(BLOCK_SIZE_MAX);
+        assert_eq!(
+            (os.price_table.len(), os.match_table.len()),
+            (OPT_SIZE, OPT_SIZE)
+        );
     }
 
     #[test]

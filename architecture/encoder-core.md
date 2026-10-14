@@ -308,9 +308,16 @@ The reference's branchless candidate test for windows below 512 KiB
 slower here. Both forms accept the same candidates.
 
 Match lengths (`mem::count_slices`, behind `Mem::count`/`count_with`)
-compare the first word inline with an XOR and a trailing-zero count and the
-rest a word at a time out of line, finishing with one word that ends at the
-limit.
+compare the first word inline with an XOR and a trailing-zero count. Out of
+line, `count_long` compares words up to 32 bytes, where most matches end,
+then skips equal 32-byte chunks (their XORs OR-ed in vector registers), then
+finds the difference a word at a time, finishing with one word that ends at
+the limit. Run-length inputs, whose matches span whole blocks, spend their
+time there.
+
+`block::is_rle` (`ZSTD_isRLE`) decides whether a compressed block is
+re-emitted as an RLE block; it compares 32-byte chunks against the first
+byte, which compiles to vector compares.
 
 ### Lazy finders and SIMD dispatch
 
@@ -466,9 +473,27 @@ buffers are always large enough) into `EncodeError::Internal`.
   vector match-length kernels (`opt_count`); fast/dfast and the entropy
   coders run in the backend's feature context without vector code.
   Histogram counting is scalar. Output is identical on every backend.
-- Levels -5..4 run within 5-30% of the reference; most of the remaining gap
-  is the finders' inner loops (register pressure and bounds tests carried
-  across loop iterations).
+- Levels -5 to 12 run at 0.75-0.98x the reference's speed on text and
+  random data ([benchmarks](../docs/benchmarks/encoders/README.md)). Cycle
+  profiles put the whole difference in the fast, dfast and row-based lazy
+  finders, which execute 17-52% more instructions than the reference's
+  (bounds tests on window and table reads, values spilled under register
+  pressure, per-candidate bookkeeping); entropy coding is at parity.
+  Measured against the unchanged binary on one pinned core (alternating
+  runs, about 1% noise), none of these gained on Alice at level 1: reads
+  clamped with `min` before each load (+5%, the select serializes each load
+  behind its clamp), the search loop out of line (+5%, it loses the AVX2
+  context and adds a call per match), the reference's branchless candidate
+  test via `select_unpredictable` (+0-4%), a constant table size for the
+  block's hash log (+2%), direct loads instead of the 9-byte window (±0),
+  `count_long` inlined (±1%), a sequence store with preallocated slots and
+  cursors (+2% instructions), and, at levels 5-9, per-block row
+  specialization, per-candidate prefetch and 64-byte-aligned rows (±0). As
+  an upper bound, a throwaway build with every read in the fast search loop
+  unchecked ran 2.5% faster on Alice and 6% on 1 MiB of text: bounds tests
+  are part of the gap but not most of it. The WSL2 host exposes no hardware
+  performance counters, so the remaining cycles could only be attributed by
+  sampling and by valgrind's simulations.
 - The row finder issues the reference's row prefetches (`ZSTD_row_prefetch`
   from `ZSTD_row_fillHashCache` and `ZSTD_row_nextCachedHash`, 8 positions
   ahead) through the `branches` crate's safe `prefetch_read_data`. On binary

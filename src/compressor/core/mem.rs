@@ -131,21 +131,53 @@ pub(crate) fn count_slices(a: &[u8], b: &[u8]) -> usize {
 /// [`count_slices`] past an equal first word, kept out of line: most
 /// candidates differ within it, and the word loop's setup would otherwise be
 /// hoisted into every caller's search loop.
+///
+/// Words are compared up to 32 bytes, where most matches end; longer runs
+/// are skipped 32 bytes at a time, OR-ing the chunks' differences in vector
+/// registers, and the word loop then finds the first difference in the
+/// chunk that has one.
 #[inline(never)]
 fn count_long(a: &[u8], b: &[u8]) -> usize {
-    let limit = a.len();
-    let (words_a, _) = a.as_chunks::<8>();
-    let (words_b, _) = b.as_chunks::<8>();
-    let mut matched = 0usize;
-    for (word_a, word_b) in words_a.iter().zip(words_b).skip(1) {
-        matched += 8;
-        let difference = u64::from_le_bytes(*word_a) ^ u64::from_le_bytes(*word_b);
-        if difference != 0 {
-            return matched + (difference.trailing_zeros() as usize >> 3);
+    let word = |at: usize| -> Option<u64> {
+        let x = a.get(at..at + 8)?;
+        let y = b.get(at..at + 8)?;
+        Some(u64::from_le_bytes(x.try_into().ok()?) ^ u64::from_le_bytes(y.try_into().ok()?))
+    };
+    let mut matched = 8usize;
+    while matched < 32 {
+        match word(matched) {
+            Some(0) => matched += 8,
+            Some(difference) => return matched + (difference.trailing_zeros() as usize >> 3),
+            None => return count_tail(a, b, matched),
         }
     }
-    matched += 8;
-    if matched == limit {
+    while let (Some(x), Some(y)) = (
+        a.get(matched..matched + 32)
+            .and_then(|x| <&[u8; 32]>::try_from(x).ok()),
+        b.get(matched..matched + 32)
+            .and_then(|y| <&[u8; 32]>::try_from(y).ok()),
+    ) {
+        let differs = x.iter().zip(y).fold(0u8, |acc, (p, q)| acc | (p ^ q));
+        if differs != 0 {
+            break;
+        }
+        matched += 32;
+    }
+    loop {
+        match word(matched) {
+            Some(0) => matched += 8,
+            Some(difference) => return matched + (difference.trailing_zeros() as usize >> 3),
+            None => return count_tail(a, b, matched),
+        }
+    }
+}
+
+/// The end of [`count_long`] once fewer than eight bytes remain after
+/// `matched` equal ones: one word that ends at the limit overlaps bytes
+/// already found equal, so its first difference is the tail's.
+fn count_tail(a: &[u8], b: &[u8], matched: usize) -> usize {
+    let limit = a.len();
+    if matched >= limit {
         return limit;
     }
     match (a.last_chunk::<8>(), b.last_chunk::<8>()) {
@@ -448,7 +480,7 @@ mod tests {
 
     #[test]
     fn word_counts_match_a_bytewise_scan_at_every_length_and_mismatch() {
-        let base: alloc::vec::Vec<u8> = (0..80u8).map(|i| i.wrapping_mul(37)).collect();
+        let base: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(37)).collect();
         for len in 0..=base.len() {
             let a = &base[..len];
             // Equal throughout, and a difference at every position.

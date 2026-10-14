@@ -1,0 +1,25 @@
+[package]
+name = "mzstd-comparison"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Cold end-to-end comparison of mzstd with the zstd 1.5.7 C library"
+
+# A separate workspace keeps the comparison's Criterion artifacts and lockfile
+# out of the library's own benchmarks and checks.
+[workspace]
+
+[dependencies]
+mzstd = { path = "../.." }
+zstd-ffi = { path = "../../zstd-ffi" }
+criterion = "=0.8.2"
+thiserror = "2"
+
+[[bench]]
+name = "encoders"
+harness = false
+
+[[bench]]
+name = "decoders"
+harness = false

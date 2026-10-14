@@ -28,6 +28,8 @@ graph TD
     CABI["mzstd-ffi: C ABI crate"] --> Root
     Fuzz["fuzz/afl (excluded package)"] -.-> Root
     Fuzz -.-> Ref
+    Cmp["benchmarks/comparison (excluded package): cold C vs mzstd reports"] -.-> Root
+    Cmp -.-> Ref
 ```
 
 Public modules own configuration, ownership, sessions and high-level errors.
@@ -51,6 +53,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns. |
 | [CI](ci.md) | Workflows and the checks they run. |
+| [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
 
 ## Known gaps
 
@@ -58,14 +61,14 @@ signatures. Each codec compiles on its own, with or without `std`.
   frames, no `targetCBlockSize`, no external sequence producers, and no
   legacy (v0.x) frames.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
-  and dispatched once per block. Against zstd 1.5.7 on `cargo bench`
-  (i7-13700KF, AVX2, one core), decoding runs at 0.93-1.18x the
-  reference's time ([decoder fast paths](decoder-performance.md)).
-  Compression runs at 0.88-1.07x on small inputs and levels 16-19, at
-  1.03-1.17x on 1 MiB of text, and at 1.1-1.3x on binary input and in
-  streaming. The remaining encoder gaps are instruction counts in the
-  match finders' inner loops ([Encoder core](encoder-core.md#known-gaps),
-  [optimal parser](optimal-parser.md)).
+  and dispatched once per block. In the cold comparison against zstd 1.5.7
+  ([benchmarks](../docs/benchmarks/README.md), i7-13700KF, AVX2, one core)
+  compression runs at a median 0.975x the reference's speed and
+  decompression at 1.033x. The remaining encoder gaps are the fast, dfast
+  and row-based lazy finders' inner loops on text and random data
+  (0.75-0.98x at levels -5 to 12; [encoder core](encoder-core.md#known-gaps));
+  the decoder's are the sequence loop and output zeroing on compressible
+  text (0.81-0.96x; [decoder fast paths](decoder-performance.md#known-gaps)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's. Each segment re-compresses its
   overlap instead of loading it as a prefix.

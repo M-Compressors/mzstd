@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- **Faster empty and tiny inputs at levels 11-22.** The optimal parser's
+  position and match tables are sized per block on first use
+  (`min(block + 3, ZSTD_OPT_SIZE)` entries) instead of being filled to
+  4099 entries at every frame start. Cold `Compressor::new(level 19)
+  .compress(b"")` went from 4.08 to 0.49 µs (zstd 1.5.7: 0.98 µs) and a
+  44-byte input at level 13 from 8.5 to 5.1 µs (zstd: 5.2 µs). Frames are
+  unchanged.
+- **Faster run-length input.** The RLE block test compares 32-byte chunks
+  instead of single bytes, and match lengths beyond 32 bytes are counted
+  32 bytes at a time. 1 MiB of one repeated byte compresses in 65 µs at
+  level 1 (was 332 µs; zstd 59 µs), 114 µs at level 3 (was 387 µs; zstd
+  111 µs) and 705 µs at level 9 (was 913 µs; zstd 715 µs). Frames are
+  unchanged.
+- **Faster `Decompressor::decompress` and `decompress_into`.** Raw and RLE
+  blocks are appended in one pass instead of zeroing room and copying over
+  it; frames that declare a content size are decoded into a vector cut at
+  their end, so neither slack nor spare capacity is kept (a declared frame's
+  vector now has exactly its length as capacity); capacity doubles, bounded
+  by the frame, and a declared size is reserved up front up to 32 bytes per
+  unread input byte. 1 MiB of random data decodes in 20.1 µs (was 43.8 µs;
+  zstd 1.5.7 20.6 µs), 64 KiB in 1.01 µs (was 1.82 µs; zstd 1.79 µs). Errors
+  are unchanged: a frame that overruns its declared size is re-decoded uncut
+  to report the same `ContentSizeMismatch`.
+- New cold comparison against zstd 1.5.7 in `benchmarks/comparison`
+  (its own workspace): mbrotli's eight datasets, including Alice in
+  Wonderland (`testdata/alice29.txt`), at levels -5, -1 and 1-22, with
+  byte-identity preflight, CSV export, and generated per-level pages,
+  per-dataset charts and run reports in `docs/benchmarks/`, laid out as
+  mbrotli's benchmark documentation. See `docs/benchmarking.md`.
+
 ## [v0.2.0](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.0) - 2026-10-13
 
 - **Breaking:** parallel streaming sessions are rebuilt around a window

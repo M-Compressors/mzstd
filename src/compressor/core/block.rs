@@ -239,8 +239,19 @@ pub(crate) fn entropy_compress(
 }
 
 /// Whether every byte of `src` is the same (`ZSTD_isRLE`).
+///
+/// Whole 32-byte chunks are compared at once: OR-ing each byte's difference
+/// from the first compiles to vector compares, where testing byte by byte
+/// costs several instructions per byte on the run-length inputs this sees.
 pub(crate) fn is_rle(src: &[u8]) -> bool {
-    src.iter().all(|&b| b == src[0])
+    let Some(&first) = src.first() else {
+        return true;
+    };
+    let (chunks, tail) = src.as_chunks::<32>();
+    tail.iter().all(|&byte| byte == first)
+        && chunks
+            .iter()
+            .all(|chunk| chunk.iter().fold(0, |acc, &byte| acc | (byte ^ first)) == 0)
 }
 
 /// Compresses one block body into `dst` (`ZSTD_compressBlock_internal`).
@@ -294,5 +305,14 @@ mod tests {
         assert!(is_rle(&[3]));
         assert!(is_rle(&[3; 100]));
         assert!(!is_rle(&[3, 3, 4]));
+        assert!(is_rle(&[]));
+        // A difference in a whole chunk, in the tail, and at either end.
+        let mut long = [7u8; 100];
+        assert!(is_rle(&long));
+        for at in [0, 1, 31, 32, 63, 64, 95, 96, 99] {
+            long[at] = 8;
+            assert!(!is_rle(&long), "{at}");
+            long[at] = 7;
+        }
     }
 }

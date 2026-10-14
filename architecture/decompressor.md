@@ -406,9 +406,10 @@ reference's, with these deliberate exceptions:
   reference; see [decoder fast paths](decoder-performance.md#known-gaps).
 - **Memory.** The streaming history can reach twice the window plus
   128 KiB, where the reference keeps about one window plus two blocks; a
-  ring buffer would close the gap. Allocation is still proportional to the
-  output actually regenerated, never to declared sizes.
+  ring buffer would close the gap. Allocation follows the output actually
+  regenerated: `decompress`/`decompress_into` reserve a declared size up
+  front only up to 32 bytes per unread input byte, and grow with the output
+  beyond that ([output paths](decoder-performance.md#output-paths)).
 - **No uninitialized-output APIs** (`*_to_uninit`, `process_uninit`) and
   no exact-size output contract, unlike mbrotli.
-- **No fuzz targets** yet under `fuzz/afl/` for the decoder.
 - **Legacy formats** (zstd v0.x) are not decoded.

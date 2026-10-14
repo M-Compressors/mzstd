@@ -35,3 +35,6 @@ fuzz/afl/target/
 # Seeds are materialised from the vendored zstd test data.
 fuzz/afl/seeds/
 .claude/worktrees/
+
+# Python bytecode from the benchmark report scripts.
+__pycache__/

@@ -189,16 +189,50 @@ flowchart LR
     ToSlice[decompress_to_slice] --> Direct{decode_to_slice: every frame declares a size that fits?}
     Direct -->|yes| Slice[SliceOutput: frame cut at its declared end]
     Direct -->|no, or any error| Session[incremental session over History]
-    Into[decompress / decompress_into] --> Vec[VecOutput: grow_zeroed per block]
+    Into[decompress / decompress_into] --> Cut[decode_all: VecOutput, declared frames cut at their end]
+    Cut -->|any error| Uncut[reset, rerun with VecOutput uncut: defines the error]
     Process[DecoderSession::process] --> History[History: prepare / commit]
 ```
 
-- `Stream::walk` is the one-shot frame grammar over an `Output`:
-  `VecOutput` grows the caller's vector with initialized slack per block
-  (`grow_zeroed`: a fresh buffer is zero-allocated, an existing one grows
-  in place), then truncates to the output; `SliceOutput` cuts the caller's
-  slice at each frame's declared end, so chunked copies never touch bytes
-  past the output and the rest of `dst` stays unchanged.
+`decompress` and `decompress_into` write through `VecOutput`, which owns
+three decisions per frame and block:
+
+```mermaid
+flowchart TD
+    Begin[begin_frame: content size, unread input] --> Declared{declared size?}
+    Declared -->|yes| Reserve["reserve min(declared end, filled + 32 x unread input)"]
+    Declared -->|no| Grow
+    Reserve --> Block
+    Grow[no reservation] --> Block
+    Block[next block] --> Kind{raw or RLE?}
+    Kind -->|yes| Place["place: extend_from_slice / resize with the byte, one pass"]
+    Kind -->|compressed| Slack["reserve: grow_output to filled + block_max + 32, cut at the declared end"]
+    Place --> Account[FrameDecoder::account_block: checksum, size checks]
+    Slack --> Decode[FrameDecoder::decode_block] --> Account
+```
+
+- `Stream::walk` is the one-shot frame grammar over an `Output`.
+  `SliceOutput` cuts the caller's slice at each frame's declared end, so
+  chunked copies never touch bytes past the output and the rest of `dst`
+  stays unchanged.
+- `VecOutput` cuts a declared frame's blocks at its end, like
+  `SliceOutput`, so no slack past the output is zeroed or kept. A frame that
+  overruns its declared size then fails with `OutputTooSmall` instead of the
+  reference's `ContentSizeMismatch`, so `decode_all` resets the stream and
+  reruns the input uncut on any error; the uncut pass defines every error and
+  leaves the vector as it was.
+- Capacity grows by doubling (`grow_output`/`reserve_output`), never past
+  twice the requested length. When the frame's last request is within that
+  factor, capacity jumps straight to it, so a declared frame ends with no
+  reallocation and no spare capacity. At a frame start, a declared size is
+  reserved only up to 32 output bytes per unread input byte
+  (`PLAUSIBLE_RATIO`): an allocation always needs input in proportion, and
+  a frame that claims more grows with its actual output.
+- Raw and RLE blocks are appended in one pass (`Output::place`):
+  `extend_from_slice` or `resize` with the run byte write straight into spare
+  capacity. Compressed blocks still need initialized room, which costs one
+  zeroing pass over the output; safe Rust cannot hand the decoder
+  uninitialized memory.
 - `decompress_to_slice` tries the direct path and, when a frame has no
   content size, does not fit, or anything fails, reruns the whole input
   through the incremental session, which defines the method's results and
@@ -242,8 +276,12 @@ which already matches the reference's 21 GB/s.
 
 ## Known gaps
 
-- Text at levels 1-3 decodes about 1.1x slower than the reference: the
-  sequence loop still executes more instructions per sequence.
+- Compressible text decodes at 0.81-0.96x the reference's speed through
+  `decompress` ([benchmarks](../docs/benchmarks/decoders/README.md)): the
+  sequence loop executes 1.10-1.22x the reference's instructions on Alice,
+  and compressed blocks need their output zeroed before decoding, about
+  12 µs per MiB that the reference, writing into uninitialized memory, does
+  not pay.
 - `decompress_to_slice` takes the incremental path, with its extra copies,
   for frames without a content size.
 - No prefetching variant for long offsets (`ZSTD_decompressSequencesLong`)

@@ -326,6 +326,69 @@ fn slices_and_vectors_report_their_outcome() {
     assert!(decoder.decompress(&[]).is_err());
 }
 
+/// A frame of one raw block with a two-byte content size (`declared`, at
+/// least 256) and a 1 KiB window, so the block may exceed the size.
+fn raw_frame_with_window(content: &[u8], declared: u16) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x40, 0x00];
+    frame.extend_from_slice(&(declared - 256).to_le_bytes());
+    let header = ((content.len() as u32) << 3) | 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(content);
+    frame
+}
+
+#[test]
+fn vectors_hold_exactly_the_output_of_frames_that_declare_it() {
+    let mut decoder = Decompressor::default();
+    for len in [
+        1,
+        1000,
+        128 << 10,
+        (128 << 10) + 1,
+        1 << 20,
+        (1 << 20) + 12_345,
+    ] {
+        let input = text(len, len as u64);
+        let frame = compress(&input, &params(3, false, true));
+        let output = decoder.decompress(&frame).expect("valid");
+        assert_eq!(output, input, "{len}");
+        assert_eq!(output.capacity(), len, "{len}");
+    }
+}
+
+#[test]
+fn vectors_report_frames_that_overrun_their_declared_size() {
+    let mut decoder = Decompressor::default();
+    let overrun = raw_frame_with_window(&[7; 300], 256);
+    assert!(matches!(
+        decoder.decompress(&overrun),
+        Err(DecodeError::ContentSizeMismatch {
+            declared: 256,
+            decoded: 300
+        })
+    ));
+    assert!(reference_decompress(&overrun, 1024).is_err());
+    // After a valid frame, the error is the same and the vector unchanged.
+    let mut input = raw_frame_with_window(&[1; 256], 256);
+    input.extend_from_slice(&overrun);
+    let mut output = b"kept".to_vec();
+    assert!(matches!(
+        decoder.decompress_into(&input, &mut output),
+        Err(DecodeError::ContentSizeMismatch {
+            declared: 256,
+            decoded: 300
+        })
+    ));
+    assert_eq!(output, b"kept");
+    // Declared sizes that fit decode as before.
+    assert_eq!(
+        decoder
+            .decompress(&raw_frame_with_window(&[2; 256], 256))
+            .expect("valid"),
+        [2; 256]
+    );
+}
+
 #[test]
 fn retention_policies_release_buffers_between_operations() {
     let input = text(200_000, 6);

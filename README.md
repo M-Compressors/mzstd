@@ -89,20 +89,48 @@ either for a whole input at once or for input that arrives in chunks. It require
 
 ## Performance
 
-Speed was not a goal of this first version: both codecs are scalar ports
-without SIMD. As a reference point, here is `cargo bench --bench compress`
-and `--bench decompress` on an Apple M5 Pro with rustc 1.99 (Criterion
-medians; both sides write and read identical frames):
+### Our benchmarks
 
-| Case | mzstd | zstd 1.5.7 |
-| --- | --- | --- |
-| compress text 1 MiB, level 1 | 398 MiB/s | 694 MiB/s |
-| compress text 1 MiB, level 3 | 418 MiB/s | 775 MiB/s |
-| compress text 1 MiB, level 9 | 54.5 MiB/s | 105 MiB/s |
-| compress text 1 MiB, level 19 | 3.8 MiB/s | 5.5 MiB/s |
-| compress binary 1 MiB, level 3 | 197 MiB/s | 350 MiB/s |
-| decompress text 4 MiB (level 3 frame) | 716 MiB/s | 2.19 GiB/s |
-| decompress binary 4 MiB (level 3 frame) | 270 MiB/s | 1.22 GiB/s |
+Compression is close to zstd 1.5.7 and writes byte-identical frames;
+decompression is generally slightly faster than zstd's, depending on the
+workload and level.
+
+<details>
+<summary>Compression benchmark results and methodology</summary>
+
+![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
+
+**Recorded 2026-10-13 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
+Each value is the median of per-dataset ratios across eight equally weighted datasets,
+including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
+frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
+median over all 192 dataset/level pairs is **0.975×**: faster than C on empty, tiny
+and run-length input, within 1–3% at levels 11–12 and 16–22, and 4–8% behind at
+levels -5 to 10, where text and random data take longer in the match finders.
+
+The benchmark includes compressor construction, allocation, compression, and disposal.
+Results apply to the [recorded revision and machine][bench-levels].
+
+[Per-dataset results and methodology][benchmarks] · [Raw measurements][bench-csv] · [Reproduce the benchmarks][benchmarking]
+
+</details>
+
+<details>
+<summary>Decompression benchmark results and methodology</summary>
+
+![Decompression speed relative to zstd 1.5.7 by source level][decoder-bench-chart]
+
+**Recorded 2026-10-13 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
+zstd C and mzstd decode identical C-written frames at source levels **-5 to 22**.
+All **384 cases** restore the original bytes. mzstd runs at **1.03–1.04×** C's speed at
+every source level (median **1.033×** over all 192 pairs): much faster on empty and
+tiny frames, faster on random and run-length data, and 0.81–0.96× on compressible
+text. Construction, allocation, decode and disposal are timed; C reads the output
+capacity from the frame header.
+
+[Per-level and dataset results][decoder-benchmarks] · [Raw measurements][decoder-bench-csv] · [Methodology and limits][decoder-bench-report]
+
+</details>
 
 ## Verification
 
@@ -151,3 +179,12 @@ conditions.
 [crate]: https://crates.io/crates/mzstd
 [api]: https://docs.rs/mzstd
 [ci]: https://github.com/M-Compressors/mzstd/actions/workflows/ci.yml
+[benchmarks]: ./docs/benchmarks/README.md
+[bench-levels]: ./docs/benchmarks/encoders/README.md
+[bench-csv]: ./docs/benchmarks/encoder-comparison.csv
+[bench-chart]: ./docs/benchmarks/encoders/charts/overview.svg
+[benchmarking]: ./docs/benchmarking.md
+[decoder-benchmarks]: ./docs/benchmarks/decoders/README.md
+[decoder-bench-csv]: ./docs/benchmarks/decoder-comparison.csv
+[decoder-bench-chart]: ./docs/benchmarks/decoders/charts/overview.svg
+[decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
