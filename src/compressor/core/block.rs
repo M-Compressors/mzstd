@@ -212,8 +212,14 @@ fn entropy_compress_internal(
     }
     let seq_head = op;
     op += 1;
-    let stats =
-        sequences::build_statistics(store, &prev.fse, &mut next.fse, &mut dst[op..], strategy)?;
+    let stats = sequences::build_statistics(
+        store,
+        &prev.fse,
+        &mut next.fse,
+        &mut dst[op..],
+        strategy,
+        backend,
+    )?;
     dst[seq_head] =
         ((stats.ll_type as u8) << 6) + ((stats.of_type as u8) << 4) + ((stats.ml_type as u8) << 2);
     op += stats.size;

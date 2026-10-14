@@ -28,6 +28,9 @@ pub(crate) const OPT_NUM: usize = 1 << 12;
 pub(crate) const OPT_SIZE: usize = OPT_NUM + 3;
 
 const LITFREQ_ADD: u32 = 2;
+/// Literal runs from this length on refresh the whole literal weight table
+/// ([`weights`]) rather than each literal's entry as it is counted.
+const BULK_WEIGHT_LITERALS: usize = 64;
 const MAX_PRICE: i32 = 1 << 30;
 const PREDEF_THRESHOLD: usize = 8;
 const BITCOST_ACCURACY: u32 = 8;
@@ -155,10 +158,11 @@ impl PriceTables {
 impl OptState {
     /// Sizes the frequency tables (`ZSTD_reset_matchState`'s opt space).
     ///
-    /// The position and match tables are left to [`Self::reserve_positions`]:
-    /// the reference carves them uninitialized from its workspace, and
-    /// filling all [`OPT_SIZE`] entries here dominated frames that never
-    /// reach the parser (empty input) or use a few of them (tiny input).
+    /// The position and match tables are left to [`Self::reserve_matches`]
+    /// and [`grow_positions`]: the reference carves them uninitialized
+    /// from its workspace, and filling all [`OPT_SIZE`] entries here
+    /// dominated frames that never reach the parser (empty input) or use a
+    /// few of them (tiny or incompressible input).
     pub(crate) fn allocate(&mut self) {
         self.lit_freq.resize(MAX_LIT as usize + 1, 0);
         self.lit_length_freq.resize(MAX_LL as usize + 1, 0);
@@ -166,18 +170,18 @@ impl OptState {
         self.off_code_freq.resize(MAX_OFF as usize + 1, 0);
     }
 
-    /// Grows the position and match tables to cover a block of
-    /// `block_len` bytes.
+    /// Grows the match table to hold every match one search can report in
+    /// a block of `block_len` bytes with `nb_compares` tree comparisons.
     ///
-    /// The parser reads and writes positions up to two past the furthest
-    /// match end, which lies within the block and below [`OPT_NUM`]; the
-    /// match list holds one entry per distinct length plus an LDM
-    /// candidate. `block_len + 3` entries, capped at [`OPT_SIZE`], cover
-    /// both. A table only grows, so each entry is written once per engine.
-    fn reserve_positions(&mut self, block_len: usize) {
-        let len = OPT_SIZE.min(block_len + 3);
-        if self.price_table.len() < len {
-            self.price_table.resize(len, Optimal::default());
+    /// A search reports matches of strictly increasing lengths: up to
+    /// three repeat offsets or one 3-byte match, one per tree comparison,
+    /// and one LDM candidate. Lengths lie within the block and the tree
+    /// walk stops past [`OPT_NUM`], so the list is also shorter than
+    /// `block_len + 3` and than [`OPT_SIZE`]. The table only grows, so each
+    /// entry is written once per engine.
+    fn reserve_matches(&mut self, block_len: usize, nb_compares: u32) {
+        let len = OPT_SIZE.min(block_len + 3).min(nb_compares as usize + 5);
+        if self.match_table.len() < len {
             self.match_table.resize(len, Match::default());
         }
     }
@@ -343,26 +347,33 @@ impl OptState {
             // A byte indexes the 256 frequencies without a bounds check, and
             // the level's weight form is chosen once for the run.
             let level = self.tables.opt_level;
-            let weights = &mut self.tables.literal;
+            let literal_weights = &mut self.tables.literal;
             if let Some(freqs) = self.lit_freq.first_chunk_mut::<256>() {
-                if level != 0 {
+                if literals.len() >= BULK_WEIGHT_LITERALS {
+                    // A long run touches most of the table: count it as
+                    // the reference does, then take every weight at once.
+                    for &lit in literals {
+                        freqs[usize::from(lit)] += LITFREQ_ADD;
+                    }
+                    weights(freqs, level, literal_weights);
+                } else if level != 0 {
                     for &lit in literals {
                         let freq = &mut freqs[usize::from(lit)];
                         *freq += LITFREQ_ADD;
-                        weights[usize::from(lit)] = frac_weight(*freq);
+                        literal_weights[usize::from(lit)] = frac_weight(*freq);
                     }
                 } else {
                     for &lit in literals {
                         let freq = &mut freqs[usize::from(lit)];
                         *freq += LITFREQ_ADD;
-                        weights[usize::from(lit)] = bit_weight(*freq);
+                        literal_weights[usize::from(lit)] = bit_weight(*freq);
                     }
                 }
             } else {
                 for &lit in literals {
                     let freq = &mut self.lit_freq[usize::from(lit)];
                     *freq += LITFREQ_ADD;
-                    weights[usize::from(lit)] = weight(*freq, level);
+                    literal_weights[usize::from(lit)] = weight(*freq, level);
                 }
             }
             self.lit_sum += literals.len() as u32 * LITFREQ_ADD;
@@ -381,6 +392,27 @@ impl OptState {
         self.tables.set_match_length(ml, self.match_length_freq[ml]);
         self.match_length_sum += 1;
     }
+}
+
+/// Grows the parser's position table to `end` positions and returns it.
+///
+/// The parser reads and writes positions up to two past the furthest
+/// match end it prices, which lies below [`OPT_NUM`] and before the end
+/// of the block. It grows the table when it first finds a match short of
+/// that, instead of covering [`OPT_SIZE`] positions up front, which an
+/// incompressible block never reaches. A table only grows, so each entry
+/// is written once per engine.
+///
+/// The parser indexes the returned slice, and calls this only when that
+/// slice is too short: the table itself is touched only when it grows, so
+/// the slice stays in registers across the parser's calls.
+#[cold]
+#[inline(never)]
+fn grow_positions(table: &mut Vec<Optimal>, end: usize) -> &mut [Optimal] {
+    if table.len() < end {
+        table.resize(end, Optimal::default());
+    }
+    table
 }
 
 /// `ZSTD_bitWeight`.
@@ -490,7 +522,9 @@ impl<'a, S: Simd> Ctx<'a, S> {
         Self {
             simd,
             window,
-            prefix: prefix.slice(prefix.start(), prefix.end()),
+            // Cut at the block's end, so that the end is the slice's: a
+            // run then needs no limit of its own.
+            prefix: prefix.slice(prefix.start(), block.end),
             ext: ext.slice(ext.start(), ext.end()),
             dict_limit: prefix.start(),
             iend: block.end,
@@ -548,6 +582,36 @@ impl<'a, S: Simd> Ctx<'a, S> {
         ((u64::from_le_bytes(word) << shift).wrapping_mul(prime) >> (64 - hash_log)) as usize
     }
 
+    /// Hints that the hash cells of `ip + 4` will be read soon: the parser
+    /// and the tree update mostly go position after position, and a search
+    /// is much shorter than a load from memory, so the hint runs a few
+    /// searches ahead. With `HASH3` and `MLS` 3 the 3-byte table's cell is
+    /// hinted too. A position whose bytes do not lie in the block is
+    /// skipped.
+    #[inline(always)]
+    fn prefetch_ahead<const MLS: u32, const HASH3: bool>(&self, finder: &Finder<'_>, ip: u32) {
+        let ahead = ip + 4;
+        if MLS <= 4 {
+            // The 4 bytes at `ip + 4` end the word at `ip`, which the
+            // search reads too.
+            let at = self.offset(ip);
+            let Some(bytes) = self.prefix.get(at..at + 8) else {
+                return;
+            };
+            let mut word = [0u8; 8];
+            word.copy_from_slice(bytes);
+            let word = (u64::from_le_bytes(word) >> 32) as u32;
+            let h = word.wrapping_mul(PRIME_4_BYTES) >> (32 - finder.hash_log);
+            prefetch_l1(finder.hash_table, h as usize);
+            if HASH3 && MLS == 3 {
+                let h3 = mem::hash3(word, finder.hash_log3, 0);
+                prefetch_l1(finder.hash_table3, h3);
+            }
+        } else if self.offset(ahead) + 8 <= self.prefix.len() {
+            prefetch_l1(finder.hash_table, self.hash::<MLS>(ahead, finder.hash_log));
+        }
+    }
+
     /// `ZSTD_count(ip, match, iend)` inside the prefix.
     #[inline(always)]
     fn count(&self, ip: u32, candidate: u32) -> usize {
@@ -556,7 +620,7 @@ impl<'a, S: Simd> Ctx<'a, S> {
             self.prefix,
             self.offset(ip),
             self.offset(candidate),
-            self.offset(self.iend),
+            self.prefix.len(),
         )
     }
 
@@ -570,14 +634,14 @@ impl<'a, S: Simd> Ctx<'a, S> {
             self.offset(ip),
             self.ext,
             self.ext_offset(candidate),
-            self.offset(self.iend),
+            self.prefix.len(),
         )
     }
 
     /// The bytes from prefix index `curr` to the end of the block.
     #[inline(always)]
     fn current(&self, curr: u32) -> &'a [u8] {
-        &self.prefix[self.offset(curr)..self.offset(self.iend)]
+        &self.prefix[self.offset(curr)..]
     }
 
     /// The tree walk's comparison: `known` bytes are already equal; returns
@@ -617,6 +681,14 @@ impl<'a, S: Simd> Ctx<'a, S> {
     }
 }
 
+/// Hints that `table[index]` will be read soon (`PREFETCH_L1`). The pointer
+/// is only handed to the prefetch instruction, never dereferenced, so a
+/// hint past the table is harmless; targets without one ignore it.
+#[inline(always)]
+fn prefetch_l1<T>(table: &[T], index: usize) {
+    branches::prefetch_read_data::<T, 0>(table.as_ptr().wrapping_add(index));
+}
+
 /// `ZSTD_readMINMATCH` comparison of `length` (3 or 4) bytes.
 #[inline(always)]
 fn min_match_equal(x: u32, y: u32, length: u32) -> bool {
@@ -627,53 +699,113 @@ fn min_match_equal(x: u32, y: u32, length: u32) -> bool {
     }
 }
 
-/// `ZSTD_insertAndFindFirstIndexHash3`.
+/// The binary-tree match finder's tables and its parameters for one block.
 ///
-/// The table holds exactly `1 << hashLog3` entries and every hash is below
-/// that, so indexing a slice cut to that length through the mask changes
-/// nothing but drops the bounds checks from the insertion loop.
+/// The reference reads `ms->cParams` and the window on every search; here
+/// whatever is fixed for the block is derived once, so a search loads it
+/// rather than recomputing it from the parameters.
+struct Finder<'t> {
+    hash_table: &'t mut [u32],
+    /// The tree: two cells per position, cut to its `2 << btLog` cells.
+    chain_table: &'t mut [u32],
+    hash_table3: &'t mut [u32],
+    /// `ms->nextToUpdate`, stored back after the block.
+    next_to_update: u32,
+    /// Index from which the 3-byte table is brought up to date.
+    next_to_update3: u32,
+    hash_log: u32,
+    hash_log3: u32,
+    /// `(1 << btLog) - 1`.
+    bt_mask: u32,
+    /// `1 << searchLog`, at least one.
+    nb_compares: u32,
+    /// `MIN(targetLength, ZSTD_OPT_NUM - 1)`.
+    sufficient_len: u32,
+    /// The window's reach `1 << windowLog`; with a loaded dictionary every
+    /// index from `low_limit` on stays valid, which no distance exceeds.
+    max_distance: u32,
+    low_limit: u32,
+}
+
+impl<'t> Finder<'t> {
+    /// The finder over `ms`'s tables for a block whose updates resume at
+    /// `ms.next_to_update`, and the pricing state, which the parser keeps
+    /// using beside it.
+    fn split(ms: &'t mut MatchState) -> (Self, &'t mut OptState) {
+        let cparams = ms.cparams;
+        let bt_mask = (1u32 << (cparams.chain_log - 1)) - 1;
+        let finder = Self {
+            hash_table: &mut ms.hash_table,
+            chain_table: &mut ms.chain_table[..2 * (bt_mask as usize + 1)],
+            hash_table3: &mut ms.hash_table3,
+            next_to_update: ms.next_to_update,
+            next_to_update3: ms.next_to_update,
+            hash_log: cparams.hash_log,
+            hash_log3: ms.hash_log3,
+            bt_mask,
+            nb_compares: 1u32 << cparams.search_log,
+            sufficient_len: cparams.target_length.min(OPT_NUM as u32 - 1),
+            max_distance: if ms.loaded_dict_end != 0 {
+                u32::MAX
+            } else {
+                1u32 << cparams.window_log
+            },
+            low_limit: ms.window.low_limit,
+        };
+        (finder, &mut ms.opt)
+    }
+
+    /// `ZSTD_getLowestMatchIndex`.
+    #[inline(always)]
+    const fn lowest_match_index(&self, curr: u32) -> u32 {
+        if curr.wrapping_sub(self.low_limit) > self.max_distance {
+            curr - self.max_distance
+        } else {
+            self.low_limit
+        }
+    }
+}
+
+/// `ZSTD_insertAndFindFirstIndexHash3`.
 #[inline(always)]
 fn insert_and_find_first_index_hash3<S: Simd>(
-    ms: &mut MatchState,
+    finder: &mut Finder<'_>,
     ctx: &Ctx<'_, S>,
-    next_to_update3: &mut u32,
     ip: u32,
 ) -> u32 {
-    let hash_log3 = ms.hash_log3;
-    let mask = (1usize << hash_log3) - 1;
-    let table = &mut ms.hash_table3[..=mask];
-    let hash3 = |index: u32| mem::hash3(ctx.read32(index), hash_log3, 0) & mask;
-    let mut idx = *next_to_update3;
-    let target = ip;
-    while idx < target {
+    let hash_log3 = finder.hash_log3;
+    let table = &mut *finder.hash_table3;
+    let hash3 = |index: u32| mem::hash3(ctx.read32(index), hash_log3, 0);
+    let mut idx = finder.next_to_update3;
+    while idx < ip {
         table[hash3(idx)] = idx;
         idx += 1;
     }
-    *next_to_update3 = target;
+    finder.next_to_update3 = ip;
     table[hash3(ip)]
 }
 
 /// `ZSTD_insertBt1`: returns how many positions it accounted for.
 #[inline(always)]
 fn insert_bt1<S: Simd, const EXT: bool, const MLS: u32>(
-    ms: &mut MatchState,
+    finder: &mut Finder<'_>,
     ctx: &Ctx<'_, S>,
     curr: u32,
     target: u32,
 ) -> u32 {
-    let cparams = ms.cparams;
-    let h = ctx.hash::<MLS>(curr, cparams.hash_log);
-    let match_index = ms.hash_table[h];
-    ms.hash_table[h] = curr;
+    let h = ctx.hash::<MLS>(curr, finder.hash_log);
+    let match_index = finder.hash_table[h];
+    finder.hash_table[h] = curr;
+    ctx.prefetch_ahead::<MLS, false>(finder, curr);
     let walk = TreeWalk {
         curr,
         match_index,
-        window_low: ms.lowest_match_index(target, cparams.window_log),
-        nb_compares: 1u32 << cparams.search_log,
+        window_low: finder.lowest_match_index(target),
+        nb_compares: finder.nb_compares,
         best_length: 8,
     };
     let (best_length, match_end_idx) =
-        walk.run::<S, EXT>(ctx, &mut ms.chain_table, cparams.chain_log, |_, _| false);
+        walk.run::<S, EXT>(ctx, finder.chain_table, finder.bt_mask, |_, _| false);
     let positions = if best_length > 384 {
         192.min((best_length - 384) as u32)
     } else {
@@ -703,14 +835,15 @@ impl TreeWalk {
     /// Returns the longest length and the farthest match end
     /// (`matchEndIdx`).
     ///
-    /// The reference parks a finished side on a dummy cell; here a side
-    /// whose walk ended below `bt_low` is simply not cleared at the end.
+    /// `bt` holds the tree's `2 * (bt_mask + 1)` cells. The reference parks
+    /// a finished side on a dummy cell; here a side whose walk ended below
+    /// `bt_low` is simply not cleared at the end.
     #[inline(always)]
     fn run<S: Simd, const EXT: bool>(
         self,
         ctx: &Ctx<'_, S>,
-        chain_table: &mut [u32],
-        chain_log: u32,
+        bt: &mut [u32],
+        bt_mask: u32,
         mut on_longer: impl FnMut(u32, usize) -> bool,
     ) -> (usize, u32) {
         let Self {
@@ -720,24 +853,27 @@ impl TreeWalk {
             mut nb_compares,
             mut best_length,
         } = self;
-        let bt_mask = (1u32 << (chain_log - 1)) - 1;
+        // The cells the next smaller / larger candidate is linked from.
+        let mut smaller = 2 * (curr & bt_mask) as usize;
+        let mut match_end_idx = curr + 8 + 1;
+        // `nb_compares` is at least one, so only the window can rule out
+        // the first candidate: then `curr` becomes a leaf straight away,
+        // which incompressible input does at nearly every position.
+        if match_index < window_low {
+            bt[smaller..smaller + 2].fill(0);
+            return (best_length, match_end_idx);
+        }
         // Cut to the tree's size and indexed through `cells`: every cell
         // index is below that size already, so the mask changes nothing
         // but lets the compiler drop the bounds checks.
         let cells = (2 * bt_mask + 1) as usize;
-        let bt = &mut chain_table[..=cells];
+        let bt = &mut bt[..=cells];
+        let mut larger = smaller + 1;
         let bt_low = curr.saturating_sub(bt_mask);
         let current = ctx.current(curr);
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
-        // The cells the next smaller / larger candidate is linked from.
-        let mut smaller = 2 * (curr & bt_mask) as usize;
-        let mut larger = smaller + 1;
-        let mut match_end_idx = curr + 8 + 1;
         let (clear_smaller, clear_larger) = loop {
-            if nb_compares == 0 || match_index < window_low {
-                break (true, true);
-            }
             let (match_length, match_smaller) = ctx.extend::<EXT>(
                 current,
                 curr,
@@ -757,7 +893,9 @@ impl TreeWalk {
                 // The run reaches the end of the block: no way to order it.
                 break (true, true);
             }
-            let next = 2 * (match_index & bt_mask) as usize;
+            // `cells` is `2 * bt_mask + 1` and an even number has no low
+            // bit: this is `2 * (match_index & bt_mask)`.
+            let next = ((match_index as usize) << 1) & cells;
             if match_smaller {
                 bt[smaller & cells] = match_index;
                 common_smaller = match_length;
@@ -776,6 +914,9 @@ impl TreeWalk {
                 match_index = bt[next & cells];
             }
             nb_compares -= 1;
+            if nb_compares == 0 || match_index < window_low {
+                break (true, true);
+            }
         };
         if clear_smaller {
             bt[smaller & cells] = 0;
@@ -800,10 +941,9 @@ struct MatchQuery<'r> {
 /// `ZSTD_insertBtAndGetAllMatches`.
 #[inline(always)]
 fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
-    ms: &mut MatchState,
+    finder: &mut Finder<'_>,
     ctx: &Ctx<'_, S>,
     matches: &mut [Match],
-    next_to_update3: &mut u32,
     query: MatchQuery<'_>,
 ) -> u32 {
     let MatchQuery {
@@ -812,15 +952,17 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
         ll0,
         length_to_beat,
     } = query;
-    let cparams = ms.cparams;
-    let sufficient_len = cparams.target_length.min(OPT_NUM as u32 - 1);
+    let sufficient_len = finder.sufficient_len;
     let curr = ip;
     let mls = MLS;
     let min_match = if mls == 3 { 3 } else { 4 };
-    let h = ctx.hash::<MLS>(ip, cparams.hash_log);
-    let match_index = ms.hash_table[h];
+    let h = ctx.hash::<MLS>(ip, finder.hash_log);
+    let match_index = finder.hash_table[h];
+    // Large tables miss the caches: a later search's cell loads while this
+    // one runs.
+    ctx.prefetch_ahead::<MLS, true>(finder, ip);
     let dict_limit = ctx.dict_limit;
-    let window_low = ms.lowest_match_index(curr, cparams.window_log);
+    let window_low = finder.lowest_match_index(curr);
     let match_low = if window_low != 0 { window_low } else { 1 };
     let mut mnum = 0usize;
     let mut best_length = (length_to_beat - 1) as usize;
@@ -828,7 +970,16 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
 
     // Repeat offsets.
     {
-        let ip_word = ctx.read32(ip);
+        // Every repeat candidate in the prefix lies before `ip`: its word
+        // lies in the bytes up to `ip`'s, so one length test covers all.
+        let ip_off = curr - dict_limit;
+        let head = &ctx.prefix[..ip_off as usize + 4];
+        let word_at = |at: u32| {
+            let mut word = [0u8; 4];
+            word.copy_from_slice(&head[at as usize..at as usize + 4]);
+            u32::from_le_bytes(word)
+        };
+        let ip_word = word_at(ip_off);
         let ll0 = u32::from(ll0);
         let last_r = REP_NUM as u32 + ll0;
         for rep_code in ll0..last_r {
@@ -839,9 +990,14 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
             };
             let rep_index = curr.wrapping_sub(rep_offset);
             let mut rep_len = 0u32;
-            if rep_offset.wrapping_sub(1) < curr - dict_limit {
-                if rep_index >= window_low
-                    && min_match_equal(ip_word, ctx.read32(ip - rep_offset), min_match)
+            // `rep_offset - 1 < curr - dict_limit`, spelled so that the
+            // candidate's offset is seen to stay at or before `ip_off`.
+            if rep_offset != 0 && rep_offset <= ip_off {
+                // The candidate lies in the prefix, so its word reads before
+                // the window test, as the reference's `&` lets it: most
+                // positions settle on the word alone.
+                if min_match_equal(ip_word, word_at(ip_off - rep_offset), min_match)
+                    && rep_index >= window_low
                 {
                     rep_len =
                         ctx.count(ip + min_match, ip + min_match - rep_offset) as u32 + min_match;
@@ -870,7 +1026,7 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
 
     // HC3 match finder.
     if mls == 3 && best_length < mls as usize {
-        let match_index3 = insert_and_find_first_index_hash3(ms, ctx, next_to_update3, ip);
+        let match_index3 = insert_and_find_first_index_hash3(finder, ctx, ip);
         if match_index3 >= match_low && curr - match_index3 < (1 << 18) {
             let mlen = if !EXT || match_index3 >= dict_limit {
                 ctx.count(ip, match_index3)
@@ -885,25 +1041,25 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
                 };
                 mnum = 1;
                 if mlen > sufficient_len as usize || ip as usize + mlen == i_limit as usize {
-                    ms.next_to_update = curr + 1;
+                    finder.next_to_update = curr + 1;
                     return 1;
                 }
             }
         }
     }
 
-    ms.hash_table[h] = curr;
+    finder.hash_table[h] = curr;
     let walk = TreeWalk {
         curr,
         match_index,
         window_low: match_low,
-        nb_compares: 1u32 << cparams.search_log,
+        nb_compares: finder.nb_compares,
         best_length,
     };
     let (_, match_end_idx) = walk.run::<S, EXT>(
         ctx,
-        &mut ms.chain_table,
-        cparams.chain_log,
+        finder.chain_table,
+        finder.bt_mask,
         |match_index, match_length| {
             matches[mnum] = Match {
                 off: offset_to_offbase(curr - match_index),
@@ -914,7 +1070,7 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
             match_length > OPT_NUM
         },
     );
-    ms.next_to_update = match_end_idx - 8;
+    finder.next_to_update = match_end_idx - 8;
     mnum as u32
 }
 
@@ -928,24 +1084,37 @@ fn insert_bt_and_get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
 #[inline(always)]
 fn get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
     simd: S,
-    ms: &mut MatchState,
+    finder: &mut Finder<'_>,
     ctx: &Ctx<'_, S>,
     matches: &mut [Match],
-    next_to_update3: &mut u32,
     query: MatchQuery<'_>,
 ) -> u32 {
     let _ = simd;
-    if query.ip < ms.next_to_update {
+    if query.ip < finder.next_to_update {
         return 0;
     }
-    // ZSTD_updateTree_internal.
-    let target = query.ip;
-    let mut idx = ms.next_to_update;
-    while idx < target {
-        idx += insert_bt1::<S, EXT, MLS>(ms, ctx, idx, target);
+    if finder.next_to_update < query.ip {
+        update_tree::<S, EXT, MLS>(finder, ctx, query.ip);
     }
-    ms.next_to_update = target;
-    insert_bt_and_get_all_matches::<S, EXT, MLS>(ms, ctx, matches, next_to_update3, query)
+    finder.next_to_update = query.ip;
+    insert_bt_and_get_all_matches::<S, EXT, MLS>(finder, ctx, matches, query)
+}
+
+/// `ZSTD_updateTree_internal`: inserts the positions a long match skipped.
+///
+/// Out of line, so that its walk does not crowd the search's registers;
+/// it is plain scalar code, and the scan of a long run calls into the
+/// backend's feature context as the search's does.
+#[inline(never)]
+fn update_tree<S: Simd, const EXT: bool, const MLS: u32>(
+    finder: &mut Finder<'_>,
+    ctx: &Ctx<'_, S>,
+    target: u32,
+) {
+    let mut idx = finder.next_to_update;
+    while idx < target {
+        idx += insert_bt1::<S, EXT, MLS>(finder, ctx, idx, target);
+    }
 }
 
 /// [`get_all_matches`] for the block's minimum match length, the
@@ -954,17 +1123,16 @@ fn get_all_matches<S: Simd, const EXT: bool, const MLS: u32>(
 #[inline(always)]
 fn find_matches<S: Simd, const EXT: bool>(
     simd: S,
-    ms: &mut MatchState,
+    finder: &mut Finder<'_>,
     ctx: &Ctx<'_, S>,
     matches: &mut [Match],
-    next_to_update3: &mut u32,
     query: MatchQuery<'_>,
 ) -> u32 {
     match ctx.mls {
-        3 => get_all_matches::<S, EXT, 3>(simd, ms, ctx, matches, next_to_update3, query),
-        4 => get_all_matches::<S, EXT, 4>(simd, ms, ctx, matches, next_to_update3, query),
-        5 => get_all_matches::<S, EXT, 5>(simd, ms, ctx, matches, next_to_update3, query),
-        _ => get_all_matches::<S, EXT, 6>(simd, ms, ctx, matches, next_to_update3, query),
+        3 => get_all_matches::<S, EXT, 3>(simd, finder, ctx, matches, query),
+        4 => get_all_matches::<S, EXT, 4>(simd, finder, ctx, matches, query),
+        5 => get_all_matches::<S, EXT, 5>(simd, finder, ctx, matches, query),
+        _ => get_all_matches::<S, EXT, 6>(simd, finder, ctx, matches, query),
     }
 }
 
@@ -1113,11 +1281,15 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
     let cparams = ms.cparams;
     let sufficient_len = cparams.target_length.min(OPT_NUM as u32 - 1);
     let min_match = if cparams.min_match == 3 { 3 } else { 4 };
-    let mut next_to_update3 = ms.next_to_update;
     let ctx = Ctx::new(simd, block, cparams.min_match.clamp(3, 6));
 
-    ms.opt.reserve_positions((iend - istart) as usize);
-    let mut opt = core::mem::take(&mut ms.opt.price_table);
+    ms.opt
+        .reserve_matches((iend - istart) as usize, 1u32 << cparams.search_log);
+    let mut opt_table = core::mem::take(&mut ms.opt.price_table);
+    let mut opt: &mut [Optimal] = &mut opt_table;
+    // Every match the parser prices ends inside the block, and below
+    // `OPT_NUM` positions from where the parse started.
+    let reach = OPT_SIZE.min((iend - istart) as usize + 3);
     let mut matches = core::mem::take(&mut ms.opt.match_table);
     let mut last_stretch = Optimal::default();
     // The reference copies the store's header; here the store is moved out
@@ -1138,6 +1310,7 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
 
     ms.opt.rescale_freqs(prefix.slice(istart, iend), opt_level);
     ip += u32::from(ip == prefix_start);
+    let (mut finder, stats) = Finder::split(ms);
 
     while i64::from(ip) < ilimit {
         let mut cur: u32;
@@ -1148,10 +1321,9 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
         let ll0 = litlen == 0;
         let mut nb_matches = find_matches::<S, EXT>(
             simd,
-            ms,
+            &mut finder,
             &ctx,
             &mut matches,
-            &mut next_to_update3,
             MatchQuery {
                 ip,
                 rep,
@@ -1171,14 +1343,17 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
             continue;
         }
 
-        let os = &ms.opt;
+        if opt.len() < reach {
+            opt = grow_positions(&mut opt_table, reach);
+        }
+        let max_ml = matches[nb_matches as usize - 1].len;
+        let max_off_base = matches[nb_matches as usize - 1].off;
+
+        let os = &*stats;
         opt[0].mlen = 0;
         opt[0].litlen = litlen;
         opt[0].price = os.lit_length_price(litlen);
         opt[0].rep = *rep;
-
-        let max_ml = matches[nb_matches as usize - 1].len;
-        let max_off_base = matches[nb_matches as usize - 1].off;
         let shortest_path_ready;
         if max_ml > sufficient_len {
             last_stretch.litlen = 0;
@@ -1223,7 +1398,7 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
             while cur <= last_pos {
                 let inr = ip + cur;
                 {
-                    let os = &ms.opt;
+                    let os = &*stats;
                     let ll_price = |l: u32| os.lit_length_price(l);
                     let ll_inc_price = |l: u32| ll_price(l) - ll_price(l - 1);
                     let litlen = opt[cur as usize - 1].litlen + 1;
@@ -1291,14 +1466,13 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
 
                 let ll0 = opt[cur as usize].litlen == 0;
                 let previous_price = opt[cur as usize].price;
-                let base_price = previous_price + ms.opt.lit_length_price(0);
+                let base_price = previous_price + stats.lit_length_price(0);
                 let cur_rep = opt[cur as usize].rep;
                 let mut nb_matches = find_matches::<S, EXT>(
                     simd,
-                    ms,
+                    &mut finder,
                     &ctx,
                     &mut matches,
-                    &mut next_to_update3,
                     MatchQuery {
                         ip: inr,
                         rep: &cur_rep,
@@ -1330,7 +1504,7 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
                     break;
                 }
 
-                let os = &ms.opt;
+                let os = &*stats;
                 for match_nb in 0..nb_matches as usize {
                     let offset = matches[match_nb].off;
                     let last_ml = matches[match_nb].len;
@@ -1420,15 +1594,16 @@ fn opt_generic<S: Simd, const OPT_LEVEL: u32, const EXT: bool>(
                 continue;
             }
             let literals = prefix.slice(anchor, anchor + llen);
-            ms.opt.update_stats(literals, off_base, mlen);
+            stats.update_stats(literals, off_base, mlen);
             seq_store.store_seq(literals, off_base, mlen as usize);
             anchor += advance;
             ip = anchor;
         }
-        ms.opt.set_base_prices(opt_level);
+        stats.set_base_prices(opt_level);
     }
 
-    ms.opt.price_table = opt;
+    ms.next_to_update = finder.next_to_update;
+    ms.opt.price_table = opt_table;
     ms.opt.match_table = matches;
     if let Some((pos, pos_in_sequence)) = lent_cursor {
         let mut store = opt_ldm.seq_store;
@@ -1643,10 +1818,83 @@ mod tests {
                     os.set_base_prices(opt_level);
                 }
                 assert_prices_match(&os, opt_level);
+                // Runs long enough to take every weight at once, around
+                // the threshold, then short ones again.
+                for (round, len) in [64usize, 63, 200, 1000, 65, 3].into_iter().enumerate() {
+                    let literals = &src[round * 7..round * 7 + len];
+                    os.update_stats(literals, 4 + round as u32, 3 + len as u32);
+                    os.set_base_prices(opt_level);
+                    assert_prices_match(&os, opt_level);
+                }
                 os.rescale_freqs(&src, opt_level);
                 assert_prices_match(&os, opt_level);
             }
         }
+    }
+
+    #[test]
+    fn finder_bounds_match_the_match_state() {
+        use super::super::params::{ParamSwitch as Switch, level_cparams};
+        for (level, loaded_dict_end) in [(16, 0), (19, 0), (22, 0), (19, 7)] {
+            let mut ms = MatchState::new(level_cparams(level, 1 << 20), Switch::Disable);
+            ms.window.low_limit = 5;
+            ms.window.dict_limit = 9;
+            ms.next_to_update = 40;
+            ms.loaded_dict_end = loaded_dict_end;
+            let cparams = ms.cparams;
+            let currs = [
+                5u32,
+                9,
+                100,
+                1 << 20,
+                (1 << 20) + 6,
+                (1 << 21) + 3,
+                u32::MAX - 9,
+            ];
+            let expected = currs.map(|curr| ms.lowest_match_index(curr, cparams.window_log));
+            let (finder, _) = Finder::split(&mut ms);
+            assert_eq!(currs.map(|curr| finder.lowest_match_index(curr)), expected);
+            assert_eq!(finder.chain_table.len(), 1 << cparams.chain_log);
+            assert_eq!(finder.bt_mask, (1 << (cparams.chain_log - 1)) - 1);
+            assert_eq!(finder.nb_compares, 1 << cparams.search_log);
+            assert_eq!(
+                finder.sufficient_len,
+                cparams.target_length.min(OPT_NUM as u32 - 1)
+            );
+            assert_eq!((finder.next_to_update, finder.next_to_update3), (40, 40));
+        }
+    }
+
+    #[test]
+    fn prefetching_ahead_skips_positions_past_the_block() {
+        use super::super::params::{ParamSwitch as Switch, level_cparams};
+        let bytes = sample(64, 3);
+        let mut ms = MatchState::new(level_cparams(19, 64), Switch::Disable);
+        let (finder, _) = Finder::split(&mut ms);
+        for backend in Backend::available() {
+            let block = BlockInput {
+                window: mem::Window {
+                    prefix: mem::Mem::new(&bytes, 100),
+                    ext: mem::Mem::new(&[], 100),
+                },
+                start: 100,
+                end: 164,
+                backend,
+            };
+            dispatch!(backend.0, simd => {
+                let ctx = Ctx::new(simd, &block, 3);
+                // Hints only: every position up to the block's end, words
+                // whole or cut, leaves the tables as they were.
+                for ip in 100..164 {
+                    ctx.prefetch_ahead::<3, true>(&finder, ip);
+                    ctx.prefetch_ahead::<4, false>(&finder, ip);
+                    ctx.prefetch_ahead::<5, false>(&finder, ip);
+                    ctx.prefetch_ahead::<6, false>(&finder, ip);
+                }
+            });
+        }
+        assert!(finder.hash_table.iter().all(|&cell| cell == 0));
+        assert!(finder.hash_table3.iter().all(|&cell| cell == 0));
     }
 
     #[test]
@@ -1689,16 +1937,25 @@ mod tests {
         let mut os = OptState::default();
         os.allocate();
         assert_eq!(os.table_bytes(), 0);
-        os.reserve_positions(44);
-        assert_eq!((os.price_table.len(), os.match_table.len()), (47, 47));
-        // A smaller block keeps the larger tables.
-        os.reserve_positions(5);
-        assert_eq!(os.price_table.len(), 47);
-        os.reserve_positions(BLOCK_SIZE_MAX);
-        assert_eq!(
-            (os.price_table.len(), os.match_table.len()),
-            (OPT_SIZE, OPT_SIZE)
-        );
+        os.reserve_matches(44, 1 << 12);
+        assert_eq!(os.match_table.len(), 47);
+        // A smaller block keeps the larger table.
+        os.reserve_matches(5, 1 << 12);
+        assert_eq!(os.match_table.len(), 47);
+        // Few comparisons bound the list below the block.
+        os.reserve_matches(BLOCK_SIZE_MAX, 1 << 4);
+        assert_eq!(os.match_table.len(), 47);
+        os.reserve_matches(BLOCK_SIZE_MAX, 1 << 6);
+        assert_eq!(os.match_table.len(), 69);
+        os.reserve_matches(BLOCK_SIZE_MAX, 1 << 13);
+        assert_eq!(os.match_table.len(), OPT_SIZE);
+        // Positions follow the block's remaining length.
+        let mut table = core::mem::take(&mut os.price_table);
+        assert_eq!(grow_positions(&mut table, 3).len(), 3);
+        grow_positions(&mut table, 40);
+        assert_eq!(grow_positions(&mut table, 12).len(), 40);
+        os.price_table = table;
+        assert!(os.table_bytes() >= 40 * core::mem::size_of::<Optimal>());
     }
 
     #[test]

@@ -9,7 +9,9 @@
 use fearless_simd::{Simd, SimdBase, SimdMask, u8x16, u8x32, u8x64};
 
 /// Bit `i` set when the tag in slot `(head + i) % ROW` of `tags` equals
-/// `tag` (`ZSTD_row_getMatchMask`); bits at and above `ROW` are clear.
+/// `tag` (`ZSTD_row_getMatchMask`), except for slot 0: it holds the head,
+/// not a tag, and the reference's search skips it. Bits at and above `ROW`
+/// are clear.
 ///
 /// `ROW` is 16, 32 or 64; `head` is below `ROW`.
 #[inline(always)]
@@ -23,17 +25,17 @@ pub(super) fn match_mask<S: Simd, const ROW: usize>(
         && ROW == 16
     {
         let equal = u8x16::<S>::load_array_ref(simd, lanes).simd_eq(u8x16::splat(simd, tag));
-        return u64::from((equal.to_bitmask() as u16).rotate_right(head));
+        return u64::from((equal.to_bitmask() as u16 & !1).rotate_right(head));
     }
     if let Some(lanes) = tags.first_chunk::<32>()
         && ROW == 32
     {
         let equal = u8x32::<S>::load_array_ref(simd, lanes).simd_eq(u8x32::splat(simd, tag));
-        return u64::from((equal.to_bitmask() as u32).rotate_right(head));
+        return u64::from((equal.to_bitmask() as u32 & !1).rotate_right(head));
     }
     if let Some(lanes) = tags.first_chunk::<64>() {
         let equal = u8x64::<S>::load_array_ref(simd, lanes).simd_eq(u8x64::splat(simd, tag));
-        return equal.to_bitmask().rotate_right(head);
+        return (equal.to_bitmask() & !1).rotate_right(head);
     }
     0
 }
@@ -45,7 +47,10 @@ mod tests {
 
     fn reference<const ROW: usize>(tags: &[u8; ROW], tag: u8, head: u32) -> u64 {
         (0..ROW)
-            .filter(|&i| tags[(head as usize + i) % ROW] == tag)
+            .filter(|&i| {
+                let slot = (head as usize + i) % ROW;
+                slot != 0 && tags[slot] == tag
+            })
             .fold(0u64, |mask, i| mask | 1 << i)
     }
 
@@ -65,7 +70,7 @@ mod tests {
         }
         let full = [0xA5u8; ROW];
         let got = fearless_simd::dispatch!(backend.0, simd => match_mask(simd, &full, 0xA5, 3));
-        assert_eq!(got, u64::MAX >> (64 - ROW));
+        assert_eq!(got, (u64::MAX >> (64 - ROW)) & !(1u64 << ((ROW - 3) % ROW)));
     }
 
     #[test]

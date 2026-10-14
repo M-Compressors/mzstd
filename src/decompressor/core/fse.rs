@@ -104,18 +104,103 @@ const SEQ_STATE_MASK: usize = SEQ_TABLE_SIZE - 1;
 pub(crate) struct SeqRow {
     base: u32,
     next_state: u16,
-    extra_bits: u8,
-    nb_bits: u8,
+    extra_bits: BitCount,
+    nb_bits: BitCount,
+}
+
+/// A bit count below 32: every sequence field and state transition reads
+/// fewer bits. As an enum its range reaches the compiler with each load,
+/// so reads by these counts need no masking of the shift amount.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+enum BitCount {
+    #[default]
+    B0,
+    B1,
+    B2,
+    B3,
+    B4,
+    B5,
+    B6,
+    B7,
+    B8,
+    B9,
+    B10,
+    B11,
+    B12,
+    B13,
+    B14,
+    B15,
+    B16,
+    B17,
+    B18,
+    B19,
+    B20,
+    B21,
+    B22,
+    B23,
+    B24,
+    B25,
+    B26,
+    B27,
+    B28,
+    B29,
+    B30,
+    B31,
+}
+
+impl BitCount {
+    /// Every count, by value.
+    const ALL: [Self; 32] = [
+        Self::B0,
+        Self::B1,
+        Self::B2,
+        Self::B3,
+        Self::B4,
+        Self::B5,
+        Self::B6,
+        Self::B7,
+        Self::B8,
+        Self::B9,
+        Self::B10,
+        Self::B11,
+        Self::B12,
+        Self::B13,
+        Self::B14,
+        Self::B15,
+        Self::B16,
+        Self::B17,
+        Self::B18,
+        Self::B19,
+        Self::B20,
+        Self::B21,
+        Self::B22,
+        Self::B23,
+        Self::B24,
+        Self::B25,
+        Self::B26,
+        Self::B27,
+        Self::B28,
+        Self::B29,
+        Self::B30,
+        Self::B31,
+    ];
+
+    /// The count `count`, which must be below 32.
+    const fn new(count: u8) -> Self {
+        debug_assert!(count < 32);
+        Self::ALL[(count & 31) as usize]
+    }
 }
 
 impl SeqRow {
-    /// A row.
+    /// A row; both bit counts are below 32.
     pub(crate) const fn new(base: u32, next_state: u16, extra_bits: u8, nb_bits: u8) -> Self {
         Self {
             base,
             next_state,
-            extra_bits,
-            nb_bits,
+            extra_bits: BitCount::new(extra_bits),
+            nb_bits: BitCount::new(nb_bits),
         }
     }
 

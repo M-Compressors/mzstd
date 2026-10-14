@@ -1,20 +1,20 @@
-# Compression comparison — 2026-10-14 (fb36eb6 + working tree)
+# Compression comparison — 2026-10-14 (cd91929 + working tree)
 
 [Benchmark index](README.md) · [Results by level](encoders/README.md)
 
-The [384-row CSV](encoder-comparison.csv) records the final working tree on
-`fb36eb6db56038c4b25f34bd7141c880181eb775` against zstd 1.5.7, under the
-Criterion baseline `parity-final-20261014`. The median speed relative to C
-is **1.000×** over all 192 dataset/level pairs. This is approximately parity
-on this corpus; the small margin does not establish an overall lead, and
-large text remains slower.
+The [384-row CSV](encoder-comparison.csv) records the working tree on
+`cd91929828c289ad9da7703554761ce4af1fcb99` against zstd 1.5.7, under the
+Criterion baseline `enc-20261014-fix`. The median speed relative to C is
+**1.092×** over all 192 dataset/level pairs, and mzstd has the lower mean
+latency in **158** of them. Text at the fastest levels remains slower:
+Alice at levels -5 to 1 measures 0.87–0.88×.
 
 The [environment record](encoder-comparison-environment.json) identifies the
 measured source files and binary by SHA-256. The
-[size manifest](encoder-comparison-2026-10-14/sizes.csv) and
-[raw Criterion samples and estimates](encoder-comparison-2026-10-14/criterion-samples.json.gz)
+[size manifest](encoder-comparison-2026-10-14-fix/sizes.csv) and
+[raw Criterion samples and estimates](encoder-comparison-2026-10-14-fix/criterion-samples.json.gz)
 are archived with this run. The [changelog](../../CHANGELOG.md) describes the
-encoder changes; the source hashes match the final working tree.
+encoder changes.
 
 ## Results
 
@@ -28,67 +28,83 @@ Higher speed and lower output are better.
 
 | Level | mzstd median speed / C ↑ | mzstd median output / C ↓ |
 | ---: | ---: | ---: |
-| -5 | 1.110× | 1.000× |
-| -1 | 1.095× | 1.000× |
-| 1 | 1.056× | 1.000× |
-| 2 | 1.035× | 1.000× |
-| 3 | 1.062× | 1.000× |
-| 4 | 1.013× | 1.000× |
-| 5 | 0.977× | 1.000× |
-| 6 | 0.995× | 1.000× |
-| 7 | 0.956× | 1.000× |
-| 8 | 0.974× | 1.000× |
-| 9 | 0.932× | 1.000× |
-| 10 | 1.024× | 1.000× |
-| 11 | 0.999× | 1.000× |
-| 12 | 1.001× | 1.000× |
-| 13 | 0.972× | 1.000× |
-| 14 | 0.942× | 1.000× |
-| 15 | 0.961× | 1.000× |
-| 16 | 0.986× | 1.000× |
-| 17 | 0.973× | 1.000× |
-| 18 | 0.998× | 1.000× |
-| 19 | 1.010× | 1.000× |
-| 20 | 1.015× | 1.000× |
-| 21 | 0.999× | 1.000× |
-| 22 | 1.012× | 1.000× |
+| -5 | 1.078× | 1.000× |
+| -1 | 1.129× | 1.000× |
+| 1 | 1.164× | 1.000× |
+| 2 | 1.046× | 1.000× |
+| 3 | 1.033× | 1.000× |
+| 4 | 0.973× | 1.000× |
+| 5 | 1.067× | 1.000× |
+| 6 | 1.143× | 1.000× |
+| 7 | 1.106× | 1.000× |
+| 8 | 1.107× | 1.000× |
+| 9 | 1.078× | 1.000× |
+| 10 | 1.078× | 1.000× |
+| 11 | 1.076× | 1.000× |
+| 12 | 1.042× | 1.000× |
+| 13 | 1.080× | 1.000× |
+| 14 | 1.046× | 1.000× |
+| 15 | 1.042× | 1.000× |
+| 16 | 1.124× | 1.000× |
+| 17 | 1.092× | 1.000× |
+| 18 | 1.099× | 1.000× |
+| 19 | 1.096× | 1.000× |
+| 20 | 1.096× | 1.000× |
+| 21 | 1.111× | 1.000× |
+| 22 | 1.100× | 1.000× |
 
-The unrounded overall median is **1.000420×**. mzstd has a lower mean latency
-in **96 of 192** pairs; in 84 of those, its individual 95% confidence interval
+The unrounded overall median is **1.092093×**. mzstd has a lower mean latency
+in **158 of 192** pairs; in 136 of those, its individual 95% confidence interval
 for mean latency lies wholly below C's. These intervals have no adjustment for
-multiple comparisons and do not establish a statistically significant lead
-for the aggregate.
+multiple comparisons.
 
 The medians over all 24 levels for each dataset show the workload differences:
 
 | Dataset | mzstd median speed / C ↑ |
 | --- | ---: |
-| empty | 2.115× |
-| tiny-text | 1.471× |
-| alice29 | 0.925× |
-| text-1m | 0.934× |
-| binary-64k | 0.991× |
-| random-64k | 0.945× |
-| random-1m | 0.934× |
-| repeated-1m | 1.127× |
+| empty | 2.431× |
+| tiny-text | 1.582× |
+| alice29 | 1.000× |
+| text-1m | 1.009× |
+| binary-64k | 1.101× |
+| random-64k | 1.046× |
+| random-1m | 1.045× |
+| repeated-1m | 1.149× |
 
 Text results at selected levels:
 
 | Dataset | Level | mzstd, MiB/s ↑ | C, MiB/s ↑ | Speed / C ↑ | Frame bytes, both |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| alice29 | 1 | 317.44 | 404.51 | 0.785× | 59,657 |
-| alice29 | 3 | 239.12 | 290.17 | 0.824× | 56,970 |
-| alice29 | 9 | 48.97 | 56.13 | 0.872× | 52,188 |
-| alice29 | 19 | 5.12 | 5.15 | 0.994× | 49,211 |
-| text-1m | 1 | 2077.58 | 2465.44 | 0.843× | 61,206 |
-| text-1m | 3 | 1446.19 | 1706.95 | 0.847× | 55,878 |
-| text-1m | 9 | 367.59 | 418.55 | 0.878× | 52,381 |
-| text-1m | 19 | 34.14 | 33.81 | 1.010× | 49,285 |
+| alice29 | 1 | 352.90 | 404.19 | 0.873× | 59,657 |
+| alice29 | 3 | 271.39 | 296.00 | 0.917× | 56,970 |
+| alice29 | 9 | 53.83 | 55.28 | 0.974× | 52,188 |
+| alice29 | 19 | 5.61 | 5.44 | 1.031× | 49,211 |
+| text-1m | 1 | 2561.35 | 2479.87 | 1.033× | 61,206 |
+| text-1m | 3 | 1683.43 | 1723.27 | 0.977× | 55,878 |
+| text-1m | 9 | 401.42 | 428.25 | 0.937× | 52,381 |
+| text-1m | 19 | 37.64 | 34.33 | 1.096× | 49,285 |
 
 Every mzstd frame passed byte-for-byte comparison with zstd and decoded back
 to the original input through zstd before timing. The
 [level pages](encoders/README.md) expose all datasets, timings, throughput and
 95% mean confidence bounds.
+
+## Regression checks
+
+A first sweep of this tree (`enc-20261014-speed`, run beside the decoder
+sweep) was compared case by case with the previous publication. The 16 cases
+more than 3% slower than before were rerun with `paired.py`: one process per
+case, randomized AB/BA order, ten pairs, the previous tree's driver against
+this tree's and C against this tree's.
+
+| Cases | Previous tree → this tree | C → this tree | Verdict |
+| --- | ---: | ---: | --- |
+| repeated-1m l13-15 | 0.82-0.84× | 0.96-1.01× | real: btlazy2's inline tree count walked whole-block runs a word at a time; fixed (runs past four words go to the vector scan), then 0.99× and 1.17-1.21× |
+| random-64k l-5, l-1, l1 | 0.92-0.95× | 1.00-1.03× | real: the cost of fast's branch-free candidate check on data where the branch predicts well; kept for its gain on text |
+| binary-64k l3, l4, l10; random-1m l2; repeated-1m l1, l3, l6, l8, l18, l19 | 0.97-1.14× | 1.00-1.28× | noise |
+
+This sweep measured the tree after the fix, without a concurrent decoder
+sweep.
 
 ## Measurement contract
 
@@ -96,12 +112,12 @@ to the original input through zstd before timing. The
 | --- | --- |
 | Host | Intel Core i7-13700KF, x86_64, WSL2 |
 | Affinity | One single-threaded process pinned to logical CPU 2; no concurrent decoder sweep |
-| Rust | rustc 1.98.1; Cargo release defaults; runtime SIMD dispatch (AVX2 here) |
+| Rust | rustc 1.99.0; Cargo release defaults; runtime SIMD dispatch (AVX2 here) |
 | C compiler | GCC 11.4.0; `cc` crate defaults (`-O3`) |
 | zstd | 1.5.7; submodule `f8745da6ff1ad1e7bab384bd1f9d742439278e99`; single-threaded, no legacy formats, no Huffman assembly |
 | Compression | Level only, complete known input, no dictionary or explicit flush |
 | API | Cold one-shot: `ZSTD_createCCtx` + `ZSTD_compress2` into a `ZSTD_compressBound` buffer against `Compressor::new(level).compress`; construction, allocation, compression and disposal timed |
-| Sampling | 20 samples; 0.2 s warmup; 0.5 s requested measurement per case; 2,000 bootstrap resamples; 95% confidence intervals |
+| Sampling | 20 samples; 0.2 s warmup; 0.5 s requested measurement per case; Criterion's default 100,000 bootstrap resamples; 95% confidence intervals |
 | Validation | All 192 mzstd frames byte-identical to zstd and decoded to the original input through zstd before timing |
 
 Inputs are empty, 44-byte text, `testdata/alice29.txt` (152,089 bytes), cyclic
@@ -135,21 +151,21 @@ Plotting uses Matplotlib 3.10.8 and does not rerun timings.
 
 ## Interpretation limits
 
-This is one complete sweep on one WSL2 host. C and mzstd run consecutively for
-each case in a fixed order. Affinity restricts CPU migration but does not
-control frequency, thermal state or host scheduling. Confidence bounds do not
-capture every source of host or allocator variation. A 0.04% aggregate margin
-is too small to claim a stable overall lead.
+This is one complete sweep on one WSL2 host. C and mzstd run consecutively
+for each case in a fixed order. Affinity restricts CPU migration but does not
+control frequency, thermal state or host scheduling. Confidence bounds
+do not capture every source of host or allocator variation.
 
 Every dataset/level pair has equal weight, regardless of input size or execution
 time. The median describes this corpus, not a production workload distribution.
 Cold APIs include allocation and allocator state; timings include the effects
-of glibc's changing mmap threshold within a process.
+of glibc's changing mmap and trim thresholds within a process.
 
-The previous published encoder sweep used longer warmup and measurement times
-and ran concurrently with the decoder sweep. The change in aggregate score
-between those runs is not a controlled before/after speedup. The latest
-[decoder report](decoder-comparison.md) retains its separate 2026-10-13 data.
+The previous published encoder sweep (`parity-final-20261014`, median
+1.000×) measured the tree before these changes with the same sampling. The
+change between the two runs is consistent with paired, process-per-case
+measurements of the same binaries, but the two sweeps are not a controlled
+before/after experiment.
 
 Streaming, retained contexts and parallel compression have separate root
 benchmarks (`cargo bench --bench compress`, `--bench parallel`) and are outside

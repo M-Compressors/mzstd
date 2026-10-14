@@ -17,8 +17,12 @@ use super::entropy::{FseTables, HufTables, Tables};
 use super::error::{CoreError, is_error_code};
 use super::mem;
 use super::params::Strategy;
-use super::seq_store::{LongLength, SeqStore, offbase_is_repcode, offset_to_offbase, update_rep};
+use super::seq_store::{
+    CODE_COUNT_SLOTS, CodeCounts, LongLength, SeqStore, offbase_is_repcode, offset_to_offbase,
+    update_rep,
+};
 use super::window::Segments;
+use crate::Backend;
 use crate::shared::format::{
     BLOCK_COMPRESSED, BLOCK_HEADER_SIZE, EncodingType, LL_BITS, LONG_NB_SEQ, MIN_MATCH, ML_BITS,
     REP_NUM,
@@ -142,6 +146,7 @@ fn build_sequences_stats(
     prev: &FseTables,
     next: &mut FseTables,
     strategy: Strategy,
+    backend: Backend,
 ) -> Result<FseMetadata, CoreError> {
     if store.nb_seq() == 0 {
         next.litlength_repeat = super::entropy::FseRepeat::None;
@@ -155,7 +160,7 @@ fn build_sequences_stats(
         });
     }
     let mut buffer = [0u8; MAX_FSE_HEADERS_SIZE];
-    let stats = sequences::build_statistics(store, prev, next, &mut buffer, strategy)?;
+    let stats = sequences::build_statistics(store, prev, next, &mut buffer, strategy, backend)?;
     Ok(FseMetadata {
         ll_type: stats.ll_type,
         of_type: stats.of_type,
@@ -197,37 +202,43 @@ fn estimate_literals(
 }
 
 /// `ZSTD_estimateBlockSize_symbolType`.
+///
+/// `count` is the histogram of the stream's `nb_seq` codes.
 fn estimate_symbol_type(
     kind: EncodingType,
-    codes: &[u8],
+    count: &[u32; CODE_COUNT_SLOTS],
+    nb_seq: usize,
     code_kind: CodeKind,
     table: &super::entropy::fse::CTable,
     additional_bits: Option<&[u8]>,
 ) -> usize {
-    let nb_seq = codes.len();
-    let mut count = [0u32; 64];
-    let mut max = code_kind.max_code;
-    let _ = hist::count(&mut count, &mut max, codes, false);
+    let max = count[..=code_kind.max_code as usize]
+        .iter()
+        .rposition(|&c| c != 0)
+        .unwrap_or(0) as u32;
     let mut bits = match kind {
         EncodingType::Basic => sequences::cross_entropy_cost(
             code_kind.default_norm,
             code_kind.default_norm_log,
-            &count,
+            count,
             max,
         ),
         EncodingType::Rle => 0,
         EncodingType::Compressed | EncodingType::Repeat => {
-            sequences::fse_bit_cost(table, &count, max)
+            sequences::fse_bit_cost(table, count, max)
         }
     };
     if is_error_code(bits) {
         return nb_seq * 10;
     }
-    for &code in codes {
-        bits += match additional_bits {
-            Some(extra) => usize::from(extra[usize::from(code)]),
-            None => usize::from(code),
+    // The reference adds each code's extra bits; summing per code value
+    // gives the same total.
+    for (code, &c) in count[..=max as usize].iter().enumerate() {
+        let per_code = match additional_bits {
+            Some(extra) => usize::from(extra[code]),
+            None => code,
         };
+        bits += c as usize * per_code;
     }
     bits >> 3
 }
@@ -248,25 +259,33 @@ fn estimate_block_size(
     );
     let nb_seq = store.nb_seq();
     let header = 1 + 1 + usize::from(nb_seq >= 128) + usize::from(nb_seq >= LONG_NB_SEQ);
-    let codes =
-        |all: &[u8]| -> Vec<u8> { all.get(..nb_seq).map(<[u8]>::to_vec).unwrap_or_default() };
+    // Without sequences no codes were made: every histogram is empty.
+    let empty = CodeCounts::default();
+    let counts = if nb_seq == 0 {
+        &empty
+    } else {
+        &store.code_counts
+    };
     let mut seq_size = estimate_symbol_type(
         fse_metadata.of_type,
-        &codes(&store.of_code),
+        &counts.of,
+        nb_seq,
         OFFSETS,
         &entropy.fse.offcode,
         None,
     );
     seq_size += estimate_symbol_type(
         fse_metadata.ll_type,
-        &codes(&store.ll_code),
+        &counts.ll,
+        nb_seq,
         LITERAL_LENGTHS,
         &entropy.fse.litlength,
         Some(&LL_BITS),
     );
     seq_size += estimate_symbol_type(
         fse_metadata.ml_type,
-        &codes(&store.ml_code),
+        &counts.ml,
+        nb_seq,
         MATCH_LENGTHS,
         &entropy.fse.matchlength,
         Some(&ML_BITS),
@@ -291,6 +310,7 @@ fn estimate_sub_block_size(engine: &mut Engine, store: &mut SeqStore) -> Result<
         &engine.prev.entropy.fse,
         &mut engine.next.entropy.fse,
         strategy,
+        engine.backend,
     )?;
     Ok(estimate_block_size(
         store,
@@ -358,9 +378,8 @@ impl SeqStore {
         SeqStore {
             sequences: self.sequences[start..end].to_vec(),
             literals: self.literals[lit_start..lit_end].to_vec(),
-            ll_code: Vec::new(),
-            ml_code: Vec::new(),
-            of_code: Vec::new(),
+            codes: Vec::new(),
+            code_counts: CodeCounts::default(),
             long_length,
             max_nb_seq: self.max_nb_seq,
             max_nb_lit: self.max_nb_lit,

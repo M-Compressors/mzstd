@@ -14,6 +14,10 @@ use crate::Backend;
 const HASHLOG3_MAX: u32 = 17;
 /// `ZSTD_ROW_HASH_CACHE_SIZE`.
 pub(crate) const ROW_HASH_CACHE_SIZE: usize = 8;
+/// Entries the row match finder's tables carry past their size, so that the
+/// finder can start both at a 64-byte boundary, as the reference's
+/// workspace aligns them.
+pub(crate) const ROW_TABLE_SLACK: usize = 64;
 
 /// The block a match finder works on.
 #[derive(Copy, Clone, Debug)]
@@ -156,8 +160,9 @@ impl MatchState {
         // (`ZSTD_cwksp_reserve_aligned_init_once`); its salt only permutes
         // rows and tags, so it is not modelled.
         let keep_stale = !reset_index;
+        let slack = if row { ROW_TABLE_SLACK } else { 0 };
         for (table, size) in [
-            (&mut self.hash_table, h_size),
+            (&mut self.hash_table, h_size + slack),
             (&mut self.chain_table, chain_size),
             (&mut self.hash_table3, h3_size),
         ] {
@@ -171,7 +176,7 @@ impl MatchState {
             self.tag_table.clear();
         }
         if row {
-            self.tag_table.resize(h_size, 0);
+            self.tag_table.resize(h_size + slack, 0);
             let row_log = cparams.search_log.clamp(4, 6);
             self.row_hash_log = cparams.hash_log - row_log;
         }

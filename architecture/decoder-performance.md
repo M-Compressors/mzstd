@@ -86,7 +86,10 @@ classDiagram
   (`HUF_DecompressFastArgs`): unread bits at the top, a `1` below them
   shifted up with every read, so the consumed count is the sentinel's
   position (`trailing_zeros`) and a 12-bit lookup is one shift. Positions
-  index the buffer holding all four streams.
+  index the buffer holding all four streams. `reload(src, last)` clamps the
+  position to `last`, the start of the buffer's last whole word: the fast
+  loops never pass it, so the clamp changes nothing, but it replaces the
+  bounds-checked load and its fallback branch with a `cmov`.
 - **`ReverseBitReader`** keeps the old per-read semantics for Huffman
   weight streams, whose overflow test mirrors the reference's FSE decoder.
 
@@ -118,6 +121,15 @@ flowchart TD
   in 12 bits. A round gathers each stream's symbols in one word and stores
   eight bytes; bytes past the symbols stay inside the stream's own segment.
   They are rebuilt only after a new tree.
+- A `PairRow` packs symbols, bit count and shift in one `u32`, so a row of
+  one symbol plus the row that continues it is the row of both. A code of
+  `b` bits fills a run of `1 << (12 - b)` rows whose `j`th row continues
+  with the code at row `j << b`, the same series for every code of that
+  length (the reference's `HUF_fillDTableX2Level2` per rank). The first run
+  of each length is built from the single rows; later runs of that length
+  copy it with one add per row that swaps in their own first symbol. This
+  cut the build from 1.97M to 0.58M instructions on Alice at level 1, and a
+  test checks every row of trees of every depth against the definition.
 - Every stream finishes with the single-symbol table in the reference's
   cautious loop and must be consumed exactly; the pair decoder never
   decides how a stream ends.
@@ -142,7 +154,10 @@ flowchart TD
 ```
 
 - `SeqTable` rows are `ZSTD_seqSymbol`: baseline, next-state base,
-  extra-bit and state-bit counts. The loop holds references to rows and
+  extra-bit and state-bit counts. Both counts are a `BitCount`, a
+  32-variant `#[repr(u8)]` enum: as an enum its range reaches the compiler
+  with every load, so reads by these counts need no `& 63` before the
+  `bzhi` or shift (about four instructions per sequence). The loop holds references to rows and
   reads fields as needed. Slots are allocated on first use and rebuilt in
   place; the predefined tables are kept while no other table replaces
   them.
@@ -158,7 +173,7 @@ flowchart TD
 | Case | Copy |
 | --- | --- |
 | literals | one 16-byte chunk, then 32-byte chunks |
-| match, offset >= 32 | 32-byte chunks |
+| match, offset >= 32 | 32-byte chunks; the first is copied from the output split at the literals' end, whose history's last `offset` bytes provably hold it, so it needs no bounds check |
 | match, 16 <= offset < 32 | 16-byte chunks |
 | match, offset < 16, `Shuffle` | `PERIOD[offset]` spreads the period over a `u8x16`; `ROTATE[offset]` turns each chunk's vector into the next's |
 | match, offset < 16, `Scalar` | the reference's offset spreading (`dec32table`/`dec64table`), then 8-byte chunks |
@@ -276,12 +291,22 @@ which already matches the reference's 21 GB/s.
 
 ## Known gaps
 
+- Measured and rejected for `decompress` (2026-10-14): appending sequences
+  to the vector with `extend_from_slice`/`extend_from_within`, which needs
+  no zeroed output, is slower (Alice level 1: 110 µs against 96 µs) because
+  every chunk reloads and stores the vector's length through memory, which
+  serializes the copies; decoding a batch of sequences before executing it,
+  in two out-of-line loops, executes about 15% more instructions; one
+  allocation for the three sequence tables changes nothing.
+
 - Compressible text decodes at 0.81-0.96x the reference's speed through
   `decompress` ([benchmarks](../docs/benchmarks/decoders/README.md)): the
-  sequence loop executes 1.10-1.22x the reference's instructions on Alice,
-  and compressed blocks need their output zeroed before decoding, about
-  12 µs per MiB that the reference, writing into uninitialized memory, does
-  not pay.
+  sequence loop executes about 1.05x the reference's instructions on Alice
+  (133 against 126 per sequence; both spill about 40 values per sequence to
+  the stack), the four-stream pair Huffman loop about 1.4x per lookup, and
+  compressed blocks need their output zeroed before decoding, about
+  8-10 µs per MiB that the reference, writing into uninitialized memory,
+  does not pay.
 - `decompress_to_slice` takes the incremental path, with its extra copies,
   for frames without a content size.
 - No prefetching variant for long offsets (`ZSTD_decompressSequencesLong`)

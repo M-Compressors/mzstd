@@ -85,9 +85,51 @@ pub(crate) fn count_ordered<S: Simd>(
 ) -> (usize, bool) {
     let known = known as usize;
     let start = start as usize;
+    // The rest is the uncommon case, which the hints keep out of the
+    // walk's path: the registers the scan's call clobbers are then saved
+    // around that call, not at every candidate.
+    let words = (word_at(current, known), word_at(data, start));
+    if let (Some(left_word), Some(right_word)) = words
+        && !branches::unlikely(left_word == right_word)
+    {
+        return ordered_difference(left_word, right_word, 0);
+    }
+    // A first word that fit on both sides matched.
+    let equal = if words.0.is_some() && words.1.is_some() {
+        8
+    } else {
+        0
+    };
+    count_ordered_run(simd, current, data, start, known, equal)
+}
+
+/// The length and order of two words that differ, `equal` bytes into the
+/// run.
+#[inline(always)]
+fn ordered_difference(left_word: u64, right_word: u64, equal: usize) -> (usize, bool) {
+    // Read big-endian, the first differing byte is the most significant
+    // one that differs: the words order as it does.
+    let smaller = right_word.swap_bytes() < left_word.swap_bytes();
+    let length = ((left_word ^ right_word).trailing_zeros() >> 3) as usize;
+    (equal + length, smaller)
+}
+
+/// [`count_ordered`] past a first word that matched (`equal` is 8) or does
+/// not fit (`equal` is 0).
+///
+/// Out of line: the walk then keeps its state in registers across the
+/// call rather than saving it for a scan most candidates never reach.
+#[inline(never)]
+fn count_ordered_run<S: Simd>(
+    simd: S,
+    current: &[u8],
+    data: &[u8],
+    start: usize,
+    known: usize,
+    mut equal: usize,
+) -> (usize, bool) {
     // Up to `INLINE_WORDS` words inline: they settle most runs of a tree
     // walk, and only a longer one pays for the call into the tail scan.
-    let mut equal = 0;
     while equal < INLINE_WORDS * 8 {
         let (Some(left_word), Some(right_word)) = (
             word_at(current, known + equal),
@@ -95,11 +137,8 @@ pub(crate) fn count_ordered<S: Simd>(
         ) else {
             break;
         };
-        let difference = left_word ^ right_word;
-        if difference != 0 {
-            let shift = difference.trailing_zeros() & !7;
-            let smaller = ((right_word >> shift) as u8) < ((left_word >> shift) as u8);
-            return (equal + (shift >> 3) as usize, smaller);
+        if left_word != right_word {
+            return ordered_difference(left_word, right_word, equal);
         }
         equal += 8;
     }

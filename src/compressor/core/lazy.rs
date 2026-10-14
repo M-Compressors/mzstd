@@ -21,7 +21,9 @@ mod row;
 
 use fearless_simd::Simd;
 
-use super::match_state::{BlockInput, DUBT_UNSORTED_MARK, MatchState, ROW_HASH_CACHE_SIZE};
+use super::match_state::{
+    BlockInput, DUBT_UNSORTED_MARK, MatchState, ROW_HASH_CACHE_SIZE, ROW_TABLE_SLACK,
+};
 use super::mem::{self, Mem, hash_ptr};
 use super::params::ROW_HASH_TAG_BITS;
 use super::seq_store::{SeqStore, offbase_to_offset, offset_to_offbase, repcode_to_offbase};
@@ -69,16 +71,24 @@ impl<'a> Ctx<'a> {
         self.base
     }
 
-    /// The little-endian `u32` at prefix index `index` (`MEM_read32`); a word
-    /// past the prefix, which the reference's index invariants rule out,
-    /// reads as zero.
+    /// Whether the four bytes at prefix index `p` repeat `offset` bytes
+    /// earlier (`MEM_read32(ip - offset) == MEM_read32(ip)`), for an offset
+    /// above zero. One slice spanning both words is cut, so one check covers
+    /// both loads; a span that leaves the prefix, which the parser's offset
+    /// bounds rule out, does not match.
     #[inline(always)]
-    fn word(&self, index: u32) -> u32 {
-        let at = index.wrapping_sub(self.base) as usize;
-        self.src
-            .get(at..at + 4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map_or(0, u32::from_le_bytes)
+    fn repeats(&self, p: u32, offset: u32) -> bool {
+        let at = p.wrapping_sub(self.base) as usize;
+        let Some(from) = at.checked_sub(offset as usize) else {
+            return false;
+        };
+        let Some(span) = self.src.get(from..at + 4) else {
+            return false;
+        };
+        match (span.first_chunk::<4>(), span.last_chunk::<4>()) {
+            (Some(earlier), Some(word)) => earlier == word,
+            _ => false,
+        }
     }
 
     /// `ZSTD_count` of the prefix positions `a` and `b < a`, up to the block
@@ -130,51 +140,16 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// One step of the binary tree: the common length of the runs at
-    /// window indices `a` and `b`, stopping before `limit` for `a`, and
-    /// whether `b`'s run sorts below `a`'s — the byte after the common run
-    /// is smaller — when that byte is before `limit` (`false` otherwise).
-    ///
-    /// Without an external dictionary (`!EXT`) both runs are in the prefix.
-    /// A difference within the first word then comes from one load per
-    /// side, and so do the two bytes that order the runs.
+    /// One step of the binary tree with an external dictionary: the common
+    /// length of the runs at window indices `a` and `b`, stopping before
+    /// `limit` for `a`, and whether `b`'s run sorts below `a`'s — the byte
+    /// after the common run is smaller — when that byte is before `limit`
+    /// (`false` otherwise). [`TreeRun::step`] takes the prefix-only case.
     #[inline(always)]
-    fn tree_step<S: Simd, const EXT: bool>(
-        &self,
-        simd: S,
-        a: u32,
-        b: u32,
-        limit: u32,
-    ) -> (usize, bool) {
-        if EXT {
-            let n = self.count_virtual(simd, a, b, limit);
-            let at = n as u32;
-            let lower = a + at < limit && self.window.byte_at(b + at) < self.window.byte_at(a + at);
-            return (n, lower);
-        }
-        let (a_off, b_off) = ((a - self.base) as usize, (b - self.base) as usize);
-        let end = (limit - self.base) as usize;
-        let mut n = 0;
-        if a_off + 8 <= end
-            && let (Some(x), Some(y)) = (
-                self.src.get(a_off..a_off + 8),
-                self.src.get(b_off..b_off + 8),
-            )
-        {
-            let x = u64::from_le_bytes(x.try_into().unwrap_or_default());
-            let y = u64::from_le_bytes(y.try_into().unwrap_or_default());
-            let difference = x ^ y;
-            if difference != 0 {
-                let shift = difference.trailing_zeros() & !7;
-                return (
-                    (shift >> 3) as usize,
-                    ((y >> shift) as u8) < ((x >> shift) as u8),
-                );
-            }
-            n = 8;
-        }
-        n += self.count_to(simd, a + n as u32, b + n as u32, limit);
-        let lower = a_off + n < end && self.src[b_off + n] < self.src[a_off + n];
+    fn ext_tree_step<S: Simd>(&self, simd: S, a: u32, b: u32, limit: u32) -> (usize, bool) {
+        let n = self.count_virtual(simd, a, b, limit);
+        let at = n as u32;
+        let lower = a + at < limit && self.window.byte_at(b + at) < self.window.byte_at(a + at);
         (n, lower)
     }
 
@@ -376,18 +351,28 @@ trait Search {
     /// Whether the search keeps the row finder's hash cache.
     const ROW: bool;
 
+    /// The search's view of the match state for one block: the tables it
+    /// reads and writes, and the constants it derives from the parameters.
+    type State<'t>;
+
+    /// The state of `ms` for one block of `ctx`.
+    fn state<'t>(ms: &'t mut MatchState, ctx: &Ctx<'_>) -> Self::State<'t>;
+
     /// `ZSTD_searchMax`: the longest match at `ip`, its offset in `offset`.
+    /// `lazy_skipping` is the parser's `ms->lazySkipping`.
     fn find<S: Simd>(
         simd: S,
-        ms: &mut MatchState,
+        state: &mut Self::State<'_>,
         ctx: &Ctx<'_>,
         ip: u32,
+        lazy_skipping: bool,
         offset: &mut u32,
     ) -> usize;
 
-    /// `ZSTD_row_fillHashCache`; nothing for searches without the cache, so
-    /// the parser calls it unconditionally.
-    fn fill_cache(_ms: &mut MatchState, _ctx: &Ctx<'_>, _idx: u32, _i_limit: i64) {}
+    /// `ZSTD_row_fillHashCache` from the next position to insert; nothing
+    /// for searches without the cache, so the parser calls it
+    /// unconditionally.
+    fn fill_cache(_state: &mut Self::State<'_>, _ctx: &Ctx<'_>, _i_limit: i64) {}
 }
 
 /// Hash chains (`search_hashChain`).
@@ -399,32 +384,44 @@ struct RowHash;
 
 impl Search for HashChain {
     const ROW: bool = false;
+    type State<'t> = &'t mut MatchState;
+
+    fn state<'t>(ms: &'t mut MatchState, _ctx: &Ctx<'_>) -> Self::State<'t> {
+        ms
+    }
 
     #[inline(always)]
     fn find<S: Simd>(
         simd: S,
-        ms: &mut MatchState,
+        ms: &mut &mut MatchState,
         ctx: &Ctx<'_>,
         ip: u32,
+        lazy_skipping: bool,
         offset: &mut u32,
     ) -> usize {
         match ctx.mls {
-            5 => hc_find_best_match::<S, 5>(simd, ms, ctx, ip, offset),
-            6 => hc_find_best_match::<S, 6>(simd, ms, ctx, ip, offset),
-            _ => hc_find_best_match::<S, 4>(simd, ms, ctx, ip, offset),
+            5 => hc_find_best_match::<S, 5>(simd, ms, ctx, ip, lazy_skipping, offset),
+            6 => hc_find_best_match::<S, 6>(simd, ms, ctx, ip, lazy_skipping, offset),
+            _ => hc_find_best_match::<S, 4>(simd, ms, ctx, ip, lazy_skipping, offset),
         }
     }
 }
 
 impl Search for BinaryTree {
     const ROW: bool = false;
+    type State<'t> = &'t mut MatchState;
+
+    fn state<'t>(ms: &'t mut MatchState, _ctx: &Ctx<'_>) -> Self::State<'t> {
+        ms
+    }
 
     #[inline(always)]
     fn find<S: Simd>(
         simd: S,
-        ms: &mut MatchState,
+        ms: &mut &mut MatchState,
         ctx: &Ctx<'_>,
         ip: u32,
+        _lazy_skipping: bool,
         offset: &mut u32,
     ) -> usize {
         match (ctx.mls, ctx.ext) {
@@ -440,32 +437,40 @@ impl Search for BinaryTree {
 
 impl Search for RowHash {
     const ROW: bool = true;
+    type State<'t> = RowState<'t>;
+
+    fn state<'t>(ms: &'t mut MatchState, ctx: &Ctx<'_>) -> Self::State<'t> {
+        RowState::new(ms, ctx)
+    }
 
     #[inline(always)]
     fn find<S: Simd>(
         simd: S,
-        ms: &mut MatchState,
+        state: &mut RowState<'_>,
         ctx: &Ctx<'_>,
         ip: u32,
+        lazy_skipping: bool,
         offset: &mut u32,
     ) -> usize {
+        let (s, l) = (state, lazy_skipping);
         match (ctx.mls, ctx.row_log) {
-            (5, 4) => row_find_best_match::<S, 5, 16>(simd, ms, ctx, ip, offset),
-            (5, 5) => row_find_best_match::<S, 5, 32>(simd, ms, ctx, ip, offset),
-            (5, _) => row_find_best_match::<S, 5, 64>(simd, ms, ctx, ip, offset),
-            (6, 4) => row_find_best_match::<S, 6, 16>(simd, ms, ctx, ip, offset),
-            (6, 5) => row_find_best_match::<S, 6, 32>(simd, ms, ctx, ip, offset),
-            (6, _) => row_find_best_match::<S, 6, 64>(simd, ms, ctx, ip, offset),
-            (_, 4) => row_find_best_match::<S, 4, 16>(simd, ms, ctx, ip, offset),
-            (_, 5) => row_find_best_match::<S, 4, 32>(simd, ms, ctx, ip, offset),
-            (_, _) => row_find_best_match::<S, 4, 64>(simd, ms, ctx, ip, offset),
+            (5, 4) => row_find_best_match::<S, 5, 16>(simd, s, ctx, ip, l, offset),
+            (5, 5) => row_find_best_match::<S, 5, 32>(simd, s, ctx, ip, l, offset),
+            (5, _) => row_find_best_match::<S, 5, 64>(simd, s, ctx, ip, l, offset),
+            (6, 4) => row_find_best_match::<S, 6, 16>(simd, s, ctx, ip, l, offset),
+            (6, 5) => row_find_best_match::<S, 6, 32>(simd, s, ctx, ip, l, offset),
+            (6, _) => row_find_best_match::<S, 6, 64>(simd, s, ctx, ip, l, offset),
+            (_, 4) => row_find_best_match::<S, 4, 16>(simd, s, ctx, ip, l, offset),
+            (_, 5) => row_find_best_match::<S, 4, 32>(simd, s, ctx, ip, l, offset),
+            (_, _) => row_find_best_match::<S, 4, 64>(simd, s, ctx, ip, l, offset),
         }
     }
 
-    fn fill_cache(ms: &mut MatchState, ctx: &Ctx<'_>, idx: u32, i_limit: i64) {
-        let bits = ms.row_hash_log + ROW_HASH_TAG_BITS;
-        let cache = &mut ms.hash_cache;
-        let tables = (ms.tag_table.as_slice(), ms.hash_table.as_slice());
+    fn fill_cache(state: &mut RowState<'_>, ctx: &Ctx<'_>, i_limit: i64) {
+        let idx = state.next_to_update;
+        let bits = state.bits;
+        let cache = &mut *state.cache;
+        let tables = (&*state.tags, &*state.slots);
         match ctx.mls {
             5 => row_fill_hash_cache::<5>(cache, tables, ctx, bits, idx, i_limit),
             6 => row_fill_hash_cache::<6>(cache, tables, ctx, bits, idx, i_limit),
@@ -495,10 +500,14 @@ const fn search_low_limit(ms: &MatchState, curr: u32) -> u32 {
 
 /// `ZSTD_insertAndFindFirstIndex_internal`.
 #[inline(always)]
-fn insert_and_find_first_index<const MLS: u32>(ms: &mut MatchState, ctx: &Ctx<'_>, ip: u32) -> u32 {
+fn insert_and_find_first_index<const MLS: u32>(
+    ms: &mut MatchState,
+    ctx: &Ctx<'_>,
+    ip: u32,
+    lazy_skipping: bool,
+) -> u32 {
     let hash_log = ms.cparams.hash_log;
     let chain_mask = (1u32 << ms.cparams.chain_log) - 1;
-    let lazy_skipping = ms.lazy_skipping;
     let mut idx = ms.next_to_update;
     // Local slices keep the tables' pointers and lengths in registers: the
     // stores below could otherwise alias the vectors that own them.
@@ -525,6 +534,7 @@ fn hc_find_best_match<S: Simd, const MLS: u32>(
     ms: &mut MatchState,
     ctx: &Ctx<'_>,
     ip: u32,
+    lazy_skipping: bool,
     offset: &mut u32,
 ) -> usize {
     let cparams = ms.cparams;
@@ -535,7 +545,7 @@ fn hc_find_best_match<S: Simd, const MLS: u32>(
     let min_chain = curr.saturating_sub(chain_size);
     let nb_attempts = 1u32 << cparams.search_log;
 
-    let first = insert_and_find_first_index::<MLS>(ms, ctx, ip);
+    let first = insert_and_find_first_index::<MLS>(ms, ctx, ip, lazy_skipping);
     let walk = ChainWalk {
         chain: &ms.chain_table,
         chain_mask,
@@ -557,33 +567,250 @@ fn hc_find_best_match<S: Simd, const MLS: u32>(
 /// `ZSTD_updateDUBT`.
 #[inline(always)]
 fn update_dubt<const MLS: u32>(ms: &mut MatchState, ctx: &Ctx<'_>, ip: u32) {
+    let start = ms.next_to_update;
+    ms.next_to_update = ip;
+    if start >= ip {
+        return;
+    }
     let hash_log = ms.cparams.hash_log;
     let bt_mask = (1u32 << (ms.cparams.chain_log - 1)) - 1;
-    let mut idx = ms.next_to_update;
-    while idx < ip {
+    // The words hashed, cut once (see [`row_update_impl`]); the
+    // reference's index invariants keep them in the prefix.
+    let from = start.wrapping_sub(ctx.base) as usize;
+    let Some(words) = ctx.src.get(from..from + (ip - start) as usize + 7) else {
+        return update_dubt_checked::<MLS>(ms, ctx, start, ip);
+    };
+    let hash_table = ms.hash_table.as_mut_slice();
+    // A node's two cells: the next candidate in the unsorted list, and the
+    // mark that the node is not sorted yet.
+    let nodes = ms.chain_table.as_chunks_mut::<2>().0;
+    let mut idx = start;
+    for word in words.windows(8) {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+        let h = mem::hash_word::<MLS>(word, hash_log);
+        let match_index = core::mem::replace(&mut hash_table[h], idx);
+        nodes[(idx & bt_mask) as usize] = [match_index, DUBT_UNSORTED_MARK];
+        idx = idx.wrapping_add(1);
+    }
+}
+
+/// [`update_dubt`] hashing through [`Ctx::hash`], for a range whose
+/// words leave the prefix.
+#[cold]
+#[inline(never)]
+fn update_dubt_checked<const MLS: u32>(ms: &mut MatchState, ctx: &Ctx<'_>, start: u32, ip: u32) {
+    let hash_log = ms.cparams.hash_log;
+    let bt_mask = (1u32 << (ms.cparams.chain_log - 1)) - 1;
+    for idx in start..ip {
         let h = ctx.hash::<MLS>(idx, hash_log);
         let match_index = ms.hash_table[h];
         let slot = 2 * (idx & bt_mask) as usize;
         ms.hash_table[h] = idx;
         ms.chain_table[slot] = match_index;
         ms.chain_table[slot + 1] = DUBT_UNSORTED_MARK;
-        idx += 1;
     }
-    ms.next_to_update = ip;
 }
 
-/// A tree link to write: a slot of the chain table, or nowhere.
-#[derive(Copy, Clone)]
-enum Link {
-    Slot(usize),
-    Dummy,
-}
+/// A tree link not to write (`dummy32`): past every chain table, so the
+/// check that guards a write also skips it.
+const NO_LINK: usize = usize::MAX;
 
+/// Writes `value` to the tree link `link`: a cell of the chain table, or
+/// [`NO_LINK`].
 #[inline(always)]
-fn set_link(bt: &mut [u32], link: Link, value: u32) {
-    if let Link::Slot(slot) = link {
-        bt[slot] = value;
+fn set_link(bt: &mut [u32], link: usize, value: u32) {
+    if let Some(cell) = bt.get_mut(link) {
+        *cell = value;
     }
+}
+
+/// The open links of a tree walk (`smallerPtr`, `largerPtr`) and the
+/// lengths its run is known to share with each side.
+struct TreeLinks {
+    smaller: usize,
+    larger: usize,
+    common_smaller: usize,
+    common_larger: usize,
+}
+
+impl TreeLinks {
+    /// The links of the node at `slot` (its pair of cells).
+    #[inline(always)]
+    const fn new(slot: usize) -> Self {
+        Self {
+            smaller: slot,
+            larger: slot + 1,
+            common_smaller: 0,
+            common_larger: 0,
+        }
+    }
+
+    /// The length every candidate below the open links shares with the run.
+    #[inline(always)]
+    fn common(&self) -> usize {
+        self.common_smaller.min(self.common_larger)
+    }
+
+    /// Attaches candidate `m` (whose cells start at `next`, sharing
+    /// `match_length` bytes with the run) to the side it sorts on, and
+    /// returns that side's child to visit next, or `None` when `m` is at
+    /// or below `bt_low` and the walk ends.
+    ///
+    /// Which side a candidate takes is as likely one way as the other, so
+    /// the side is selected without a branch; the reference's two arms do
+    /// the same writes.
+    #[inline(always)]
+    fn descend(
+        &mut self,
+        bt: &mut [u32],
+        m: u32,
+        next: usize,
+        match_length: usize,
+        lower: bool,
+        bt_low: u32,
+    ) -> Option<u32> {
+        use core::hint::select_unpredictable as select;
+        set_link(bt, select(lower, self.smaller, self.larger), m);
+        self.common_smaller = select(lower, match_length, self.common_smaller);
+        self.common_larger = select(lower, self.common_larger, match_length);
+        let ends = m <= bt_low;
+        let child = if ends {
+            NO_LINK
+        } else {
+            next + usize::from(lower)
+        };
+        self.smaller = select(lower, child, self.smaller);
+        self.larger = select(lower, self.larger, child);
+        if ends {
+            return None;
+        }
+        bt.get(child).copied()
+    }
+
+    /// Closes both open links (`*smallerPtr = *largerPtr = 0`).
+    #[inline(always)]
+    fn close(&self, bt: &mut [u32]) {
+        set_link(bt, self.smaller, 0);
+        set_link(bt, self.larger, 0);
+    }
+}
+
+/// The run a tree walk sorts candidates against: the bytes from position
+/// `curr` to the walk's limit. Without an external dictionary (`!EXT`)
+/// they are cut from the prefix once, so a step costs one check per side.
+#[derive(Copy, Clone)]
+struct TreeRun<'a> {
+    curr: u32,
+    limit: u32,
+    /// The run's bytes (prefix only).
+    current: &'a [u8],
+}
+
+impl<'a> TreeRun<'a> {
+    #[inline(always)]
+    fn new<const EXT: bool>(ctx: &Ctx<'a>, curr: u32, limit: u32) -> Self {
+        let current = if EXT {
+            &[]
+        } else {
+            ctx.src
+                .get(curr.wrapping_sub(ctx.base) as usize..limit.wrapping_sub(ctx.base) as usize)
+                .unwrap_or_default()
+        };
+        Self {
+            curr,
+            limit,
+            current,
+        }
+    }
+
+    /// The run's length.
+    #[inline(always)]
+    const fn len(&self) -> usize {
+        (self.limit - self.curr) as usize
+    }
+
+    /// One step of a tree walk: the common length of
+    /// the run and candidate `m`, which agree on their first `from` bytes,
+    /// and whether the candidate sorts below the run.
+    #[inline(always)]
+    fn step<S: Simd, const EXT: bool>(
+        &self,
+        simd: S,
+        ctx: &Ctx<'_>,
+        m: u32,
+        from: usize,
+    ) -> (usize, bool) {
+        if EXT {
+            let at = from as u32;
+            let (n, lower) = ctx.ext_tree_step(simd, self.curr + at, m + at, self.limit);
+            return (from + n, lower);
+        }
+        let (current, src) = (self.current, ctx.src);
+        // Lengths and window offsets fit in 32 bits; saying so lets the
+        // compiler drop the overflow checks of the ranges below.
+        let from = from & u32::MAX as usize;
+        let at = m.wrapping_sub(ctx.base) as usize;
+        // `ZSTD_count` inline, a word at a time, for the first
+        // `TREE_INLINE_WORDS` words: a call here would make the walk keep its
+        // state in memory across every step. Longer runs (run-length input
+        // matches whole blocks) continue in the vector scan.
+        let mut n = from;
+        let mut words = 0;
+        while let (Some(x), Some(y)) = (current.get(n..n + 8), src.get(at + n..at + n + 8)) {
+            let x = u64::from_le_bytes(x.try_into().unwrap_or_default());
+            let y = u64::from_le_bytes(y.try_into().unwrap_or_default());
+            let difference = x ^ y;
+            if difference != 0 {
+                // The words read big-endian order as their bytes do, so the
+                // first difference orders them.
+                let lower = y.swap_bytes() < x.swap_bytes();
+                return (n + (difference.trailing_zeros() >> 3) as usize, lower);
+            }
+            n += 8;
+            words += 1;
+            if words == TREE_INLINE_WORDS {
+                return long_tree_step(simd, current, src.get(at..).unwrap_or_default(), n);
+            }
+        }
+        while let (Some(x), Some(y)) = (current.get(n), src.get(at + n))
+            && x == y
+        {
+            n += 1;
+        }
+        let lower = match (current.get(n), src.get(at + n)) {
+            (Some(&x), Some(&y)) => y < x,
+            _ => false,
+        };
+        (n, lower)
+    }
+}
+
+/// Words a tree step compares inline before handing a run to
+/// [`long_tree_step`].
+const TREE_INLINE_WORDS: usize = 4;
+
+/// The rest of a long tree step, past the `matched` bytes compared inline:
+/// the common length of `current` and `candidate` by the vector scan, and
+/// whether the candidate sorts below the run. Out of line and cold, so the
+/// walk keeps its registers.
+#[cold]
+#[inline(never)]
+fn long_tree_step<S: Simd>(
+    simd: S,
+    current: &[u8],
+    candidate: &[u8],
+    matched: usize,
+) -> (usize, bool) {
+    let (current_rest, candidate_rest) = (
+        current.get(matched..).unwrap_or_default(),
+        candidate.get(matched..).unwrap_or_default(),
+    );
+    let n = matched + mem::count_slices_simd(simd, current_rest, candidate_rest);
+    let lower = match (current.get(n), candidate.get(n)) {
+        (Some(&x), Some(&y)) => y < x,
+        _ => false,
+    };
+    (n, lower)
 }
 
 /// `ZSTD_insertDUBT1`: sorts one inserted but unsorted position.
@@ -604,10 +831,7 @@ fn insert_dubt1<S: Simd, const EXT: bool>(
     } else {
         dict_limit
     };
-    let mut common_smaller = 0usize;
-    let mut common_larger = 0usize;
-    let mut smaller = Link::Slot(2 * (curr & bt_mask) as usize);
-    let mut larger = Link::Slot(2 * (curr & bt_mask) as usize + 1);
+    let run = TreeRun::new::<EXT>(ctx, curr, iend);
     let window_valid = ms.window.low_limit;
     let max_distance = 1u32 << cparams.window_log;
     let window_low = if curr.wrapping_sub(window_valid) > max_distance {
@@ -615,45 +839,23 @@ fn insert_dubt1<S: Simd, const EXT: bool>(
     } else {
         window_valid
     };
-    let bt = &mut ms.chain_table;
-    let mut match_index = bt[2 * (curr & bt_mask) as usize];
+    let bt = ms.chain_table.as_mut_slice();
+    let mut links = TreeLinks::new(2 * (curr & bt_mask) as usize);
+    let mut match_index = bt[links.smaller];
 
     while nb_compares > 0 && match_index > window_low {
         let next = 2 * (match_index & bt_mask) as usize;
-        let mut match_length = common_smaller.min(common_larger);
-        let (common, lower) = ctx.tree_step::<S, EXT>(
-            simd,
-            curr + match_length as u32,
-            match_index + match_length as u32,
-            iend,
-        );
-        match_length += common;
-        if (curr as usize + match_length) == iend as usize {
+        let (match_length, lower) = run.step::<S, EXT>(simd, ctx, match_index, links.common());
+        if match_length == run.len() {
             break;
         }
-        if lower {
-            set_link(bt, smaller, match_index);
-            common_smaller = match_length;
-            if match_index <= bt_low {
-                smaller = Link::Dummy;
-                break;
-            }
-            smaller = Link::Slot(next + 1);
-            match_index = bt[next + 1];
-        } else {
-            set_link(bt, larger, match_index);
-            common_larger = match_length;
-            if match_index <= bt_low {
-                larger = Link::Dummy;
-                break;
-            }
-            larger = Link::Slot(next);
-            match_index = bt[next];
+        match links.descend(bt, match_index, next, match_length, lower, bt_low) {
+            Some(child) => match_index = child,
+            None => break,
         }
         nb_compares -= 1;
     }
-    set_link(bt, smaller, 0);
-    set_link(bt, larger, 0);
+    links.close(bt);
 }
 
 /// `ZSTD_DUBT_findBestMatch`.
@@ -709,27 +911,18 @@ fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
     }
 
     // Find the longest match.
-    let mut common_smaller = 0usize;
-    let mut common_larger = 0usize;
+    let run = TreeRun::new::<EXT>(ctx, ip, ctx.iend);
     let mut match_end_idx = curr + 8 + 1;
     let mut best_length = 0usize;
 
     match_index = ms.hash_table[h];
     ms.hash_table[h] = curr;
-    let mut smaller = Link::Slot(2 * (curr & bt_mask) as usize);
-    let mut larger = Link::Slot(2 * (curr & bt_mask) as usize + 1);
-    let bt = &mut ms.chain_table;
+    let mut links = TreeLinks::new(2 * (curr & bt_mask) as usize);
+    let bt = ms.chain_table.as_mut_slice();
 
     while nb_compares > 0 && match_index > window_low {
         let next = 2 * (match_index & bt_mask) as usize;
-        let mut match_length = common_smaller.min(common_larger);
-        let (common, lower) = ctx.tree_step::<S, EXT>(
-            simd,
-            ip + match_length as u32,
-            match_index + match_length as u32,
-            ctx.iend,
-        );
-        match_length += common;
+        let (match_length, lower) = run.step::<S, EXT>(simd, ctx, match_index, links.common());
         if match_length > best_length {
             if match_length as u32 > match_end_idx - match_index {
                 match_end_idx = match_index + match_length as u32;
@@ -741,33 +934,17 @@ fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
                 best_length = match_length;
                 *off_base = offset_to_offbase(curr - match_index);
             }
-            if ip as usize + match_length == ctx.iend as usize {
+            if match_length == run.len() {
                 break;
             }
         }
-        if lower {
-            set_link(bt, smaller, match_index);
-            common_smaller = match_length;
-            if match_index <= bt_low {
-                smaller = Link::Dummy;
-                break;
-            }
-            smaller = Link::Slot(next + 1);
-            match_index = bt[next + 1];
-        } else {
-            set_link(bt, larger, match_index);
-            common_larger = match_length;
-            if match_index <= bt_low {
-                larger = Link::Dummy;
-                break;
-            }
-            larger = Link::Slot(next);
-            match_index = bt[next];
+        match links.descend(bt, match_index, next, match_length, lower, bt_low) {
+            Some(child) => match_index = child,
+            None => break,
         }
         nb_compares -= 1;
     }
-    set_link(bt, smaller, 0);
-    set_link(bt, larger, 0);
+    links.close(bt);
     ms.next_to_update = match_end_idx - 8;
     best_length
 }
@@ -804,6 +981,7 @@ struct Rows<'t, const ROW: usize> {
 impl<'t, const ROW: usize> Rows<'t, ROW> {
     /// Both tables cut to their common number of rows, so one check of a
     /// row number covers both.
+    #[inline(always)]
     fn new(tag_table: &'t mut [u8], hash_table: &'t mut [u32]) -> Self {
         let tags = tag_table.as_chunks_mut::<ROW>().0;
         let slots = hash_table.as_chunks_mut::<ROW>().0;
@@ -837,40 +1015,67 @@ impl<'t, const ROW: usize> Rows<'t, ROW> {
     }
 }
 
-/// `PREFETCH_L1`: hints that `table[index]` will be read soon. The pointer
-/// is only handed to the prefetch instruction, never dereferenced, so a hint
-/// past the table is harmless; targets without one ignore it.
+/// `PREFETCH_L1`: hints that the bytes at `at` will be read soon. The
+/// pointer is only handed to the prefetch instruction, never dereferenced, so
+/// a hint past a table is harmless; targets without one ignore it.
 #[inline(always)]
-fn prefetch_l1<T>(table: &[T], index: usize) {
-    branches::prefetch_read_data::<T, 0>(table.as_ptr().wrapping_add(index));
+fn prefetch_l1(at: *const u8) {
+    branches::prefetch_read_data::<u8, 0>(at);
 }
 
 /// `ZSTD_row_prefetch`: the hash and tag rows of `hash`, the first 64 bytes
 /// of each, plus the hash row's next 64 bytes from 32-slot rows and the tag
 /// row's next 32 bytes for 64-slot rows.
+///
+/// Each row's address is formed once, and the second line of a row is a
+/// constant step from it.
 #[inline(always)]
 fn row_prefetch(tag_table: &[u8], hash_table: &[u32], hash: u32, row_log: u32) {
     let rel_row = ((hash >> ROW_HASH_TAG_BITS) << row_log) as usize;
-    prefetch_l1(hash_table, rel_row);
+    let slots = hash_table.as_ptr().wrapping_add(rel_row).cast::<u8>();
+    prefetch_l1(slots);
     if row_log >= 5 {
-        prefetch_l1(hash_table, rel_row + 16);
+        prefetch_l1(slots.wrapping_add(64));
     }
-    prefetch_l1(tag_table, rel_row);
+    let tags = tag_table.as_ptr().wrapping_add(rel_row);
+    prefetch_l1(tags);
     if row_log == 6 {
-        prefetch_l1(tag_table, rel_row + 32);
+        prefetch_l1(tags.wrapping_add(32));
     }
 }
 
+/// `ZSTD_row_nextIndex` of every head byte for rows of `ROW` slots: the
+/// head steps down from the last slot to slot 1, skipping slot 0, which
+/// holds it. A head left by a different row size is masked first, as the
+/// reference masks it.
+const fn next_index_table<const ROW: usize>() -> [u8; 256] {
+    let row_mask = ROW - 1;
+    let mut table = [0u8; 256];
+    let mut head = 0usize;
+    while head < 256 {
+        let next = head.wrapping_sub(1) & row_mask;
+        table[head] = if next == 0 { row_mask } else { next } as u8;
+        head += 1;
+    }
+    table
+}
+
+/// The next head of a row, by row size.
+struct NextIndex<const ROW: usize>;
+
+impl<const ROW: usize> NextIndex<ROW> {
+    const TABLE: [u8; 256] = next_index_table::<ROW>();
+}
+
 /// `ZSTD_row_nextIndex`: the next slot of a row, which also becomes its head.
+///
+/// One load from a 256-byte table replaces the reference's decrement, mask
+/// and conditional move, whose wrap the compiler would otherwise branch on.
 #[inline(always)]
 fn row_next_index<const ROW: usize>(tag_row: &mut [u8; ROW]) -> usize {
-    let row_mask = ROW as u32 - 1;
-    let mut next = u32::from(tag_row[0]).wrapping_sub(1) & row_mask;
-    if next == 0 {
-        next += row_mask;
-    }
-    tag_row[0] = next as u8;
-    next as usize & (ROW - 1)
+    let next = NextIndex::<ROW>::TABLE[usize::from(tag_row[0])];
+    tag_row[0] = next;
+    usize::from(next) & (ROW - 1)
 }
 
 /// Hash of the row match finder over `bits` bits, salted as the reference's
@@ -918,17 +1123,54 @@ fn row_next_cached_hash<const MLS: u32>(
 /// `ZSTD_row_update_internalImpl` with the hash cache.
 #[inline(always)]
 fn row_update_impl<const MLS: u32, const ROW: usize>(
-    rows: &mut Rows<'_, ROW>,
-    cache: &mut [u32; ROW_HASH_CACHE_SIZE],
+    state: &mut RowState<'_>,
     ctx: &Ctx<'_>,
-    bits: u32,
     start: u32,
     end: u32,
 ) {
-    for idx in start..end {
-        let hash = row_next_cached_hash::<MLS>(cache, ctx, bits, idx);
+    if start >= end {
+        return;
+    }
+    // The words hashed, `ROW_HASH_CACHE_SIZE` positions ahead of each
+    // inserted one, cut once: the reference's index invariants keep them in
+    // the prefix, and each window of the cut is then a word without a check
+    // of its own.
+    let from = start.wrapping_sub(ctx.base) as usize + ROW_HASH_CACHE_SIZE;
+    let words = ctx.src.get(from..from + (end - start) as usize + 7);
+    let Some(words) = words else {
+        return row_update_checked::<MLS, ROW>(state, ctx, start, end);
+    };
+    let bits = state.bits;
+    let cache = &mut *state.cache;
+    let mut rows = Rows::<ROW>::new(state.tags, state.slots);
+    let mut idx = start;
+    for word in words.windows(8) {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+        let new_hash = mem::hash_word::<MLS>(word, bits) as u32;
         // `ZSTD_row_nextCachedHash` prefetches the rows of the hash it
         // caches, 8 positions ahead.
+        rows.prefetch(new_hash);
+        let hash = core::mem::replace(&mut cache[(idx & ROW_HASH_CACHE_MASK) as usize], new_hash);
+        rows.insert(hash, idx);
+        idx = idx.wrapping_add(1);
+    }
+}
+
+/// [`row_update_impl`] reading each word through [`Ctx::hash`], for a
+/// range whose words leave the prefix.
+#[cold]
+#[inline(never)]
+fn row_update_checked<const MLS: u32, const ROW: usize>(
+    state: &mut RowState<'_>,
+    ctx: &Ctx<'_>,
+    start: u32,
+    end: u32,
+) {
+    let bits = state.bits;
+    let cache = &mut *state.cache;
+    let mut rows = Rows::<ROW>::new(state.tags, state.slots);
+    for idx in start..end {
+        let hash = row_next_cached_hash::<MLS>(cache, ctx, bits, idx);
         rows.prefetch(cache[(idx & ROW_HASH_CACHE_MASK) as usize]);
         rows.insert(hash, idx);
     }
@@ -936,62 +1178,142 @@ fn row_update_impl<const MLS: u32, const ROW: usize>(
 
 /// `ZSTD_row_update_internal` with the hash cache.
 #[inline(always)]
-fn row_update<const MLS: u32, const ROW: usize>(
-    rows: &mut Rows<'_, ROW>,
-    cache: &mut [u32; ROW_HASH_CACHE_SIZE],
-    next_to_update: &mut u32,
-    ctx: &Ctx<'_>,
-    bits: u32,
-    ip: u32,
-) {
+fn row_update<const MLS: u32, const ROW: usize>(state: &mut RowState<'_>, ctx: &Ctx<'_>, ip: u32) {
     const SKIP_THRESHOLD: u32 = 384;
     const MAX_MATCH_START_POSITIONS_TO_UPDATE: u32 = 96;
     const MAX_MATCH_END_POSITIONS_TO_UPDATE: u32 = 32;
-    let mut idx = *next_to_update;
+    let mut idx = state.next_to_update;
     let target = ip;
     if target - idx > SKIP_THRESHOLD {
         let bound = idx + MAX_MATCH_START_POSITIONS_TO_UPDATE;
-        row_update_impl::<MLS, ROW>(rows, cache, ctx, bits, idx, bound);
+        row_update_impl::<MLS, ROW>(state, ctx, idx, bound);
         idx = target - MAX_MATCH_END_POSITIONS_TO_UPDATE;
-        let tables = (rows.tags.as_flattened(), rows.slots.as_flattened());
-        row_fill_hash_cache::<MLS>(cache, tables, ctx, bits, idx, i64::from(ip) + 1);
+        let tables = (&*state.tags, &*state.slots);
+        let i_limit = i64::from(ip) + 1;
+        row_fill_hash_cache::<MLS>(state.cache, tables, ctx, state.bits, idx, i_limit);
     }
-    row_update_impl::<MLS, ROW>(rows, cache, ctx, bits, idx, target);
-    *next_to_update = target;
+    row_update_impl::<MLS, ROW>(state, ctx, idx, target);
+    state.next_to_update = target;
+}
+
+/// The row finder's view of the match state for one block: its tables, and
+/// the constants each search would otherwise derive from the parameters.
+struct RowState<'t> {
+    tags: &'t mut [u8],
+    slots: &'t mut [u32],
+    cache: &'t mut [u32; ROW_HASH_CACHE_SIZE],
+    /// `nextToUpdate`, kept here and stored back when the block ends.
+    next_to_update: u32,
+    /// The match state's `nextToUpdate`.
+    ms_next_to_update: &'t mut u32,
+    /// `rowHashLog + ZSTD_ROW_HASH_TAG_BITS`.
+    bits: u32,
+    /// The window's lowest valid index.
+    lowest_valid: u32,
+    /// The longest distance searched: the window size, or no limit once a
+    /// dictionary is loaded (`lowLimit` is then the lowest valid index).
+    max_distance: u32,
+    /// Candidates collected per search (`1 << cappedSearchLog`), at most a
+    /// row.
+    nb_attempts: usize,
+    /// `matchBuffer`, kept across searches so it is never cleared.
+    candidates: [u32; 64],
+}
+
+impl<'t> RowState<'t> {
+    fn new(ms: &'t mut MatchState, ctx: &Ctx<'_>) -> Self {
+        let max_distance = if ms.loaded_dict_end != 0 {
+            u32::MAX
+        } else {
+            1u32 << ms.cparams.window_log
+        };
+        let nb_attempts = 1usize << ms.cparams.search_log.min(ctx.row_log);
+        let bits = ms.row_hash_log + ROW_HASH_TAG_BITS;
+        let lowest_valid = ms.window.low_limit;
+        let rows_len = 1usize << ms.cparams.hash_log;
+        let MatchState {
+            tag_table,
+            hash_table,
+            hash_cache,
+            next_to_update,
+            ..
+        } = ms;
+        Self {
+            tags: aligned_rows(tag_table, rows_len),
+            slots: aligned_rows(hash_table, rows_len),
+            cache: hash_cache,
+            next_to_update: *next_to_update,
+            ms_next_to_update: next_to_update,
+            bits,
+            lowest_valid,
+            max_distance,
+            nb_attempts,
+            candidates: [0; 64],
+        }
+    }
+
+    /// `lowLimit` of a search at `curr` ([`search_low_limit`]).
+    #[inline(always)]
+    const fn low_limit(&self, curr: u32) -> u32 {
+        if curr.wrapping_sub(self.lowest_valid) > self.max_distance {
+            curr - self.max_distance
+        } else {
+            self.lowest_valid
+        }
+    }
+}
+
+/// The first `len` entries of `table` from its first 64-byte boundary, as
+/// the reference places its tables (`ZSTD_cwksp_reserve_aligned64`): a row
+/// of tags or positions then never straddles a cache line, and its vector
+/// load never splits. A table without [`ROW_TABLE_SLACK`] entries to spare
+/// is used from its start.
+///
+/// The view's position in the allocation does not change the frames: a
+/// search reads only the entries the finder wrote since the window's
+/// indices were last invalidated, and every older entry, wherever it lies,
+/// is below `lowLimit` and ends the search as a zero would.
+fn aligned_rows<T>(table: &mut [T], len: usize) -> &mut [T] {
+    const ALIGN: usize = 64;
+    let skip = table.as_ptr().addr().wrapping_neg() % ALIGN / size_of::<T>().max(1);
+    if skip < ROW_TABLE_SLACK && skip + len <= table.len() {
+        &mut table[skip..skip + len]
+    } else {
+        let len = len.min(table.len());
+        &mut table[..len]
+    }
+}
+
+impl Drop for RowState<'_> {
+    fn drop(&mut self) {
+        *self.ms_next_to_update = self.next_to_update;
+    }
 }
 
 /// `ZSTD_RowFindBestMatch`.
 #[inline(always)]
 fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     simd: S,
-    ms: &mut MatchState,
+    state: &mut RowState<'_>,
     ctx: &Ctx<'_>,
     ip: u32,
+    lazy_skipping: bool,
     offset: &mut u32,
 ) -> usize {
     let curr = ip;
-    let low_limit = search_low_limit(ms, curr);
-    let row_log = ROW.trailing_zeros();
-    let capped_search_log = ms.cparams.search_log.min(row_log);
-    let mut nb_attempts = 1u32 << capped_search_log;
-    let bits = ms.row_hash_log + ROW_HASH_TAG_BITS;
-    let lazy_skipping = ms.lazy_skipping;
-    let MatchState {
-        tag_table,
-        hash_table,
-        hash_cache,
-        next_to_update,
-        ..
-    } = ms;
-    let mut rows = Rows::<ROW>::new(tag_table, hash_table);
-
+    let low_limit = state.low_limit(curr);
+    let bits = state.bits;
+    if !lazy_skipping {
+        row_update::<MLS, ROW>(state, ctx, ip);
+    }
+    let rows = Rows::<ROW>::new(state.tags, state.slots);
+    let cache = &mut *state.cache;
     let hash = if !lazy_skipping {
-        row_update::<MLS, ROW>(&mut rows, hash_cache, next_to_update, ctx, bits, ip);
-        let hash = row_next_cached_hash::<MLS>(hash_cache, ctx, bits, curr);
-        rows.prefetch(hash_cache[(curr & ROW_HASH_CACHE_MASK) as usize]);
+        let hash = row_next_cached_hash::<MLS>(cache, ctx, bits, curr);
+        rows.prefetch(cache[(curr & ROW_HASH_CACHE_MASK) as usize]);
         hash
     } else {
-        *next_to_update = curr;
+        state.next_to_update = curr;
         row_hash::<MLS>(ctx, ip, bits)
     };
 
@@ -1003,41 +1325,119 @@ fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     let mut matches = row::match_mask(simd, tag_row, tag, head);
     // Candidates are collected before any is measured, as the reference
     // does: their loads then overlap instead of waiting on each comparison
-    // (one fused pass measured 15-20% slower). At most `ROW - 1` are
-    // collected — slot 0 is the head, never one — which the masked index
-    // states, so the store needs no check.
-    let mut match_buffer = [0u32; ROW];
+    // (one fused pass measured 15-20% slower).
     let mut num_matches = 0usize;
-    while matches != 0 && nb_attempts > 0 {
-        let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
-        matches &= matches - 1;
-        if match_pos == 0 {
-            continue;
+    let buffer = &mut state.candidates;
+    // Window index `i` of the prefix is at `window + i` (`base`); the
+    // pointer only feeds prefetches.
+    let window = ctx.src.as_ptr().wrapping_sub(ctx.base as usize);
+    if state.nb_attempts >= ROW {
+        // At most `ROW - 1` slots match (slot 0 never does), so the
+        // attempts cannot run out and the loop counts only the candidates,
+        // which also stay below the buffer's 64 slots.
+        while matches != 0 {
+            let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
+            matches &= matches - 1;
+            let match_index = slot_row[match_pos];
+            if match_index < low_limit {
+                break;
+            }
+            // `PREFETCH_L1(base + matchIndex)`: the candidates' bytes load
+            // while the rest are collected.
+            prefetch_l1(window.wrapping_add(match_index as usize));
+            buffer[num_matches & 63] = match_index;
+            num_matches += 1;
         }
-        let match_index = slot_row[match_pos];
-        if match_index < low_limit {
-            break;
+    } else {
+        // Fewer attempts than a row has slots, all within the buffer.
+        let nb_attempts = state.nb_attempts;
+        while matches != 0 && num_matches < nb_attempts {
+            let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
+            matches &= matches - 1;
+            let match_index = slot_row[match_pos];
+            if match_index < low_limit {
+                break;
+            }
+            prefetch_l1(window.wrapping_add(match_index as usize));
+            buffer[num_matches & 63] = match_index;
+            num_matches += 1;
         }
-        match_buffer[num_matches & (ROW - 1)] = match_index;
-        num_matches += 1;
-        nb_attempts -= 1;
     }
-    let num_matches = num_matches.min(ROW);
 
     // Insert the current position too.
     {
         let pos = row_next_index(tag_row);
         tag_row[pos] = tag;
-        slot_row[pos] = *next_to_update;
-        *next_to_update += 1;
+        slot_row[pos] = state.next_to_update;
+        state.next_to_update += 1;
     }
 
-    let candidates = &match_buffer[..num_matches];
+    let candidates = &state.candidates[..num_matches.min(64)];
     if ctx.ext {
         best_candidate::<S, true>(simd, ctx, ip, candidates, offset)
     } else {
-        best_candidate::<S, false>(simd, ctx, ip, candidates, offset)
+        best_prefix_candidate(simd, ctx, ip, candidates, offset)
     }
+}
+
+/// [`best_candidate`] without an external dictionary: every candidate is a
+/// prefix index below `ip`.
+///
+/// The best length's probe word is compared against `hay`, the prefix
+/// shifted by that length, so a candidate costs one load and one check; a
+/// candidate that shares it is measured with its first word inline.
+#[inline(always)]
+fn best_prefix_candidate<S: Simd>(
+    simd: S,
+    ctx: &Ctx<'_>,
+    ip: u32,
+    candidates: &[u32],
+    offset: &mut u32,
+) -> usize {
+    let src = ctx.src;
+    let base = ctx.base;
+    // The block may end before the prefix does (long distance matching
+    // runs the finder on parts of a block), and no match runs past it.
+    let current = src
+        .get((ip - base) as usize..(ctx.iend - base) as usize)
+        .unwrap_or_default();
+    // The searched position is at least 16 bytes before the block's end
+    // (`ilimit`); a shorter tail takes the general loop.
+    let Some(first) = current.first_chunk::<8>() else {
+        return best_candidate::<S, false>(simd, ctx, ip, candidates, offset);
+    };
+    let first = u64::from_le_bytes(*first);
+    let mut ml: usize = 4 - 1;
+    // `current[ml - 3..ml + 1]`, and `hay[i]` is `src[i + ml - 3]`.
+    let mut word = first as u32;
+    let mut hay = src;
+    for &match_index in candidates {
+        let at = match_index.wrapping_sub(base) as usize;
+        match hay.get(at..at + 4) {
+            Some(bytes) if u32::from_le_bytes(bytes.try_into().unwrap_or_default()) == word => {}
+            _ => continue,
+        }
+        let current_ml = match src.get(at..at + 8) {
+            Some(y) => match first ^ u64::from_le_bytes(y.try_into().unwrap_or_default()) {
+                0 => count::common_run(simd, current, &src[at..]),
+                difference => (difference.trailing_zeros() >> 3) as usize,
+            },
+            None => count::common_run(simd, current, &src[at..]),
+        };
+        if current_ml > ml {
+            ml = current_ml;
+            *offset = offset_to_offbase(ip - match_index);
+            // A match below the tail's length leaves the bytes of the next
+            // probe word in it.
+            let (Some(next), Some(next_hay)) = (current.get(ml - 3..ml + 1), src.get(ml - 3..))
+            else {
+                break;
+            };
+            word = u32::from_le_bytes(next.try_into().unwrap_or_default());
+            hay = next_hay;
+        }
+    }
+    ml
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,7 +1473,6 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
         ms.cparams.search_log.clamp(4, 6),
         false,
     );
-    let read32 = |p: i64| ctx.word(p as u32);
     let count = |a: i64, b: i64| ctx.count(simd, a as u32, b as u32);
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
@@ -1096,9 +1495,9 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
             offset_1 = 0;
         }
     }
-    ms.lazy_skipping = false;
-    let next = ms.next_to_update;
-    M::fill_cache(ms, &ctx, next, ilimit);
+    let mut lazy_skipping = false;
+    let mut state = M::state(ms, &ctx);
+    M::fill_cache(&mut state, &ctx, ilimit);
 
     while ip < ilimit {
         let mut match_length = 0usize;
@@ -1106,7 +1505,7 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
         let mut start = ip + 1;
         let mut store_now = false;
 
-        if offset_1 > 0 && read32(ip + 1 - i64::from(offset_1)) == read32(ip + 1) {
+        if offset_1 > 0 && ctx.repeats((ip + 1) as u32, offset_1) {
             match_length = count(ip + 1 + 4, ip + 1 + 4 - i64::from(offset_1)) + 4;
             if DEPTH == 0 {
                 store_now = true;
@@ -1115,7 +1514,7 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
 
         if !store_now {
             let mut found = NO_OFFBASE;
-            let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut found);
+            let ml2 = M::find(simd, &mut state, &ctx, ip as u32, lazy_skipping, &mut found);
             if ml2 > match_length {
                 match_length = ml2;
                 start = ip;
@@ -1125,17 +1524,14 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
             if match_length < 4 {
                 let step = ((ip - anchor) >> SEARCH_STRENGTH) as usize + 1;
                 ip += step as i64;
-                ms.lazy_skipping = step > LAZY_SKIPPING_STEP;
+                lazy_skipping = step > LAZY_SKIPPING_STEP;
                 continue;
             }
 
             if DEPTH >= 1 {
                 while ip < ilimit {
                     ip += 1;
-                    if off_base != 0
-                        && offset_1 > 0
-                        && read32(ip) == read32(ip - i64::from(offset_1))
-                    {
+                    if off_base != 0 && offset_1 > 0 && ctx.repeats(ip as u32, offset_1) {
                         let ml_rep = count(ip + 4, ip + 4 - i64::from(offset_1)) + 4;
                         let gain2 = (ml_rep * 3) as i32;
                         let gain1 = gain(match_length, 3, off_base, 1);
@@ -1147,7 +1543,14 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
                     }
                     {
                         let mut candidate = NO_OFFBASE;
-                        let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut candidate);
+                        let ml2 = M::find(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
                         let gain2 = gain(ml2, 4, candidate, 0);
                         let gain1 = gain(match_length, 4, off_base, 4);
                         if ml2 >= 4 && gain2 > gain1 {
@@ -1159,10 +1562,7 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
                     }
                     if DEPTH == 2 && ip < ilimit {
                         ip += 1;
-                        if off_base != 0
-                            && offset_1 > 0
-                            && read32(ip) == read32(ip - i64::from(offset_1))
-                        {
+                        if off_base != 0 && offset_1 > 0 && ctx.repeats(ip as u32, offset_1) {
                             let ml_rep = count(ip + 4, ip + 4 - i64::from(offset_1)) + 4;
                             let gain2 = (ml_rep * 4) as i32;
                             let gain1 = gain(match_length, 4, off_base, 1);
@@ -1173,7 +1573,14 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
                             }
                         }
                         let mut candidate = NO_OFFBASE;
-                        let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut candidate);
+                        let ml2 = M::find(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
                         let gain2 = gain(ml2, 4, candidate, 0);
                         let gain1 = gain(match_length, 4, off_base, 7);
                         if ml2 >= 4 && gain2 > gain1 {
@@ -1210,21 +1617,22 @@ fn lazy_generic<S: Simd, M: Search, const DEPTH: u32>(
         );
         ip = start + match_length as i64;
         anchor = ip;
-        if ms.lazy_skipping {
-            let next = ms.next_to_update;
-            M::fill_cache(ms, &ctx, next, ilimit);
-            ms.lazy_skipping = false;
+        if lazy_skipping {
+            M::fill_cache(&mut state, &ctx, ilimit);
+            lazy_skipping = false;
         }
 
-        while ip <= ilimit && offset_2 > 0 && read32(ip) == read32(ip - i64::from(offset_2)) {
+        while ip <= ilimit && offset_2 > 0 && ctx.repeats(ip as u32, offset_2) {
             let ml = count(ip + 4, ip + 4 - i64::from(offset_2)) + 4;
             core::mem::swap(&mut offset_1, &mut offset_2);
-            seq_store.store_seq(&[], repcode_to_offbase(1), ml);
+            seq_store.store_seq_only(0, repcode_to_offbase(1), ml);
             ip += ml as i64;
             anchor = ip;
         }
     }
 
+    drop(state);
+    ms.lazy_skipping = lazy_skipping;
     offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
         offset_saved1
     } else {
@@ -1274,8 +1682,18 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     // A repeat-offset candidate at `rep_index` for position `curr`.
-    let rep_ok = |ms: &MatchState, curr: u32, offset: u32| {
-        let window_low = ms.lowest_match_index(curr, window_log);
+    let (lowest_valid, dict_loaded) = (ms.window.low_limit, ms.loaded_dict_end != 0);
+    // `ZSTD_getLowestMatchIndex`.
+    let lowest_match_index = move |curr: u32| {
+        let max_distance = 1u32 << window_log;
+        if dict_loaded || curr.wrapping_sub(lowest_valid) <= max_distance {
+            lowest_valid
+        } else {
+            curr - max_distance
+        }
+    };
+    let rep_ok = |curr: u32, offset: u32| {
+        let window_low = lowest_match_index(curr);
         let rep_index = curr.wrapping_sub(offset);
         let overlap_ok = dict_limit.wrapping_sub(1).wrapping_sub(rep_index) >= 3;
         if overlap_ok
@@ -1288,12 +1706,12 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
         }
     };
 
-    ms.lazy_skipping = false;
+    let mut lazy_skipping = false;
     let mut ip = istart;
     let mut anchor = istart;
     ip += i64::from(ip == prefix_start);
-    let next = ms.next_to_update;
-    M::fill_cache(ms, &ctx, next, ilimit);
+    let mut state = M::state(ms, &ctx);
+    M::fill_cache(&mut state, &ctx, ilimit);
 
     while ip < ilimit {
         let mut match_length = 0usize;
@@ -1302,7 +1720,7 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
         let mut curr = ip as u32;
         let mut store_now = false;
 
-        if let Some(length) = rep_ok(ms, curr + 1, offset_1) {
+        if let Some(length) = rep_ok(curr + 1, offset_1) {
             match_length = length;
             if DEPTH == 0 {
                 store_now = true;
@@ -1311,7 +1729,14 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
 
         if !store_now {
             let mut candidate = NO_OFFBASE;
-            let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut candidate);
+            let ml2 = M::find(
+                simd,
+                &mut state,
+                &ctx,
+                ip as u32,
+                lazy_skipping,
+                &mut candidate,
+            );
             if ml2 > match_length {
                 match_length = ml2;
                 start = ip;
@@ -1320,7 +1745,7 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
             if match_length < 4 {
                 let step = ((ip - anchor) >> SEARCH_STRENGTH) as usize;
                 ip += step as i64 + 1;
-                ms.lazy_skipping = step > LAZY_SKIPPING_STEP;
+                lazy_skipping = step > LAZY_SKIPPING_STEP;
                 continue;
             }
             if DEPTH >= 1 {
@@ -1328,7 +1753,7 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
                     ip += 1;
                     curr += 1;
                     if off_base != 0
-                        && let Some(rep_length) = rep_ok(ms, curr, offset_1)
+                        && let Some(rep_length) = rep_ok(curr, offset_1)
                     {
                         let gain2 = (rep_length * 3) as i32;
                         let gain1 = gain(match_length, 3, off_base, 1);
@@ -1340,7 +1765,14 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
                     }
                     {
                         let mut candidate = NO_OFFBASE;
-                        let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut candidate);
+                        let ml2 = M::find(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
                         let gain2 = gain(ml2, 4, candidate, 0);
                         let gain1 = gain(match_length, 4, off_base, 4);
                         if ml2 >= 4 && gain2 > gain1 {
@@ -1354,7 +1786,7 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
                         ip += 1;
                         curr += 1;
                         if off_base != 0
-                            && let Some(rep_length) = rep_ok(ms, curr, offset_1)
+                            && let Some(rep_length) = rep_ok(curr, offset_1)
                         {
                             let gain2 = (rep_length * 4) as i32;
                             let gain1 = gain(match_length, 4, off_base, 1);
@@ -1365,7 +1797,14 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
                             }
                         }
                         let mut candidate = NO_OFFBASE;
-                        let ml2 = M::find(simd, ms, &ctx, ip as u32, &mut candidate);
+                        let ml2 = M::find(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
                         let gain2 = gain(ml2, 4, candidate, 0);
                         let gain1 = gain(match_length, 4, off_base, 7);
                         if ml2 >= 4 && gain2 > gain1 {
@@ -1407,22 +1846,23 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
         );
         ip = start + match_length as i64;
         anchor = ip;
-        if ms.lazy_skipping {
-            let next = ms.next_to_update;
-            M::fill_cache(ms, &ctx, next, ilimit);
-            ms.lazy_skipping = false;
+        if lazy_skipping {
+            M::fill_cache(&mut state, &ctx, ilimit);
+            lazy_skipping = false;
         }
 
         while ip <= ilimit {
-            let Some(ml) = rep_ok(ms, ip as u32, offset_2) else {
+            let Some(ml) = rep_ok(ip as u32, offset_2) else {
                 break;
             };
             core::mem::swap(&mut offset_1, &mut offset_2);
-            seq_store.store_seq(&[], repcode_to_offbase(1), ml);
+            seq_store.store_seq_only(0, repcode_to_offbase(1), ml);
             ip += ml as i64;
             anchor = ip;
         }
     }
+    drop(state);
+    ms.lazy_skipping = lazy_skipping;
     rep[0] = offset_1;
     rep[1] = offset_2;
     (iend - anchor) as usize
@@ -1476,11 +1916,146 @@ mod tests {
     use super::super::advanced_tests;
     use super::super::cctx::{Engine, RequestedParams};
     use super::super::compress_once;
-    use super::super::params::{ParamSwitch, Strategy};
+    use super::super::params::{ParamSwitch, Strategy, level_cparams};
     use super::super::stream::{EndOp, Stream};
+    use super::*;
     use crate::Backend;
     use zstd_ffi::corpus;
     use zstd_ffi::oracle::{self, Directive, Params};
+
+    /// A prefix-only block over `bytes`, starting at window index 2.
+    fn prefix_block(bytes: &[u8]) -> BlockInput<'_> {
+        BlockInput {
+            window: mem::Window {
+                prefix: Mem::new(bytes, 2),
+                ext: Mem::new(&[], 2),
+            },
+            start: 2,
+            end: 2 + bytes.len() as u32,
+            backend: Backend::default(),
+        }
+    }
+
+    #[test]
+    fn next_index_tables_follow_the_reference() {
+        fn check<const ROW: usize>() {
+            let mask = ROW as u32 - 1;
+            for head in 0..=255u8 {
+                let mut row = [0u8; ROW];
+                row[0] = head;
+                let next = u32::from(head).wrapping_sub(1) & mask;
+                let expected = if next == 0 { mask } else { next };
+                assert_eq!(row_next_index(&mut row), expected as usize, "{ROW} {head}");
+                assert_eq!(u32::from(row[0]), expected);
+            }
+            // Built at run time too, not only into the constant.
+            assert_eq!(next_index_table::<ROW>(), NextIndex::<ROW>::TABLE);
+        }
+        check::<16>();
+        check::<32>();
+        check::<64>();
+    }
+
+    #[test]
+    fn row_tables_start_at_a_cache_line() {
+        let mut slots = vec![0u32; 1024 + ROW_TABLE_SLACK];
+        let view = aligned_rows(&mut slots, 1024);
+        assert_eq!(view.len(), 1024);
+        assert_eq!(view.as_ptr().addr() % 64, 0);
+        let mut tags = vec![0u8; 512 + ROW_TABLE_SLACK];
+        let view = aligned_rows(&mut tags, 512);
+        assert_eq!(view.len(), 512);
+        assert_eq!(view.as_ptr().addr() % 64, 0);
+        // Without room to move, a table is used from its start.
+        let mut short = vec![0u8; 100];
+        let start = short.as_ptr();
+        assert_eq!(aligned_rows(&mut short, 200).as_ptr(), start);
+        assert_eq!(aligned_rows(&mut short, 200).len(), 100);
+    }
+
+    /// The per-index fallback of a row update inserts exactly what the
+    /// word loop inserts.
+    #[test]
+    fn checked_row_updates_insert_like_the_word_loop() {
+        fn check<const MLS: u32, const ROW: usize>(bytes: &[u8]) {
+            let block = prefix_block(bytes);
+            let row_log = ROW.trailing_zeros();
+            let mut cparams = level_cparams(6, u64::MAX);
+            cparams.search_log = row_log;
+            cparams.min_match = MLS;
+            let ctx = Ctx::new(&block, MLS, row_log, false);
+            let mut fast = MatchState::new(cparams, ParamSwitch::Enable);
+            let mut checked = MatchState::new(cparams, ParamSwitch::Enable);
+            for (ms, by_index) in [(&mut fast, false), (&mut checked, true)] {
+                let mut state = RowState::new(ms, &ctx);
+                for (start, end) in [(12, 300), (300, 301), (301, 2000)] {
+                    if by_index {
+                        row_update_checked::<MLS, ROW>(&mut state, &ctx, start, end);
+                    } else {
+                        row_update_impl::<MLS, ROW>(&mut state, &ctx, start, end);
+                    }
+                }
+            }
+            // Each state's rows start where its own allocation aligns.
+            let rows = |ms: &mut MatchState| {
+                let len = 1usize << ms.cparams.hash_log;
+                let tags = aligned_rows(&mut ms.tag_table, len).to_vec();
+                (tags, aligned_rows(&mut ms.hash_table, len).to_vec())
+            };
+            assert!(rows(&mut fast) == rows(&mut checked), "{MLS} {ROW}");
+            assert_eq!(fast.hash_cache, checked.hash_cache, "{MLS} {ROW}");
+        }
+        let bytes = corpus::text(4096, 61);
+        check::<4, 16>(&bytes);
+        check::<5, 32>(&bytes);
+        check::<6, 64>(&bytes);
+    }
+
+    /// The per-index fallback of a tree update inserts exactly what the
+    /// word loop inserts.
+    #[test]
+    fn checked_tree_updates_insert_like_the_word_loop() {
+        let bytes = corpus::text(4096, 62);
+        let block = prefix_block(&bytes);
+        let cparams = level_cparams(13, u64::MAX);
+        let ctx = Ctx::new(&block, 5, 4, false);
+        let mut fast = MatchState::new(cparams, ParamSwitch::Disable);
+        let mut checked = MatchState::new(cparams, ParamSwitch::Disable);
+        fast.next_to_update = 12;
+        update_dubt::<5>(&mut fast, &ctx, 3000);
+        update_dubt::<5>(&mut fast, &ctx, 3000);
+        update_dubt_checked::<5>(&mut checked, &ctx, 12, 3000);
+        assert_eq!(fast.next_to_update, 3000);
+        assert!(fast.hash_table == checked.hash_table);
+        assert!(fast.chain_table == checked.chain_table);
+    }
+
+    /// A tree step in the prefix measures and orders runs as the
+    /// external-dictionary step does, from any known common length.
+    #[test]
+    fn prefix_tree_steps_match_the_general_step() {
+        let mut bytes = corpus::text(600, 63);
+        bytes.extend_from_within(..300);
+        let block = prefix_block(&bytes);
+        let end = block.end;
+        for backend in Backend::available() {
+            fearless_simd::dispatch!(backend.0, simd => {
+                let ctx = Ctx::new(&block, 4, 4, false);
+                for (curr, limit) in [(602, end), (650, end), (700, 720)] {
+                    let prefix = TreeRun::new::<false>(&ctx, curr, limit);
+                    let general = TreeRun::new::<true>(&ctx, curr, limit);
+                    for m in 2..curr {
+                        let (full, _) = general.step::<_, true>(simd, &ctx, m, 0);
+                        for known in [0usize, 1, 7, 8, 9, 30].map(|k| k.min(full)) {
+                            let expected = general.step::<_, true>(simd, &ctx, m, known);
+                            let got = prefix.step::<_, false>(simd, &ctx, m, known);
+                            assert_eq!(got, expected, "{backend} {curr} {m} {known}");
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     /// The reference's parameters for `requested`, row finder switch
     /// included.

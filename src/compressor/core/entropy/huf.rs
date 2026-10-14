@@ -591,20 +591,24 @@ impl<'a> HufWriter<'a> {
 
     /// `HUF_flushBits`: writes the pending whole bytes of the first
     /// container. With `FAST` the destination is known to hold the whole
-    /// stream (`HUF_tightCompressBound`), so the position needs no clamp.
+    /// stream (`HUF_tightCompressBound`), so the position never passes the
+    /// end. Otherwise, past the end the bytes land at it, as the reference's
+    /// clamped position puts them, and the overflow surfaces in
+    /// [`Self::close`]: the position only grows, so once past the end it
+    /// stays there. Writing at the smaller of the two also lets the store
+    /// go without a bounds check.
     #[inline(always)]
     fn flush<const FAST: bool>(&mut self) {
         let nb_bits = (self.bit_pos[0] & 0xFF) as u32;
         let nb_bytes = (nb_bits >> 3) as usize;
         let bits = self.container[0].wrapping_shr(HUF_CONTAINER_BITS.wrapping_sub(nb_bits));
         self.bit_pos[0] &= 7;
-        debug_assert!(self.pos <= self.end);
-        self.dst[self.pos..self.pos + 8].copy_from_slice(&bits.to_le_bytes());
+        let at = self.pos.min(self.end);
+        if let Some(window) = self.dst.get_mut(at..at + 8) {
+            window.copy_from_slice(&bits.to_le_bytes());
+        }
         self.pos += nb_bytes;
         debug_assert!(!FAST || self.pos <= self.end);
-        if !FAST && self.pos > self.end {
-            self.pos = self.end;
-        }
     }
 
     /// `HUF_closeCStream`: adds the end mark and returns the stream size, or

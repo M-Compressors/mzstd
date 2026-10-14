@@ -400,9 +400,11 @@ impl Executor<'_, '_> {
             if offset >= 32 {
                 // The first chunk here, where the room test above bounds
                 // it; most matches need no other.
-                let src = lit_end - offset;
-                let chunk: [u8; 32] = self.out[src..src + 32].try_into().unwrap_or([0; 32]);
-                self.out[lit_end..lit_end + 32].copy_from_slice(&chunk);
+                // The history ends at the literals' end, so its last
+                // `offset` bytes hold the whole chunk.
+                let (history, tail) = self.out.split_at_mut(lit_end);
+                let source = &history[lit_end - offset..];
+                tail[..32].copy_from_slice(&source[..32]);
                 if match_length > 32 {
                     wildcopy_match(
                         simd,
@@ -596,9 +598,11 @@ impl SequenceTables {
         // The last sequence leaves the states alone; peeling it keeps that
         // test out of the loop. Callers handle empty sections themselves.
         debug_assert!(count > 0);
-        for _ in 1..count {
+        let mut left = count - 1;
+        while left != 0 {
             let sequence = decoder.decode(false)?;
             executor.execute(simd, copy, sequence)?;
+            left -= 1;
         }
         let sequence = decoder.decode(true)?;
         executor.execute(simd, copy, sequence)?;

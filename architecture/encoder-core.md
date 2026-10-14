@@ -211,17 +211,36 @@ sequenceDiagram
   extDict pick one function pointer, chosen once per block outside the
   finder's inner loop.
 - `seq_store` holds sequences in the reference's `SeqDef` form (offBase, a
-  16-bit literal length and match length with one "long length" escape) and
-  converts them to codes (`fill_codes`).
+  16-bit literal length and match length with one "long length" escape).
+  `fill_codes(backend)` is one pass, dispatched once per block, that turns
+  them into codes: one four-byte `SeqCodes` per sequence (the three FSE
+  codes and the sequence's extra-bit count) and, in the same loop, the three
+  code histograms (`CodeCounts`) that `ZSTD_buildSequencesStatistics`
+  counts with three `HIST_countFast_wksp` passes. The long-length escape is
+  patched afterwards for its one sequence, counts included. The codes buffer
+  only grows and every entry below `nb_seq` is written before it is read.
+  It is kept at four bytes a sequence on purpose: a 16-byte record holding
+  precomputed extra bits pushed a cold one-shot call's peak heap past
+  glibc's dynamic trim threshold, so every call returned and re-faulted
+  about 2.7 MB (text-1m level 3 went from 0.69 ms to 1.03 ms).
 - `entropy` is the reference's FSE and Huffman encoders: histogram counting,
   normalization, table building, the cost estimates used to choose between
   predefined, repeat, RLE and new tables, and the backward bit streams.
   - `hist::count` counts inputs below 1500 bytes straight into the caller's
     table (`HIST_count_simple`) and larger ones with four interleaved
-    tables (`HIST_count_parallel_wksp`).
+    tables (`HIST_count_parallel_wksp`). It counts literals (and the
+    optimal parser's and FSE weights' inputs); sequence code histograms
+    come from `fill_codes`, read through `code_histogram`, which reports
+    the largest code and count as `HIST_countFast_wksp` does.
   - `fse::CTable::build` takes the reference's branch-light spread when no
     symbol has the low-probability count, and sizes its scratch to the
-    largest table it holds.
+    largest table it holds. Its state-table and spread loops mask indices
+    (symbols below 64, positions below 512), which removes their bounds
+    checks without changing any index.
+  - `BitWriter` and the Huffman writer store each flushed word at
+    `min(pos, end)` and leave `pos` unclamped; `close` reports "does not
+    fit" when `pos` passed `end`, the reference's clamp result, while the
+    store needs no bounds check.
   - `huf` packs each code with its length (`HUF_CElt`, built per call for
     the symbols the table describes) and encodes with the reference's
     two-container, unrolled loop, whose shape depends on the table log and
@@ -231,8 +250,15 @@ sequenceDiagram
     Each subsequent depth trial restores leaf lengths from the unchanged
     internal-node heights before applying the reference's height limit;
     table pricing, tie order and the selected depth are unchanged.
-  - `sequences::encode` walks the codes with zipped iterators and masked
-    table indices.
+  - `sequences::encode` walks codes and sequences backwards together. Each
+    sequence's extra bits are assembled into one word (literal length,
+    match length, offset, from the least significant bit; `SeqCodes::extra`)
+    and added with one write when they number fewer than 31, the
+    reference's own bound; otherwise the word is flushed in two parts.
+    Flushes only move whole bytes out of the container, so where they fall
+    does not change the stream; `fused_encoding_matches_the_reference_loop`
+    checks every backend against a step-by-step port of
+    `ZSTD_encodeSequences_body`.
 - `literals::try_compress` reports a raw-literals fallback without copying
   it. If those raw bytes alone reach `block_size - min_gain`, entropy coding
   returns the raw-block decision immediately. This shortcut requires a
@@ -246,6 +272,17 @@ sequenceDiagram
 - After a block, `prev` and `next` swap (`confirm_block_state`) unless the
   block was stored raw or RLE, which keeps the previous entropy tables and
   demotes repeat-mode state as the reference does.
+
+```mermaid
+flowchart LR
+    MF[match finder] --> SS["SeqStore {sequences, literals}"]
+    SS --> FC["fill_codes(backend): codes + extra-bit counts + CodeCounts, one pass"]
+    FC --> ST["build_statistics: code_histogram -> select_encoding_type / build_ctable"]
+    FC --> EN["sequences::encode: codes + sequences -> extra-bit word, FSE states"]
+    ST --> EN
+    SS --> LIT["literals: hist::count, Huffman"]
+    FC --> SB["split_block: extra bits from histograms x extra bits per code"]
+```
 
 ## Backend dispatch
 
@@ -295,34 +332,55 @@ reference's templates are:
 - one instance per minimum match length (`ZSTD_GEN_FAST_FN`,
   `ZSTD_GEN_DFAST_FN`), so the hash width is a constant (`mem::hash_word`,
   `mem::hash_at`);
-- positions are offsets into the block's prefix slice and the reference's
-  `base` is the prefix's first index, so a read is one fixed-width load
-  (`mem::load32`, `mem::load64`) with a single bound test;
-- no-dictionary candidates are read from the searchable history slice with
-  `mem::matches32` / `matches64`. Wrapping subtraction of the lower window
-  index turns a stale entry into an out-of-range offset, so one fallible
-  word read checks both the lower limit and the end of the readable input;
-- hash indices are masked with `len - 1` after an up-front non-empty
-  assertion; this bounds the index, although the compiler can retain a
-  comparison when a masked value passes through the search loop's state;
-- the fast loop keeps only `ip0` and `ip2` of the reference's
-  `ip0..ip3` pipeline (`ip1 = ip0 + 1`, `ip3 = ip2 + 1` at every probe),
-  and reads both probed positions of each through a nine-byte window
-  (`mem::window9`, `mem::window_word`): `ip2`'s window becomes the next
-  `ip0`'s, so one bound test per step covers every hash and compare at
-  the probes;
+- `compress_block_mls` handles the repeat-offset setup and the
+  saved-offset restore, then calls `compress_scan::<S, MLS, IN_PREFIX>`
+  with a small `Scan` (dfast also a `Tables { long, small }`), which
+  returns the trailing literals and the two repeat offsets;
+- `IN_PREFIX` holds when the block starts in the prefix and both repeat
+  offsets reach no further back than the prefix start from the block's
+  first position. Every later repeat offset is then `ip - match` with the
+  match in the prefix, so no read can go below the prefix: positions
+  become offsets from the prefix start and the search loop drops the window
+  base, the history pointer and its length. Otherwise the base-relative
+  loop runs (`IN_PREFIX = false`);
+- candidates are tested without a branch on their validity
+  (`mem::matches32` / `matches64`, the reference's
+  `ZSTD_match4Found_cmov` / `ZSTD_selectAddr`): an out-of-prefix or stale
+  candidate reads a stand-in word chosen by the probed word's low bit
+  (`DUMMIES`), which can never equal it, so only the equality compare
+  branches. Stale and valid entries are about equally likely, which made
+  the validity branch the finder's main source of mispredictions;
+- the loops hold `&Cell<u32>` references to the hash slots they will write,
+  which removes the bounds check on a table index carried across
+  iterations;
+- the exit tests share their bounds checks with the loads they guard:
+  fast fetches the window at `ip2` with one 10-byte range check that is
+  also its `ip2 + 1 < ilimit` test (`mem::probe_window`, `probe_pair`),
+  dfast's 8-byte load at `ip1` (`mem::try_load64`) is its `ip1 <= ilimit`
+  test;
+- after a match, fast extends backwards without per-byte checks
+  (`mem::common_suffix`), compares the first word of the forward length
+  inline (`mem::count_at_simd`), and reads `ip0 - 2` once for both the
+  hash insert and the first repcode compare;
 - the extDict variants use the same prefix offsets, reading only
   candidates below the prefix from the external segment by window index;
-- dfast loads each searched position's eight bytes once and derives both
-  hashes, the 4- and 8-byte compares and the repcode compare at `ip + 1`
-  from that word;
 - literals go to the sequence store through `SeqStore::store_seq_from`,
   which copies a run of at most 16 bytes as one fixed chunk
   (`ZSTD_copy16`) and cuts the excess.
 
-The reference's branchless candidate test for windows below 512 KiB
-(`ZSTD_match4Found_cmov`) is not ported: a masked-select version measured
-slower here. Both forms accept the same candidates.
+```mermaid
+flowchart TD
+    A[compress_block_mls: rep offsets, saved offsets] --> B{block in prefix and reps within it?}
+    B -- yes --> C["compress_scan::<S, MLS, true>: offsets from the prefix start"]
+    B -- no --> D["compress_scan::<S, MLS, false>: offsets from the window base"]
+    C --> E[probe: hash slots as Cell refs, window load = exit test]
+    D --> E
+    E --> F{"candidate word == probed word? (stand-in word if invalid)"}
+    F -- no --> E
+    F -- yes --> G[extend back, count forward, store_seq_from, insert hashes, repcode loop]
+    G --> E
+    E -- window load fails --> H[trailing literals, rep offsets]
+```
 
 Match lengths (`mem::count_slices`, behind `Mem::count`/`count_with`)
 compare the first word inline with an XOR and a trailing-zero count. Out of
@@ -400,6 +458,45 @@ lets the candidates' loads overlap. Row tables are viewed as
 `&mut [[u8; ROW]]` and `&mut [[u32; ROW]]`, cut to a common row count, so
 one check of the row number covers both and slot indexes are masked.
 
+Per block the parser builds the search's state (`Search::State<'t>`, from
+`Search::state(ms, ctx)`) and keeps `lazy_skipping` locally, storing it
+back into the match state at the block's end. The row finder's `RowState`
+holds:
+
+- the tag and slot tables viewed from their first 64-byte boundary
+  (`aligned_rows`). `MatchState` gives both tables `ROW_TABLE_SLACK` (64)
+  extra entries in row mode. glibc returns large blocks 16 bytes past a
+  page, so unaligned, half of the 32-byte tag rows crossed a cache line and
+  every 128-byte slot row spanned three; the reference's workspace aligns
+  them to 64 bytes. Moving the view cannot change a frame: a search only
+  follows entries written since indices were last invalidated, and older
+  ones fall below `lowLimit` and end the walk as zeros would;
+- the hash cache, a local `next_to_update` written back on `Drop`, the
+  precomputed hash bits, low-limit inputs and number of attempts;
+- a persistent 64-entry candidate buffer, so no row-sized array is zeroed
+  per search.
+
+The update loop cuts the words once for the whole range and walks them with
+`windows(8)` (a cold per-index fallback covers the end), and steps the row
+head through a 256-entry constant table per row size instead of the wrap the
+compiler turned into a branch. The tag mask clears slot 0 before rotating, so
+collection has no per-candidate head test, and when the attempts reach the
+row size the loop keeps no attempts counter. Each collected candidate is
+prefetched (`PREFETCH_L1(base + matchIndex)`), as the reference does.
+`best_prefix_candidate` measures prefix candidates: the probe word is
+compared against a prefix slice shifted by the best length, the first eight
+bytes inline, stopping when the next probe word would leave the block.
+
+btlazy2's DUBT inserts nodes from one cut word slice and writes each node
+pair in one store. Prefix tree walks use `TreeRun`, which cuts the run once
+and counts up to four words inline, ordering the runs with a byte-swapped
+compare; longer runs continue in `long_tree_step`, out of line, with the
+vector scan (word-at-a-time counting of run-length input, whose matches span
+whole blocks, made levels 13-15 on 1 MiB of repeated bytes 18% slower); `TreeLinks` picks the side with `select_unpredictable` (the side
+is close to a coin flip) and writes the dummy link to a `NO_LINK` sentinel,
+so its write check doubles as the bounds check. ExtDict walks use
+`Ctx::ext_tree_step`.
+
 ```mermaid
 flowchart TD
     A[row_find_best_match ip] --> B{lazy skipping?}
@@ -409,9 +506,10 @@ flowchart TD
     D --> F[match_mask: SIMD tag compare, rotate by head]
     E --> F
     F --> G[collect slots newest first, skip slot 0, stop below low_limit or after nb_attempts]
-    G --> H[insert ip into its row]
+    G --> P[prefetch each candidate]
+    P --> H[insert ip into its row]
     H --> I{ext window?}
-    I -- no --> J["best_candidate::<S, false>: Probe word test, count"]
+    I -- no --> J["best_prefix_candidate: shifted probe word, first 8 bytes inline, count"]
     I -- yes --> K["best_candidate::<S, true>: extDict candidates via count_2segments"]
     J --> L[ml, offset]
     K --> L
@@ -532,19 +630,28 @@ buffers are always large enough) into `EncodeError::Internal`.
   optimal parser and LDM use native-vector kernels (`opt_count`). The entropy
   coders run in the backend's feature context without explicit vector code.
   Histogram counting is scalar. Output is identical on every backend.
-- The [2026-10-14 benchmarks](../docs/benchmarks/encoder-comparison.md)
-  measure a median 1.000x the reference across all 192 dataset/level pairs,
-  including empty and tiny input. Text remains slower: Alice at level 1
-  reaches 0.785x C's speed, and cyclic Alice at 1 MiB reaches 0.843x at
-  level 1 and 0.847x at level 3. Across levels their medians are 0.925x
-  and 0.934x. These end-to-end measurements include match finding, entropy
-  coding and allocation; they do not attribute the gap to a single kernel.
+- See the [benchmarks](../docs/benchmarks/encoder-comparison.md) for the
+  current end-to-end ratios. Text at the fast levels and the lazy levels
+  6–12 still trails the reference. The fast kernel executes about 1.5x the
+  reference's instructions on Alice (loop-carried positions spill, and
+  each match costs about 140 instructions against 92, `store_seq_from`
+  about 50 against 28); its speed comes from fewer branch mispredictions.
+  The lazy finders now run at or below the reference's instruction count
+  and remain 2–8% slower on text for reasons not yet attributed (no
+  hardware counters under WSL2).
+- Fast's branch-free candidate check costs about 5-8% on random 64 KiB
+  input at levels -5 to 1 (still at or above the reference's speed there),
+  where the validity branch it replaces predicts well; it is kept for its
+  gain on text.
 - The row finder issues the reference's row prefetches (`ZSTD_row_prefetch`
   from `ZSTD_row_fillHashCache` and `ZSTD_row_nextCachedHash`, 8 positions
-  ahead) through the `branches` crate's safe `prefetch_read_data`. The
-  reference's per-candidate prefetch in `ZSTD_RowFindBestMatch` is not
-  issued. The hash chain and binary tree have no prefetch points
-  outside dictionary modes, so none are ported.
+  ahead) and its per-candidate prefetch through the `branches` crate's safe
+  `prefetch_read_data`. The hash chain and binary tree have no prefetch
+  points outside dictionary modes, so none are ported.
+- A cold one-shot call's heap footprint sits close to glibc's dynamic trim
+  threshold on 1 MiB inputs; growing per-call allocations by a few hundred
+  KiB makes every call return and re-fault the heap top (see
+  `fill_codes`).
 - The reference also resets indices when it reallocates its workspace for
   larger parameters; mzstd resets them only on first use or near
   `ZSTD_CURRENT_MAX`. Frames are unaffected — a reused reference context

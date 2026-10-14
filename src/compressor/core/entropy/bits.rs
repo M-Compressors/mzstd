@@ -66,19 +66,18 @@ impl<'a> BitWriter<'a> {
 
     /// Writes every whole pending byte.
     ///
-    /// Past the end of the usable area the write position stops at its
-    /// limit; the overflow surfaces in [`Self::close`].
+    /// Past the end of the usable area the bytes land at its limit, as the
+    /// reference's clamped write position puts them, and the overflow
+    /// surfaces in [`Self::close`]: the position only grows, so once past
+    /// the limit it stays there.
     #[inline(always)]
     pub(crate) fn flush(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
-        debug_assert!(self.pos <= self.end);
-        if let Some(window) = self.dst.get_mut(self.pos..self.pos + CONTAINER_BYTES) {
+        let at = self.pos.min(self.end);
+        if let Some(window) = self.dst.get_mut(at..at + CONTAINER_BYTES) {
             window.copy_from_slice(&self.container.to_le_bytes());
         }
         self.pos += nb_bytes;
-        if self.pos > self.end {
-            self.pos = self.end;
-        }
         self.bit_pos &= 7;
         self.container >>= nb_bytes * 8;
     }

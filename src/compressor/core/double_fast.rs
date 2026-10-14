@@ -1,11 +1,13 @@
 //! The `dfast` strategy (`zstd_double_fast.c`): a long (8-byte) hash table
 //! in `hash_table` and a short one in `chain_table`.
 
+use core::cell::Cell;
+
 use fearless_simd::Simd;
 use fearless_simd_macros::simd;
 
 use super::match_state::{BlockInput, MatchState};
-use super::mem::{count_slices_simd, hash_ptr, hash_word, load32, load64};
+use super::mem::{count_slices_simd, hash_ptr, hash_word, load32, load64, try_load64};
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
 use super::window::HASH_READ_SIZE;
 
@@ -55,40 +57,19 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     block: &BlockInput<'_>,
 ) -> usize {
     let cparams = ms.cparams;
-    let h_bits_l = cparams.hash_log;
-    let h_bits_s = cparams.chain_log;
-    // Positions are offsets into `src`, whose first byte has window index
-    // `base`: the reference's pointers, with `base` its `base` pointer.
     let prefix = block.window.prefix;
     let base = prefix.start();
-    let src = prefix.slice(base, block.end);
-    let istart = (block.start - base) as usize;
-    let iend = src.len();
-    let mut anchor = istart;
     let prefix_lowest_index = ms.lowest_prefix_index(block.end, cparams.window_log);
-    let prefix_lowest = (prefix_lowest_index - base) as usize;
-    // The candidate load's bound also enforces the searchable lower limit.
-    let history = &src[prefix_lowest..];
-    // A block shorter than HASH_READ_SIZE never enters the search: the
-    // first `ip1 > ilimit` test fails for any `ilimit < 1`.
-    let ilimit = iend.saturating_sub(HASH_READ_SIZE as usize);
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offset_saved1 = 0u32;
     let mut offset_saved2 = 0u32;
-    let k_step_incr: usize = 1 << SEARCH_STRENGTH;
 
-    let index = |p: usize| p as u32 + base;
-    let read32 = |p: usize| load32(src, p);
-    let read64 = |p: usize| load64(src, p);
-    let count = |a: usize, b: usize| count_slices_simd(simd, &src[a..], &src[b..]);
-
-    let mut ip = istart;
-    ip += usize::from(ip == prefix_lowest);
+    let mut ip = block.start;
+    ip += u32::from(ip == prefix_lowest_index);
     {
-        let current = index(ip);
-        let window_low = ms.lowest_prefix_index(current, cparams.window_log);
-        let max_rep = current - window_low;
+        let window_low = ms.lowest_prefix_index(ip, cparams.window_log);
+        let max_rep = ip - window_low;
         if offset_2 > max_rep {
             offset_saved2 = offset_2;
             offset_2 = 0;
@@ -104,46 +85,174 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         chain_table: hash_small,
         ..
     } = ms;
-    let hash_long = hash_long.as_mut_slice();
-    let hash_small = hash_small.as_mut_slice();
+    let tables = Tables {
+        long: hash_long.as_mut_slice(),
+        small: hash_small.as_mut_slice(),
+    };
+    let scan = |origin: u32| Scan {
+        src: prefix.slice(origin, block.end),
+        origin,
+        prefix_lowest: (prefix_lowest_index - origin) as usize,
+        start: (block.start - origin) as usize,
+        h_bits_l: cparams.hash_log,
+        h_bits_s: cparams.chain_log,
+    };
+    // Every repcode the search can use either is one of these two or was
+    // found at a candidate inside the prefix, so when these two reach no
+    // further back than the first position the block reads nothing below
+    // the prefix: it is then searched as offsets from the prefix's start,
+    // which spares the search loop the window's base and the history's
+    // bounds.
+    let in_prefix =
+        block.start >= prefix_lowest_index && offset_1.max(offset_2) <= ip - prefix_lowest_index;
+    let (literals, [rep_1, rep_2]) = if in_prefix {
+        let scan = scan(prefix_lowest_index);
+        let ip = (ip - prefix_lowest_index) as usize;
+        compress_scan::<S, MLS, true>(simd, tables, seq_store, &scan, ip, [offset_1, offset_2])
+    } else {
+        let scan = scan(base);
+        let ip = (ip - base) as usize;
+        compress_scan::<S, MLS, false>(simd, tables, seq_store, &scan, ip, [offset_1, offset_2])
+    };
+    offset_1 = rep_1;
+    offset_2 = rep_2;
+
+    offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
+        offset_saved1
+    } else {
+        offset_saved2
+    };
+    rep[0] = if offset_1 != 0 {
+        offset_1
+    } else {
+        offset_saved1
+    };
+    rep[1] = if offset_2 != 0 {
+        offset_2
+    } else {
+        offset_saved2
+    };
+    literals
+}
+
+/// The two hash tables a `dfast` block reads and fills.
+struct Tables<'a> {
+    /// Eight-byte hashes (`hashLong`).
+    long: &'a mut [u32],
+    /// `MLS`-byte hashes (`hashSmall`).
+    small: &'a mut [u32],
+}
+
+/// The bytes one `dfast` block searches and the parameters it searches them
+/// with.
+struct Scan<'a> {
+    /// The block and the history before it, from window index `origin` on.
+    src: &'a [u8],
+    /// Window index of `src[0]`: the reference's `base`, as an offset.
+    origin: u32,
+    /// Offset of the prefix's lowest valid index, below which no candidate
+    /// is taken.
+    prefix_lowest: usize,
+    /// Offset of the block's first byte.
+    start: usize,
+    /// `hashLog`, the long table's hash width.
+    h_bits_l: u32,
+    /// `chainLog`, the short table's hash width.
+    h_bits_s: u32,
+}
+
+/// The search and match loop of `ZSTD_compressBlock_doubleFast_noDict_generic`
+/// from offset `ip` of `scan.src`, with the repcodes `reps`. Returns the
+/// length of the trailing literals and the final repcodes.
+///
+/// `IN_PREFIX` states that `scan.prefix_lowest` is zero, so the candidates'
+/// history is all of `src` and its lower bound the window index `origin`.
+#[inline(always)]
+fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
+    simd: S,
+    tables: Tables<'_>,
+    seq_store: &mut SeqStore,
+    scan: &Scan<'_>,
+    mut ip: usize,
+    reps: [u32; 2],
+) -> (usize, [u32; 2]) {
+    let Scan {
+        src,
+        origin: base,
+        h_bits_l,
+        h_bits_s,
+        ..
+    } = *scan;
+    let prefix_lowest = if IN_PREFIX { 0 } else { scan.prefix_lowest };
+    let prefix_lowest_index = base + prefix_lowest as u32;
+    // The candidate load's bound also enforces the searchable lower limit.
+    let history = &src[prefix_lowest..];
+    let iend = src.len();
+    let mut anchor = scan.start;
+    // A block shorter than HASH_READ_SIZE never enters the search: the
+    // first `ip1 > ilimit` test fails for any `ilimit < 1`.
+    let ilimit = iend.saturating_sub(HASH_READ_SIZE as usize);
+    let [mut offset_1, mut offset_2] = reps;
+    let k_step_incr: usize = 1 << SEARCH_STRENGTH;
+
+    let index = |p: usize| p as u32 + base;
+    let read32 = |p: usize| load32(src, p);
+    let count = |a: usize, b: usize| count_slices_simd(simd, &src[a..], &src[b..]);
+
+    let Tables {
+        long: hash_long,
+        small: hash_small,
+    } = tables;
     // Hashes are below the table sizes (`1 << hash_log`, `1 << chain_log`);
     // masking with `len - 1` changes nothing and, with the tables known to
     // be non-empty, proves every index in bounds.
     assert!(!hash_long.is_empty() && !hash_small.is_empty());
     let (mask_l, mask_s) = (hash_long.len() - 1, hash_small.len() - 1);
-    let hash_lw = |word: u64| hash_word::<8>(word, h_bits_l) & mask_l;
-    let hash_sw = |word: u64| hash_word::<MLS>(word, h_bits_s) & mask_s;
-    let hash_l = |p: usize| hash_lw(read64(p));
-    let hash_s = |p: usize| hash_sw(read64(p));
+    // The search keeps references to the slots it will write rather than
+    // their hashes, so a slot is bounds checked once, where its hash is
+    // computed.
+    let hash_long = Cell::from_mut(hash_long).as_slice_of_cells();
+    let hash_small = Cell::from_mut(hash_small).as_slice_of_cells();
+    let slot_l = |word: u64| &hash_long[hash_word::<8>(word, h_bits_l) & mask_l];
+    let slot_s = |word: u64| &hash_small[hash_word::<MLS>(word, h_bits_s) & mask_s];
+    let hash_l = |p: usize| slot_l(load64(src, p));
+    let hash_s = |p: usize| slot_s(load64(src, p));
 
     'outer: loop {
         let mut step: usize = 1;
         let mut next_step = ip + k_step_incr;
         let mut ip1 = ip + step;
-        if ip1 > ilimit {
+        // The eight bytes at `ip` and at `ip1`: every hash and compare at a
+        // searched position reads them. The search goes on while
+        // `ip1 <= ilimit`, that is while the eight bytes at `ip1` are inside
+        // `src`, so loading them is the loop's exit test.
+        let Some(mut word1) = try_load64(src, ip1) else {
             break 'outer;
-        }
-        // The eight bytes at `ip` and `ip1`: every hash and compare at a
-        // searched position reads them (`ip1 <= ilimit` keeps both whole).
-        let mut word0 = read64(ip);
-        let mut word1;
-        let mut hl0 = hash_lw(word0);
-        let mut idxl0 = hash_long[hl0 & mask_l];
+        };
+        let mut word0 = load64(src, ip);
+        let mut slot_l0 = slot_l(word0);
+        let mut idxl0 = slot_l0.get();
         let mut curr: u32;
-        let mut hl1: usize = 0;
-        let mut idxl1: u32 = 0;
 
-        enum Next {
+        enum Next<'t> {
             Stored(usize),
-            Found { offset: u32, m_length: usize },
-            SearchNextLong { idxs0: u32, word1: u64 },
+            Found {
+                offset: u32,
+                m_length: usize,
+                slot_l1: &'t Cell<u32>,
+            },
+            SearchNextLong {
+                idxs0: u32,
+                idxl1: u32,
+                slot_l1: &'t Cell<u32>,
+            },
         }
         let next = loop {
-            let hs0 = hash_sw(word0);
-            let idxs0 = hash_small[hs0];
+            let slot_s0 = slot_s(word0);
+            let idxs0 = slot_s0.get();
             curr = index(ip);
-            hash_long[hl0 & mask_l] = curr;
-            hash_small[hs0] = curr;
+            slot_l0.set(curr);
+            slot_s0.set(curr);
 
             if offset_1 > 0 && read32(ip + 1 - offset_1 as usize) == (word0 >> 8) as u32 {
                 let m_length = count(ip + 1 + 4, ip + 1 + 4 - offset_1 as usize) + 4;
@@ -152,8 +261,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                 break Next::Stored(m_length);
             }
 
-            word1 = read64(ip1);
-            hl1 = hash_lw(word1);
+            let slot_l1 = slot_l(word1);
             if super::mem::matches64(history, idxl0.wrapping_sub(prefix_lowest_index), word0) {
                 let mut matchl0 = (idxl0 - base) as usize;
                 let mut m_length = count(ip + 8, matchl0 + 8) + 8;
@@ -163,16 +271,24 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                     matchl0 -= 1;
                     m_length += 1;
                 }
-                break Next::Found { offset, m_length };
+                break Next::Found {
+                    offset,
+                    m_length,
+                    slot_l1,
+                };
             }
 
-            idxl1 = hash_long[hl1 & mask_l];
+            let idxl1 = slot_l1.get();
             if super::mem::matches32(
                 history,
                 idxs0.wrapping_sub(prefix_lowest_index),
                 word0 as u32,
             ) {
-                break Next::SearchNextLong { idxs0, word1 };
+                break Next::SearchNextLong {
+                    idxs0,
+                    idxl1,
+                    slot_l1,
+                };
             }
 
             if ip1 >= next_step {
@@ -181,21 +297,26 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
             }
             ip = ip1;
             ip1 += step;
-            hl0 = hl1;
+            slot_l0 = slot_l1;
             idxl0 = idxl1;
             word0 = word1;
-            if ip1 > ilimit {
-                break 'outer;
+            match try_load64(src, ip1) {
+                Some(word) => word1 = word,
+                None => break 'outer,
             }
         };
 
         let m_length = match next {
             Next::Stored(m_length) => m_length,
-            Next::Found { offset, m_length } => {
+            Next::Found {
+                offset,
+                m_length,
+                slot_l1,
+            } => {
                 offset_2 = offset_1;
                 offset_1 = offset;
                 if step < 4 {
-                    hash_long[hl1 & mask_l] = index(ip1);
+                    slot_l1.set(index(ip1));
                 }
                 seq_store.store_seq_from(
                     src,
@@ -206,7 +327,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                 );
                 m_length
             }
-            Next::SearchNextLong { idxs0, word1 } => {
+            Next::SearchNextLong {
+                idxs0,
+                idxl1,
+                slot_l1,
+            } => {
                 let mut matchs0 = (idxs0 - base) as usize;
                 let mut m_length = count(ip + 4, matchs0 + 4) + 4;
                 let mut offset = (ip - matchs0) as u32;
@@ -233,7 +358,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                 offset_2 = offset_1;
                 offset_1 = offset;
                 if step < 4 {
-                    hash_long[hl1 & mask_l] = index(ip1);
+                    slot_l1.set(index(ip1));
                 }
                 seq_store.store_seq_from(
                     src,
@@ -252,16 +377,16 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         if ip <= ilimit {
             let index_to_insert = curr + 2;
             let insert_at = (index_to_insert - base) as usize;
-            hash_long[hash_l(insert_at)] = index_to_insert;
-            hash_long[hash_l(ip - 2)] = index(ip - 2);
-            hash_small[hash_s(insert_at)] = index_to_insert;
-            hash_small[hash_s(ip - 1)] = index(ip - 1);
+            hash_l(insert_at).set(index_to_insert);
+            hash_l(ip - 2).set(index(ip - 2));
+            hash_s(insert_at).set(index_to_insert);
+            hash_s(ip - 1).set(index(ip - 1));
 
             while ip <= ilimit && offset_2 > 0 && read32(ip) == read32(ip - offset_2 as usize) {
                 let r_length = count(ip + 4, ip + 4 - offset_2 as usize) + 4;
                 core::mem::swap(&mut offset_1, &mut offset_2);
-                hash_small[hash_s(ip)] = index(ip);
-                hash_long[hash_l(ip)] = index(ip);
+                hash_s(ip).set(index(ip));
+                hash_l(ip).set(index(ip));
                 seq_store.store_seq_only(0, repcode_to_offbase(1), r_length);
                 ip += r_length;
                 anchor = ip;
@@ -269,22 +394,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         }
     }
 
-    offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
-        offset_saved1
-    } else {
-        offset_saved2
-    };
-    rep[0] = if offset_1 != 0 {
-        offset_1
-    } else {
-        offset_saved1
-    };
-    rep[1] = if offset_2 != 0 {
-        offset_2
-    } else {
-        offset_saved2
-    };
-    iend - anchor
+    (iend - anchor, [offset_1, offset_2])
 }
 
 /// `ZSTD_compressBlock_doubleFast_extDict`: selects the variant compiled for

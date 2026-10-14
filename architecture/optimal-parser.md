@@ -15,15 +15,17 @@ graph TD
     Block["block::build_seq_store"] -->|"BlockInput { window, start, end, backend }"| Entry["btopt / btopt_ext / btultra / btultra_ext / btultra2"]
     Block -->|"generate_sequences(.., backend)"| Ldm["ldm::LdmState"]
     Entry -->|"dispatch!(backend) once per block"| Parser["opt_generic::&lt;S, OPT_LEVEL, EXT&gt; (#[simd])"]
-    Parser --> Find["find_matches: match on mls"]
+    Parser --> Split["Finder::split(ms): Finder + OptState"]
+    Split --> Find["find_matches: match on mls"]
     Find --> Gam["get_all_matches::&lt;S, EXT, MLS&gt; (#[simd] entry)"]
-    Gam --> Update["insert_bt1 (update_tree)"]
+    Gam --> Update["update_tree (out of line) -> insert_bt1"]
     Gam --> Search["insert_bt_and_get_all_matches"]
     Update --> Walk["TreeWalk::run"]
     Search --> Walk
     Walk --> Ctx["Ctx::extend"]
-    Ctx --> Count["opt_count::count_ordered / count_2segments"]
-    Count --> Tail["opt_count::count_tail (#[simd] entry): words, native vectors, words"]
+    Ctx --> Count["opt_count::count_ordered: first word inline / count_2segments"]
+    Count --> Run["count_ordered_run (out of line, unlikely)"]
+    Run --> Tail["opt_count::count_tail (#[simd] entry): words, native vectors, words"]
     Parser --> Prices["OptState + PriceTables"]
     Ldm -->|"dispatch!(backend) once per 1 MiB chunk"| Gen["generate_internal (#[simd])"]
     Gen --> Count
@@ -40,6 +42,20 @@ match length (`ZSTD_selectBtGetAllMatches`); the branch resolves the same
 way for every position of a block. `get_all_matches` and `count_tail` are
 `#[fearless_simd_macros::simd]` entries: their bodies run in the backend's
 feature context, so the vector loads and compares inline into them.
+
+Per block, `Finder::split(ms)` divides the match state into a `Finder` and
+the `OptState` the parser keeps pricing with. The `Finder` borrows the hash
+table, the tree (cut to `2 << btLog` cells) and the 3-byte hash table, and
+precomputes the hash logs, `bt_mask`, `nb_compares`, `sufficient_len`, the
+low limit and `max_distance` (`u32::MAX` with a loaded dictionary, which
+reproduces `ZSTD_getLowestMatchIndex`). It owns `next_to_update` and
+`next_to_update3` for the block and stores them back afterwards, so the
+search reloads and recomputes nothing per call. `update_tree` stays out of
+line: inlined, its copy of the walk crowded the search's registers. Each
+search hints the hash cell and the 3-byte hash cell of `ip + 4`, and each
+tree insertion the hash cell of `ip + 4`, through the `branches` crate's
+safe `prefetch_read_data`; four positions ahead measured best (the largest
+wall-clock gain on 1 MiB inputs).
 
 ## The parser
 
@@ -64,11 +80,13 @@ position table (`opt`, `ZSTD_optimal_t`) and the match buffer live in
 `OptState` and are moved out for the block, as is the LDM candidate store
 (lent by `ldm::block_compress` and handed back with its cursor unchanged,
 which is what the reference's header copy amounts to). The reference carves
-both tables uninitialized from its workspace; `OptState::reserve_positions`
-grows them on the first block that needs them to `min(block length + 3,
-ZSTD_OPT_SIZE)` entries, the most any position or match index reaches (a
-match ends inside the block and below `ZSTD_OPT_NUM`; the list holds one
-match per distinct length plus an LDM candidate). `OptState::allocate` at
+both tables uninitialized from its workspace. Here the position table grows
+only when a block's first match is found (`grow_positions`, cold), to at
+most `min(block length + 3, ZSTD_OPT_SIZE)` entries, and the parser indexes
+a `&mut [Optimal]` slice that stays in registers. The match table
+(`OptState::reserve_matches`) holds `min(ZSTD_OPT_SIZE, block length + 3,
+nb_compares + 5)` entries: a search reports at most three repeat matches or
+one 3-byte hash match, one match per tree comparison and one LDM candidate. `OptState::allocate` at
 frame start sizes only the frequency tables, so an empty frame never fills
 them and a tiny one fills a few dozen entries instead of 4099.
 
@@ -119,7 +137,9 @@ additionally carries the eight bits of `(stat + 1) << 8 >> highbit`. If any
 below 2^19), the table is redone with the integer form, which wraps exactly
 as the reference's `stat << 8` does. `update_stats` patches literal weights
 through a fixed 256-entry view of the frequencies, with the level's weight
-form chosen once per sequence.
+form chosen once per sequence; a run of 64 or more literals increments the
+frequencies as the reference does and then rebuilds all 256 literal weights
+at once with `weights`, which is cheaper than patching each.
 
 ## The binary tree
 
@@ -131,6 +151,16 @@ block end and the minimum match length. `TreeWalk::run` is the loop that
 tree around the inserted position and reports each candidate longer than
 every earlier one through a closure (which records the match for the
 search and does nothing for an insertion).
+
+An insertion or search whose first candidate is already below the window
+(almost every position of incompressible input) only clears its two cells.
+A child cell is `(index << 1) & cells`, and the loop tests its condition at
+the bottom. The repeat-offset checks read the candidate word before testing
+the window, as the reference's `&` allows, and guard prefix candidates with
+`rep_offset != 0 && rep_offset <= ip_offset` (the reference's
+`rep_offset - 1 < curr - dictLimit`), so one slice `prefix[..ip + 4]` covers
+every candidate read. `Ctx` cuts the prefix at the block end, so lengths are
+bounded by the slice instead of a separate limit.
 
 ```mermaid
 flowchart TD
@@ -160,15 +190,14 @@ cell; here that side is simply not cleared.
 
 ### Match-length kernels (`opt_count`)
 
-`count_ordered` is the walk's comparison. It loads the first word of each
-side, with one length test apiece. If they differ, it returns the length
-from a trailing-zero count, and takes the order of the first differing
-bytes (`match[len] < ip[len]`, which the walk branches on next) from the
-same words. Up to `INLINE_WORDS` (2) words are compared this way inline;
-measured with interleaved runs, two settle most runs on short inputs and
-on text without growing the walk enough to slow the tiny-input path, while
-four were faster on `http` but slower on tiny and binary inputs. A run
-past them continues in `count_tail`, out of line: two more words, then
+`count_ordered` is the walk's comparison. It compares the first word of each
+side inline, with one length test apiece. If they differ, it returns the
+length from a trailing-zero count and the order of the first differing bytes
+(`match[len] < ip[len]`, which the walk branches on next) from a compare of
+the byte-swapped words. Longer runs continue in `count_ordered_run`, out of
+line and hinted unlikely, so the walk's state is not spilled at every
+candidate; it starts after the matched first word and compares up to
+`INLINE_WORDS` (2) more words before `count_tail`, out of line: two more words, then
 native vectors (the backend's 32 or 64 lanes, else 16; the scalar
 fallback emulates them), then words, then one word ending at the limit that
 overlaps bytes already known equal. `count` is `ZSTD_count` within one
@@ -205,10 +234,13 @@ shifts the previous state), so it stays scalar.
 
 - The tree walk still pays one length test for the candidate's word and one
   for the current position's per visited node, which the reference's
-  pointer arithmetic does not. On text at level 16 the parser executes
-  about 25% more instructions than the reference. Most of that is in the
-  walk, whose time is dominated by cache misses, so the wall-clock gap is
-  far smaller.
+  pointer arithmetic does not. On Alice at level 15 `get_all_matches` and
+  `update_tree` execute about 18% more instructions than the reference's
+  search; at level 19 and on 1 MiB inputs the parser executes fewer in
+  total, and with the prefetches every measured btopt..btultra2 case runs
+  at least as fast as the reference.
+- Branchless child selection in the walk measured 19% slower: the next
+  node's load becomes data-dependent and loses speculation.
 - `MatchState::reset` zeroes the hash, tree and 3-byte hash tables on every
   frame for these strategies, while the reference keeps them when indices
   continue. Every read here is checked against the window first: the hash

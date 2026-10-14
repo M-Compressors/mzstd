@@ -459,10 +459,13 @@ impl CTable {
             );
         }
 
-        // Build the state table.
-        for u in 0..table_size {
-            let s = usize::from(table_symbol[u as usize]);
-            self.state_table[cumul[s] as usize] = (table_size + u) as u16;
+        // Build the state table. Spread symbols are below `symbols`, at
+        // most `MAX_SYMBOLS`, and their positions below the table size, so
+        // the masks change nothing and leave no bounds checks behind.
+        for (u, &s) in (0..table_size).zip(&table_symbol[..table_size as usize]) {
+            let s = usize::from(s) & (MAX_SYMBOLS - 1);
+            self.state_table[cumul[s] as usize & ((1 << STATE_TABLE_LOG) - 1)] =
+                (table_size + u) as u16;
             cumul[s] += 1;
         }
 
@@ -528,7 +531,7 @@ fn spread(
     let mut position: u32 = 0;
     for (symbol, &freq) in norm.iter().enumerate() {
         for _ in 0..i32::from(freq).max(0) {
-            table_symbol[position as usize] = symbol as u8;
+            table_symbol[position as usize & ((1 << STATE_TABLE_LOG) - 1)] = symbol as u8;
             position = (position + step) & table_mask;
             while position > high_threshold {
                 position = (position + step) & table_mask;

@@ -140,6 +140,42 @@ fn count_slices_with(a: &[u8], b: &[u8], long: impl FnOnce(&[u8], &[u8]) -> usiz
     long(a, b)
 }
 
+/// `ZSTD_count` for two runs of one buffer: the common prefix of
+/// `src[ip..]` and `src[m..]`, as [`count_slices_simd`] counts it.
+///
+/// The match finders call it once per match, and most matches end within
+/// their first word: that word is compared after a bounds check on each
+/// side, before the slices the full count needs are built.
+#[inline(always)]
+pub(crate) fn count_at_simd<S: fearless_simd::Simd>(
+    simd: S,
+    src: &[u8],
+    ip: usize,
+    m: usize,
+) -> usize {
+    let (ip, m) = (ip & u32::MAX as usize, m & u32::MAX as usize);
+    if let (Some(a), Some(b)) = (src.get(ip..ip + 8), src.get(m..m + 8))
+        && let (Some(a), Some(b)) = (a.first_chunk::<8>(), b.first_chunk::<8>())
+    {
+        let difference = u64::from_le_bytes(*a) ^ u64::from_le_bytes(*b);
+        if difference != 0 {
+            return difference.trailing_zeros() as usize >> 3;
+        }
+    }
+    count_slices_simd(simd, &src[ip..], &src[m..])
+}
+
+/// The number of bytes that `a` and `b` end with in common: how far a match
+/// whose start is at the ends of both extends backwards.
+#[inline(always)]
+pub(crate) fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
 /// Baseline callers keep their compact 32-byte loop. Keeping the scan out
 /// of line avoids hoisting its setup into the first-word candidate check.
 #[inline(never)]
@@ -372,6 +408,36 @@ pub(crate) fn load64(src: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
+/// Words that stand in for a candidate outside the history, so its bytes
+/// are loaded and compared without first branching on whether it is valid
+/// (the reference's `ZSTD_match4Found_cmov` reads its `dummy` the same
+/// way). The first byte of `DUMMIES[b]` has its low bit clear exactly when
+/// `b` is 1, so the one picked by a word's low bit differs from that word.
+const DUMMIES: [[u8; 8]; 2] = [
+    [0x13, 0x35, 0x57, 0x79, 0x9b, 0xbd, 0xdf, 0xf1],
+    [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+];
+
+/// The `N` bytes at offset `at` of `src`, or bytes that differ from `word`
+/// when they are not all inside `src`, so comparing them with `word` tells
+/// whether the candidate matches.
+///
+/// The choice is a select rather than a branch: a stale candidate is as
+/// likely as a live one, so a branch on it would be mispredicted often.
+#[inline(always)]
+fn candidate<'a, const N: usize>(src: &'a [u8], at: u32, word: &[u8; N]) -> &'a [u8; N] {
+    let at = at as usize;
+    let candidate = at
+        .checked_add(N)
+        .and_then(|end| src.get(at..end))
+        .and_then(|bytes| bytes.first_chunk::<N>());
+    let low_bit = word.first().map_or(0, |byte| usize::from(byte & 1));
+    let Some(dummy) = DUMMIES[low_bit].first_chunk::<N>() else {
+        unreachable!("candidates are at most eight bytes");
+    };
+    core::hint::select_unpredictable(candidate.is_some(), candidate.unwrap_or(dummy), dummy)
+}
+
 /// Compares a four-byte candidate if the whole word is in `src`.
 /// Match finders pass the searchable history and an index with its lower
 /// bound subtracted using wrapping arithmetic. An older index becomes a
@@ -379,42 +445,69 @@ pub(crate) fn load64(src: &[u8], at: usize) -> u64 {
 /// the word load. No bytes outside the history are read.
 #[inline(always)]
 pub(crate) fn matches32(src: &[u8], at: u32, word: u32) -> bool {
-    let at = at as usize;
-    let Some(end) = at.checked_add(4) else {
-        return false;
-    };
-    src.get(at..end)
-        .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == word)
+    let word = word.to_le_bytes();
+    *candidate(src, at, &word) == word
 }
 
 /// Eight-byte counterpart of [`matches32`].
 #[inline(always)]
 pub(crate) fn matches64(src: &[u8], at: u32, word: u64) -> bool {
-    let at = at as usize;
-    let Some(end) = at.checked_add(8) else {
-        return false;
-    };
-    src.get(at..end)
-        .is_some_and(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()) == word)
+    let word = word.to_le_bytes();
+    *candidate(src, at, &word) == word
 }
 
-/// The nine bytes at offset `at` of `src`: a probed position and the one
-/// after it, both readable as whole words without further bounds tests
-/// ([`window_word`]).
+/// The little-endian `u64` at offset `at` of `src`, or `None` when the
+/// eight bytes are not all inside it.
 ///
-/// # Panics
-///
-/// When the nine bytes are not inside `src`.
+/// The `dfast` search goes on while its next position is at most `ilimit`,
+/// eight bytes before the end of `src`: that is while this load succeeds,
+/// so one range test is the loop's exit test and the load's bounds check.
 #[inline(always)]
-pub(crate) fn window9(src: &[u8], at: usize) -> &[u8; 9] {
+pub(crate) fn try_load64(src: &[u8], at: usize) -> Option<u64> {
     let at = at & u32::MAX as usize;
-    match src[at..at + 9].first_chunk::<9>() {
-        Some(window) => window,
-        None => unreachable!("a nine-byte slice holds nine bytes"),
+    match src.get(at..at + 8) {
+        Some(bytes) => bytes
+            .first_chunk::<8>()
+            .map(|word| u64::from_le_bytes(*word)),
+        None => None,
     }
 }
 
-/// The little-endian word at `OFF` (0 or 1) of a [`window9`].
+/// The nine bytes at offset `at` of a position the `fast` search may still
+/// probe, or `None` once it may not: the position and the one after it,
+/// both readable as whole words without further bounds tests
+/// ([`window_word`]).
+///
+/// The search continues while `at + 1 < ilimit`, with `ilimit` eight bytes
+/// before the end of `src`: that is while the ten bytes at `at` are inside
+/// `src`. Testing that range is the loop's exit test and the window's bounds
+/// check at once.
+#[inline(always)]
+pub(crate) fn probe_window(src: &[u8], at: usize) -> Option<&[u8; 9]> {
+    let at = at & u32::MAX as usize;
+    match src.get(at..at + 10) {
+        Some(bytes) => bytes.first_chunk::<9>(),
+        None => None,
+    }
+}
+
+/// The [`probe_window`]s at offsets `at` and `at + gap` of `src`, or `None`
+/// when the second is refused: both windows lie in one range, so a single
+/// bounds check covers them.
+#[inline(always)]
+pub(crate) fn probe_pair(src: &[u8], at: usize, gap: usize) -> Option<(&[u8; 9], &[u8; 9])> {
+    let (at, gap) = (at & u32::MAX as usize, gap & u32::MAX as usize);
+    let pair = src.get(at..at + gap + 10)?;
+    match (
+        pair.first_chunk::<9>(),
+        pair.get(gap..).and_then(|second| second.first_chunk::<9>()),
+    ) {
+        (Some(first), Some(second)) => Some((first, second)),
+        _ => None,
+    }
+}
+
+/// The little-endian word at `OFF` (0 or 1) of a [`probe_window`].
 #[inline(always)]
 pub(crate) fn window_word<const OFF: usize>(window: &[u8; 9]) -> u64 {
     let mut word = [0u8; 8];
@@ -638,19 +731,97 @@ mod tests {
     }
 
     #[test]
-    fn window_words_match_offset_loads() {
+    fn probe_windows_match_offset_loads_while_ten_bytes_remain() {
         let bytes: alloc::vec::Vec<u8> = (0..24u8).map(|i| i.wrapping_mul(53) ^ 0x3C).collect();
-        for at in 0..=bytes.len() - 9 {
-            let window = window9(&bytes, at);
-            assert_eq!(window_word::<0>(window), load64(&bytes, at));
-            assert_eq!(window_word::<1>(window), load64(&bytes, at + 1));
+        for at in 0..=bytes.len() + 2 {
+            let window = probe_window(&bytes, at);
+            assert_eq!(window.is_some(), at + 10 <= bytes.len(), "at {at}");
+            if let Some(window) = window {
+                assert_eq!(window_word::<0>(window), load64(&bytes, at));
+                assert_eq!(window_word::<1>(window), load64(&bytes, at + 1));
+            }
+            for gap in 0..=bytes.len() {
+                let pair = probe_pair(&bytes, at, gap);
+                assert_eq!(
+                    pair.is_some(),
+                    at + gap + 10 <= bytes.len(),
+                    "at {at} gap {gap}"
+                );
+                if let Some((first, second)) = pair {
+                    assert_eq!(window_word::<0>(first), load64(&bytes, at));
+                    assert_eq!(window_word::<1>(first), load64(&bytes, at + 1));
+                    assert_eq!(window_word::<0>(second), load64(&bytes, at + gap));
+                    assert_eq!(window_word::<1>(second), load64(&bytes, at + gap + 1));
+                }
+            }
+        }
+        assert!(probe_window(&bytes, usize::MAX).is_none());
+        assert!(probe_pair(&bytes, usize::MAX, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn checked_loads_stop_where_eight_bytes_no_longer_fit() {
+        let bytes: alloc::vec::Vec<u8> = (0..20u8).map(|i| i.wrapping_mul(29) ^ 0xA5).collect();
+        for at in 0..=bytes.len() + 2 {
+            let word = try_load64(&bytes, at);
+            assert_eq!(word.is_some(), at + 8 <= bytes.len(), "at {at}");
+            if let Some(word) = word {
+                assert_eq!(word, load64(&bytes, at));
+            }
+        }
+        assert!(try_load64(&bytes, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn dummy_words_never_match_a_stale_candidate() {
+        // A word equal to either stand-in, probed at an index outside the
+        // history, must not match: the stand-in picked differs from it.
+        let history = [0u8; 16];
+        for dummy in DUMMIES {
+            let word64 = u64::from_le_bytes(dummy);
+            let word32 = u32::from_le_bytes([dummy[0], dummy[1], dummy[2], dummy[3]]);
+            for at in [13, 16, 1000, u32::MAX - 3, u32::MAX] {
+                assert!(!matches32(&history, at, word32), "at {at}");
+                assert!(!matches64(&history, at, word64), "at {at}");
+            }
+        }
+        // The same words in the history match where they are.
+        let mut history = [0u8; 24];
+        history[3..11].copy_from_slice(&DUMMIES[1]);
+        history[11..19].copy_from_slice(&DUMMIES[0]);
+        assert!(matches64(&history, 3, u64::from_le_bytes(DUMMIES[1])));
+        assert!(matches64(&history, 11, u64::from_le_bytes(DUMMIES[0])));
+        assert!(matches32(
+            &history,
+            11,
+            u32::from_le_bytes([0x13, 0x35, 0x57, 0x79])
+        ));
+    }
+
+    #[test]
+    fn first_word_counts_match_the_slice_count_on_every_backend() {
+        use crate::Backend;
+
+        let mut bytes: alloc::vec::Vec<u8> = (0..96u8).map(|i| i % 7).collect();
+        bytes.extend((0..64u8).map(|i| i.wrapping_mul(37)));
+        for backend in Backend::available() {
+            for ip in 0..=bytes.len() {
+                for m in 0..=ip {
+                    let expected = count_slices(&bytes[ip..], &bytes[m..]);
+                    let got = fearless_simd::dispatch!(backend.0, simd => count_at_simd(simd, &bytes, ip, m));
+                    assert_eq!(got, expected, "{backend} ip {ip} m {m}");
+                }
+            }
         }
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn windows_past_the_end_panic() {
-        window9(&[0u8; 9], 1);
+    fn common_suffixes_stop_at_the_first_difference_or_shorter_side() {
+        assert_eq!(common_suffix(b"", b"abc"), 0);
+        assert_eq!(common_suffix(b"xabc", b"yabc"), 3);
+        assert_eq!(common_suffix(b"abc", b"zzabc"), 3);
+        assert_eq!(common_suffix(b"zzabc", b"bc"), 2);
+        assert_eq!(common_suffix(b"abcd", b"abce"), 0);
     }
 
     #[test]

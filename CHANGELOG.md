@@ -1,5 +1,51 @@
 # Changelog
 
+## [v0.2.3](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.3) - 2026-10-15
+
+- **Faster fast and double-fast match finding (levels -131072 to 4).**
+  Candidate validity is a select between the candidate's bytes and a
+  stand-in word that can never match (the reference's
+  `ZSTD_match4Found_cmov`), so only equality branches; this removed most of
+  the finders' branch mispredictions. Blocks that cannot read below the
+  prefix take a specialization with prefix-relative positions, hash slots
+  are held as cell references, and exit tests share the bounds checks of the
+  loads they guard. Frames remain byte-identical to zstd 1.5.7.
+
+- **Faster lazy finders (greedy to btlazy2).** Row tables are viewed from
+  a 64-byte boundary as the reference's workspace aligns them (half of the
+  tag rows used to straddle cache lines); search state is built once per
+  block; the row update checks one range per run and steps through a
+  constant table; collected candidates are prefetched as in the reference;
+  btlazy2's tree walk counts short runs inline, hands long ones to the
+  vector scan, and picks its side without a branch.
+
+- **Faster optimal parser (btopt, btultra, btultra2).** A per-block
+  `Finder` precomputes the search's parameters, the tree update runs out of
+  line, the walk exits early when the first candidate is outside the window,
+  hash cells are prefetched four positions ahead, long literal runs refresh
+  all literal weights at once, and the position and match tables are sized
+  to what a block can use. Levels 16-22 now run faster than zstd 1.5.7 on
+  every dataset of the comparison corpus.
+
+- **Cheaper sequence coding.** `fill_codes` builds the codes, extra-bit
+  counts and the three code histograms in one pass, `sequences::encode`
+  adds each sequence's extra bits with one write when they number fewer
+  than 31, and the bit writers and FSE table build drop their bounds checks.
+  The sequence encoder now executes fewer instructions than the reference's.
+
+- Updated [benchmarks](docs/benchmarks/README.md) for this working tree
+  (2026-10-14): compression median 1.092× zstd 1.5.7 (was 1.000×), faster in
+  158 of 192 dataset/level pairs (was 96); decompression median 1.022×, with Alice 0.92× (was 0.89×) and cyclic
+  Alice 0.85× (was 0.82×). All frames remain byte-identical to zstd 1.5.7.
+  Text at the fastest compression levels and compressible-text decoding
+  remain slower than C.
+
+- **Faster literal and sequence decoding.** Huffman pair tables are built
+  from one series per code length with one add per row (3.4x fewer
+  instructions), sequence bit counts carry their range so reads need no
+  masking, the first chunk of a long-offset match copy and the Huffman fast
+  loops' refills need no bounds checks.
+
 ## [v0.2.2](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.2) - 2026-10-14
 
 - **A session holds a first `End` call to its declared size.** With

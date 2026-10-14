@@ -6,16 +6,15 @@ use fearless_simd_macros::simd;
 
 use super::bits::BitWriter;
 use super::fse::{self, CState, CTable};
-use super::hist;
 use super::{FseRepeat, FseTables};
 use crate::Backend;
 use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::Strategy;
-use crate::compressor::core::seq_store::SeqStore;
+use crate::compressor::core::seq_store::{CODE_COUNT_SLOTS, SeqStore};
 use crate::shared::format::{
-    DEFAULT_MAX_OFF, EncodingType, LL_BITS, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG,
-    MAX_LL, MAX_ML, MAX_OFF, MAX_SEQ, ML_BITS, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG, ML_FSE_LOG,
-    OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG, OFF_FSE_LOG,
+    DEFAULT_MAX_OFF, EncodingType, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, MAX_LL,
+    MAX_ML, MAX_OFF, MAX_SEQ, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG, ML_FSE_LOG, OF_DEFAULT_NORM,
+    OF_DEFAULT_NORM_LOG, OFF_FSE_LOG,
 };
 
 /// `-log2(x / 256)` in 1/256 bits for `x` in `0..256`; `0` for `x == 0`.
@@ -162,12 +161,24 @@ pub(crate) struct CodeStats<'a> {
     pub(crate) nb_seq: usize,
 }
 
-/// A code stream with its mutable histogram.
+/// A code stream's mutable histogram, with what table construction needs of
+/// the stream itself.
 #[derive(Debug)]
 struct Histogram<'a> {
     count: &'a mut [u32],
     max: u32,
-    codes: &'a [u8],
+    /// Number of codes in the stream.
+    nb_seq: usize,
+    /// The stream's last code.
+    last: u8,
+}
+
+/// A code stream's histogram as `HIST_countFast_wksp` reports it: the
+/// counts, the largest code present (`0` for none) and the largest count.
+fn code_histogram(counts: &[u32; CODE_COUNT_SLOTS]) -> ([u32; CODE_COUNT_SLOTS], u32, usize) {
+    let max = counts.iter().rposition(|&c| c != 0).unwrap_or(0);
+    let most_frequent = counts.iter().copied().max().unwrap_or(0);
+    (*counts, max as u32, most_frequent as usize)
 }
 
 /// Chooses how to encode one code stream (`ZSTD_selectEncodingType`).
@@ -248,14 +259,20 @@ fn build_ctable(
     encoding: EncodingType,
     histogram: Histogram<'_>,
 ) -> Result<usize, CoreError> {
-    let Histogram { count, max, codes } = histogram;
+    let Histogram {
+        count,
+        max,
+        nb_seq,
+        last,
+    } = histogram;
     match encoding {
         EncodingType::Rle => {
             next.build_rle(max as u8);
             let Some(first) = dst.first_mut() else {
                 return Err(CoreError::DstSizeTooSmall);
             };
-            *first = codes[0];
+            // Every code is the one present symbol, `max`.
+            *first = max as u8;
             Ok(1)
         }
         EncodingType::Repeat => {
@@ -267,10 +284,9 @@ fn build_ctable(
             Ok(0)
         }
         EncodingType::Compressed => {
-            let nb_seq = codes.len();
             let mut nb_seq_1 = nb_seq;
             let table_log = fse::optimal_table_log(kind.fse_log, nb_seq, max);
-            let last = usize::from(codes[nb_seq - 1]);
+            let last = usize::from(last);
             if count[last] > 1 {
                 count[last] -= 1;
                 nb_seq_1 -= 1;
@@ -307,7 +323,8 @@ pub(crate) struct EncodingStats {
 /// Chooses encodings for the three code streams, builds their tables into
 /// `next` and writes their descriptions (`ZSTD_buildSequencesStatistics`).
 ///
-/// The store must hold at least one sequence; its codes are (re)computed.
+/// The store must hold at least one sequence; its codes are (re)computed
+/// with `backend`.
 ///
 /// # Errors
 ///
@@ -318,17 +335,17 @@ pub(crate) fn build_statistics(
     next: &mut FseTables,
     dst: &mut [u8],
     strategy: Strategy,
+    backend: Backend,
 ) -> Result<EncodingStats, CoreError> {
     let nb_seq = store.nb_seq();
     debug_assert!(nb_seq != 0);
-    store.fill_codes();
+    store.fill_codes(backend);
     let mut op = 0usize;
     let mut last_count_size = 0usize;
-    let mut count = [0u32; MAX_SEQ as usize + 1];
+    let last = store.codes[nb_seq - 1];
 
     // Literal lengths.
-    let mut max = MAX_LL;
-    let most_frequent = hist::count(&mut count, &mut max, &store.ll_code, false)? as usize;
+    let (mut count, max, most_frequent) = code_histogram(&store.code_counts.ll);
     next.litlength_repeat = prev.litlength_repeat;
     let ll_type = select_encoding_type(
         &mut next.litlength_repeat,
@@ -352,7 +369,8 @@ pub(crate) fn build_statistics(
         Histogram {
             count: &mut count,
             max,
-            codes: &store.ll_code,
+            nb_seq,
+            last: last.ll,
         },
     )?;
     if ll_type == EncodingType::Compressed {
@@ -361,8 +379,7 @@ pub(crate) fn build_statistics(
     op += size;
 
     // Offsets.
-    let mut max = MAX_OFF;
-    let most_frequent = hist::count(&mut count, &mut max, &store.of_code, false)? as usize;
+    let (mut count, max, most_frequent) = code_histogram(&store.code_counts.of);
     let default_allowed = max <= DEFAULT_MAX_OFF;
     next.offcode_repeat = prev.offcode_repeat;
     let of_type = select_encoding_type(
@@ -387,7 +404,8 @@ pub(crate) fn build_statistics(
         Histogram {
             count: &mut count,
             max,
-            codes: &store.of_code,
+            nb_seq,
+            last: last.of,
         },
     )?;
     if of_type == EncodingType::Compressed {
@@ -396,8 +414,7 @@ pub(crate) fn build_statistics(
     op += size;
 
     // Match lengths.
-    let mut max = MAX_ML;
-    let most_frequent = hist::count(&mut count, &mut max, &store.ml_code, false)? as usize;
+    let (mut count, max, most_frequent) = code_histogram(&store.code_counts.ml);
     next.matchlength_repeat = prev.matchlength_repeat;
     let ml_type = select_encoding_type(
         &mut next.matchlength_repeat,
@@ -421,7 +438,8 @@ pub(crate) fn build_statistics(
         Histogram {
             count: &mut count,
             max,
-            codes: &store.ml_code,
+            nb_seq,
+            last: last.ml,
         },
     )?;
     if ml_type == EncodingType::Compressed {
@@ -438,30 +456,14 @@ pub(crate) fn build_statistics(
     })
 }
 
-/// `bits` padded to 64 entries, so a code masked to six bits indexes it
-/// without a bounds check.
-const fn padded_bits<const N: usize>(bits: [u8; N]) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    let mut i = 0;
-    while i < N {
-        out[i] = bits[i];
-        i += 1;
-    }
-    out
-}
-
-/// Extra bits per literal length code.
-const LL_EXTRA_BITS: [u8; 64] = padded_bits(LL_BITS);
-/// Extra bits per match length code.
-const ML_EXTRA_BITS: [u8; 64] = padded_bits(ML_BITS);
-
 /// Writes the sequences bitstream (`ZSTD_encodeSequences`), backward from
 /// the last sequence, with the loop compiled for `backend` (the reference
 /// selects its BMI2 build at run time the same way).
 ///
 /// # Errors
 ///
-/// [`CoreError::DstSizeTooSmall`] when the stream does not fit.
+/// [`CoreError::DstSizeTooSmall`] when the stream does not fit, and
+/// [`CoreError::Generic`] for a store without sequences.
 pub(crate) fn encode(
     dst: &mut [u8],
     tables: &FseTables,
@@ -470,6 +472,10 @@ pub(crate) fn encode(
 ) -> Result<usize, CoreError> {
     fearless_simd::dispatch!(backend.0, simd => encode_on(simd, dst, tables, store))
 }
+
+/// Bits of extra values one sequence may add without a flush: the 64-bit
+/// container holds up to 7 pending bits and the three states' bits.
+const EXTRA_BITS_WITHOUT_FLUSH: u32 = 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG);
 
 /// [`encode`] inside `simd`'s feature context.
 #[simd]
@@ -483,41 +489,40 @@ fn encode_on<S: Simd>(
         return Err(CoreError::DstSizeTooSmall);
     };
     let n = store.nb_seq();
-    let seqs = &store.sequences[..n];
-    let (ll, of, ml) = (
-        &store.ll_code[..n],
-        &store.of_code[..n],
-        &store.ml_code[..n],
-    );
-    let last = n - 1;
-    let ll_bits_of = |code: u8| u32::from(LL_EXTRA_BITS[usize::from(code & 63)]);
-    let ml_bits_of = |code: u8| u32::from(ML_EXTRA_BITS[usize::from(code & 63)]);
+    let Some((last, codes)) = store.codes[..n].split_last() else {
+        return Err(CoreError::Generic);
+    };
+    let Some((last_seq, seqs)) = store.sequences[..n].split_last() else {
+        return Err(CoreError::Generic);
+    };
 
-    let mut state_ml = CState::with_first_symbol(&tables.matchlength, u32::from(ml[last]));
-    let mut state_of = CState::with_first_symbol(&tables.offcode, u32::from(of[last]));
-    let mut state_ll = CState::with_first_symbol(&tables.litlength, u32::from(ll[last]));
-    writer.add_bits(u64::from(seqs[last].lit_length), ll_bits_of(ll[last]));
-    writer.add_bits(u64::from(seqs[last].ml_base), ml_bits_of(ml[last]));
-    writer.add_bits(u64::from(seqs[last].off_base), u32::from(of[last]));
+    let mut state_ml = CState::with_first_symbol(&tables.matchlength, u32::from(last.ml));
+    let mut state_of = CState::with_first_symbol(&tables.offcode, u32::from(last.of));
+    let mut state_ll = CState::with_first_symbol(&tables.litlength, u32::from(last.ll));
+    // An empty container takes any sequence's extra bits.
+    writer.add_bits_fast(last.extra(last_seq), u32::from(last.extra_bits));
     writer.flush();
 
-    let codes = ll[..last].iter().zip(&of[..last]).zip(&ml[..last]);
-    for (seq, ((&ll_code, &of_code), &ml_code)) in seqs[..last].iter().zip(codes).rev() {
-        let ll_bits = ll_bits_of(ll_code);
-        let of_bits = u32::from(of_code);
-        let ml_bits = ml_bits_of(ml_code);
-        state_of.encode(&mut writer, u32::from(of_code));
-        state_ml.encode(&mut writer, u32::from(ml_code));
-        state_ll.encode(&mut writer, u32::from(ll_code));
-        if of_bits + ml_bits + ll_bits >= 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG) {
+    for (&codes, seq) in codes.iter().zip(seqs).rev() {
+        state_of.encode(&mut writer, u32::from(codes.of));
+        state_ml.encode(&mut writer, u32::from(codes.ml));
+        state_ll.encode(&mut writer, u32::from(codes.ll));
+        let extra_bits = u32::from(codes.extra_bits);
+        let extra = codes.extra(seq);
+        if extra_bits < EXTRA_BITS_WITHOUT_FLUSH {
+            writer.add_bits_fast(extra, extra_bits);
+        } else {
+            // Flushes only move whole bytes out of the container, so where
+            // they fall does not change the stream: this one makes room,
+            // and the second one splits the at most 63 extra bits.
             writer.flush();
-        }
-        writer.add_bits(u64::from(seq.lit_length), ll_bits);
-        writer.add_bits(u64::from(seq.ml_base), ml_bits);
-        if of_bits + ml_bits + ll_bits > 56 {
+            writer.add_bits(extra, EXTRA_BITS_WITHOUT_FLUSH);
             writer.flush();
+            writer.add_bits_fast(
+                extra >> EXTRA_BITS_WITHOUT_FLUSH,
+                extra_bits - EXTRA_BITS_WITHOUT_FLUSH,
+            );
         }
-        writer.add_bits(u64::from(seq.off_base), of_bits);
         writer.flush();
     }
 
@@ -533,14 +538,156 @@ fn encode_on<S: Simd>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compressor::core::seq_store::{offset_to_offbase, repcode_to_offbase};
+
+    /// `ZSTD_encodeSequences_body` step by step, with every conditional
+    /// flush of the reference: the oracle for the fused loop. Returns `0`
+    /// when the stream does not fit.
+    fn encode_reference(dst: &mut [u8], tables: &FseTables, store: &SeqStore) -> usize {
+        use crate::shared::format::{LL_BITS, ML_BITS};
+        let Some(mut writer) = BitWriter::new(dst) else {
+            return 0;
+        };
+        let n = store.nb_seq();
+        let (seqs, codes) = (&store.sequences[..n], &store.codes[..n]);
+        let ll_bits = |code: u8| u32::from(LL_BITS[usize::from(code)]);
+        let ml_bits = |code: u8| u32::from(ML_BITS[usize::from(code)]);
+        let last = &codes[n - 1];
+        let mut state_ml = CState::with_first_symbol(&tables.matchlength, u32::from(last.ml));
+        let mut state_of = CState::with_first_symbol(&tables.offcode, u32::from(last.of));
+        let mut state_ll = CState::with_first_symbol(&tables.litlength, u32::from(last.ll));
+        writer.add_bits(u64::from(seqs[n - 1].lit_length), ll_bits(last.ll));
+        writer.add_bits(u64::from(seqs[n - 1].ml_base), ml_bits(last.ml));
+        writer.add_bits(u64::from(seqs[n - 1].off_base), u32::from(last.of));
+        writer.flush();
+        for (seq, codes) in seqs[..n - 1].iter().zip(&codes[..n - 1]).rev() {
+            let (ll, ml, of) = (ll_bits(codes.ll), ml_bits(codes.ml), u32::from(codes.of));
+            state_of.encode(&mut writer, u32::from(codes.of));
+            state_ml.encode(&mut writer, u32::from(codes.ml));
+            state_ll.encode(&mut writer, u32::from(codes.ll));
+            if of + ml + ll >= 64 - 7 - (LL_FSE_LOG + ML_FSE_LOG + OFF_FSE_LOG) {
+                writer.flush();
+            }
+            writer.add_bits(u64::from(seq.lit_length), ll);
+            writer.add_bits(u64::from(seq.ml_base), ml);
+            if of + ml + ll > 56 {
+                writer.flush();
+            }
+            writer.add_bits(u64::from(seq.off_base), of);
+            writer.flush();
+        }
+        state_ml.flush(&mut writer);
+        state_of.flush(&mut writer);
+        state_ll.flush(&mut writer);
+        writer.close()
+    }
+
+    /// A store of `count` pseudo-random sequences whose lengths and offsets
+    /// span every code, so the extra bits of one sequence range from none
+    /// to the 63 that need a flush in between; `long` makes one length
+    /// exceed 16 bits.
+    fn random_store(seed: &mut u64, count: usize, long: Option<bool>) -> SeqStore {
+        let mut next = move || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let mut store = SeqStore::default();
+        store.reserve(1 << 22, 3);
+        for i in 0..count {
+            let r = next();
+            // Bit widths drawn first, so small and huge values are equally
+            // likely.
+            let ll = (r & 0xFFFF) as usize >> (r >> 16 & 15);
+            let ml = 3 + ((r >> 20 & 0xFFFF) as usize >> (r >> 36 & 15));
+            let off = ((r >> 40) as u32 | 1 << 23) >> (r >> 59);
+            let off_base = if r >> 62 == 0 {
+                repcode_to_offbase(1 + (r >> 8) as u32 % 3)
+            } else {
+                offset_to_offbase(off.max(1))
+            };
+            match long {
+                Some(true) if i == count / 2 => store.store_seq_only(0x10000 + ll, off_base, ml),
+                Some(false) if i == count / 2 => store.store_seq_only(ll, off_base, 0x10003 + ml),
+                _ => store.store_seq_only(ll, off_base, ml),
+            }
+        }
+        store
+    }
 
     #[test]
-    fn padded_extra_bits_extend_the_format_tables_with_zeros() {
-        let ll = padded_bits(LL_BITS);
-        assert_eq!(ll[..LL_BITS.len()], LL_BITS);
-        assert!(ll[LL_BITS.len()..].iter().all(|&b| b == 0));
-        assert_eq!(ML_EXTRA_BITS[..ML_BITS.len()], ML_BITS);
-        assert_eq!(LL_EXTRA_BITS, ll);
+    fn fused_encoding_matches_the_reference_loop() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for (count, long) in [
+            (1usize, None),
+            (2, None),
+            (7, Some(true)),
+            (300, None),
+            (300, Some(false)),
+            (5000, Some(true)),
+        ] {
+            let mut store = random_store(&mut seed, count, long);
+            let prev = FseTables::default();
+            let mut next = FseTables::default();
+            let mut headers = [0u8; 1024];
+            for strategy in [Strategy::Fast, Strategy::BtOpt] {
+                build_statistics(
+                    &mut store,
+                    &prev,
+                    &mut next,
+                    &mut headers,
+                    strategy,
+                    Backend::default(),
+                )
+                .expect("statistics");
+                assert!(
+                    store.codes[..count]
+                        .iter()
+                        .any(|codes| u32::from(codes.extra_bits) >= EXTRA_BITS_WITHOUT_FLUSH)
+                        || count < 300,
+                    "the slow path is exercised"
+                );
+                let mut expected = alloc::vec![0u8; count * 16 + 64];
+                let size = encode_reference(&mut expected, &next, &store);
+                assert_ne!(size, 0);
+                // Room to spare, just enough, and too little by one byte or
+                // by everything.
+                for capacity in [expected.len(), size + 8, size + 7, 9, 8] {
+                    let mut want = alloc::vec![0u8; capacity];
+                    let fits = encode_reference(&mut want, &next, &store);
+                    for backend in Backend::available() {
+                        let mut got = alloc::vec![0u8; capacity];
+                        let result = encode(&mut got, &next, &store, backend);
+                        if fits == 0 {
+                            assert_eq!(result, Err(CoreError::DstSizeTooSmall), "{capacity}");
+                        } else {
+                            assert_eq!(result, Ok(fits), "{capacity} {backend}");
+                            assert_eq!(got[..fits], want[..fits], "{capacity} {backend}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_store_has_no_bitstream() {
+        let store = SeqStore::default();
+        let mut dst = [0u8; 64];
+        assert_eq!(
+            encode(&mut dst, &FseTables::default(), &store, Backend::default()),
+            Err(CoreError::Generic)
+        );
+        assert_eq!(
+            encode(
+                &mut dst[..8],
+                &FseTables::default(),
+                &store,
+                Backend::default()
+            ),
+            Err(CoreError::DstSizeTooSmall)
+        );
     }
 
     #[test]
@@ -614,7 +761,8 @@ mod tests {
                 Histogram {
                     count: &mut count,
                     max: 3,
-                    codes: &[3],
+                    nb_seq: 1,
+                    last: 3,
                 },
             ),
             Err(CoreError::DstSizeTooSmall)

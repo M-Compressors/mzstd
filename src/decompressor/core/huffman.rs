@@ -45,15 +45,35 @@ const INDEX_MASK: usize = TABLE_SIZE - 1;
 /// the high byte.
 type Row = u16;
 
-/// A pair lookup row, the reference's `HUF_DEltX2`: one or two symbols,
-/// the bits they take, and eight times their count (the shift that places
-/// the next symbols). The fast loop reads each field from memory as it
-/// needs it, as the reference does.
+/// A pair lookup row, the reference's `HUF_DEltX2`: one or two symbols in
+/// the low 16 bits, the bits they take in the next byte, and eight times
+/// their count (the shift that places the next symbols) in the top byte.
+/// Packed in one word, a row of one symbol and a row continuing it add up
+/// to the row of both, which keeps the table build to one add per row.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct PairRow {
-    symbols: u16,
-    nb_bits: u8,
-    shift: u8,
+#[repr(transparent)]
+struct PairRow(u32);
+
+impl PairRow {
+    /// Packs a row.
+    const fn new(symbols: u16, nb_bits: u8, shift: u8) -> Self {
+        Self(symbols as u32 | (nb_bits as u32) << 16 | (shift as u32) << 24)
+    }
+
+    /// The decoded symbols, first one in the low byte.
+    const fn symbols(self) -> u16 {
+        self.0 as u16
+    }
+
+    /// The bits the symbols take.
+    const fn nb_bits(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+
+    /// Eight times the number of symbols.
+    const fn shift(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
 }
 
 /// Packs a row.
@@ -206,6 +226,10 @@ fn single_rounds<const K: usize>(
     sentinels: &mut [Sentinel; 4],
 ) -> usize {
     let src = streams.src;
+    // Every sentinel sits at least eight bytes before the end.
+    let Some(last) = src.len().checked_sub(8) else {
+        return 0;
+    };
     let [b1, b2, b3, b4, _] = streams.segments;
     // The fourth segment is the shortest.
     let length = streams.segments[4] - b4;
@@ -217,10 +241,10 @@ fn single_rounds<const K: usize>(
             break;
         }
         for _ in 0..rounds {
-            s1.reload(src);
-            s2.reload(src);
-            s3.reload(src);
-            s4.reload(src);
+            s1.reload(src, last);
+            s2.reload(src, last);
+            s3.reload(src, last);
+            s4.reload(src, last);
             let mut q = [[0u8; K]; 4];
             for k in 0..K {
                 for (quad, sentinel) in q.iter_mut().zip([&mut s1, &mut s2, &mut s3, &mut s4]) {
@@ -257,6 +281,9 @@ fn pair_rounds<const K: usize>(
 ) -> [usize; 4] {
     const { assert!(2 * K <= 8 && K * LOOKUP_BITS as usize + 7 <= 64) };
     let src = streams.src;
+    let Some(last) = src.len().checked_sub(8) else {
+        return [0; 4];
+    };
     let segments = streams.segments;
     let mut ops = [segments[0], segments[1], segments[2], segments[3]];
     let [mut s1, mut s2, mut s3, mut s4] = *sentinels;
@@ -274,14 +301,14 @@ fn pair_rounds<const K: usize>(
             // live at a time.
             let out = &mut *streams.out;
             for (op, sentinel) in ops.iter_mut().zip([&mut s1, &mut s2, &mut s3, &mut s4]) {
-                sentinel.reload(src);
+                sentinel.reload(src, last);
                 let mut word = 0u64;
                 let mut shift = 0u32;
                 for _ in 0..K {
-                    let pair = &pairs[sentinel.peek(LOOKUP_SHIFT)];
-                    sentinel.skip(u32::from(pair.nb_bits));
-                    word |= u64::from(pair.symbols) << (shift & 63);
-                    shift += u32::from(pair.shift);
+                    let pair = pairs[sentinel.peek(LOOKUP_SHIFT)];
+                    sentinel.skip(u32::from(pair.nb_bits()));
+                    word |= u64::from(pair.symbols()) << (shift & 63);
+                    shift += u32::from(pair.shift());
                 }
                 let at = *op & u32::MAX as usize;
                 out[at..at + 8].copy_from_slice(&word.to_le_bytes());
@@ -402,29 +429,49 @@ impl HuffmanTable {
     /// A row pairs the code at the top of its index with the code that
     /// follows when both fit in the lookup; decoding then reads exactly
     /// the bits of the symbols it yields, as the single-symbol table does.
+    ///
+    /// A code of `b` bits fills a run of `1 << (12 - b)` rows, whose `j`th
+    /// row continues with the code at row `j << b`. Every code of one
+    /// length is therefore followed by the same series, built once per
+    /// length (the reference's `HUF_fillDTableX2Level2` per rank); each row
+    /// of the run is that series' row plus the first symbol's.
     fn build_pairs(&mut self) {
-        let rows = &self.rows;
+        let rows = &*self.rows;
         let pairs = self
             .pairs
             .get_or_insert_with(|| Box::new([PairRow::default(); TABLE_SIZE]));
-        for (index, pair) in pairs.iter_mut().enumerate() {
+        // The first run of each length is built from the rows; later runs
+        // of that length copy it, swapping in their own first symbol.
+        let mut series = (0, 0, 0);
+        let mut index = 0;
+        while index < TABLE_SIZE {
             let first = rows[index];
-            let first_bits = u32::from(first >> 8);
-            let second = rows[(index << first_bits) & INDEX_MASK];
-            let second_bits = u32::from(second >> 8);
-            *pair = if first_bits + second_bits <= LOOKUP_BITS {
-                PairRow {
-                    symbols: u16::from(first as u8) | u16::from(second as u8) << 8,
-                    nb_bits: (first_bits + second_bits) as u8,
-                    shift: 16,
+            // Rows are built for codes of 1 to 12 bits.
+            let first_bits = u32::from(first >> 8).clamp(1, LOOKUP_BITS);
+            let len = 1 << (LOOKUP_BITS - first_bits);
+            let end = (index + len).min(TABLE_SIZE);
+            let own = PairRow::new(first & 0xff, first_bits as u8, 0).0;
+            let (series_bits, series_start, series_own) = series;
+            if first_bits == series_bits && series_start + len <= index {
+                let (built, rest) = pairs.split_at_mut(index);
+                let delta = own.wrapping_sub(series_own);
+                for (pair, model) in rest[..end - index].iter_mut().zip(&built[series_start..]) {
+                    *pair = PairRow(model.0.wrapping_add(delta));
                 }
             } else {
-                PairRow {
-                    symbols: u16::from(first as u8),
-                    nb_bits: first_bits as u8,
-                    shift: 8,
+                series = (first_bits, index, own);
+                for (j, pair) in pairs[index..end].iter_mut().enumerate() {
+                    let second = rows[(j << first_bits) & INDEX_MASK];
+                    let second_bits = u32::from(second >> 8);
+                    let next = if first_bits + second_bits <= LOOKUP_BITS {
+                        PairRow::new((second & 0xff) << 8, second_bits as u8, 16)
+                    } else {
+                        PairRow::new(0, 0, 8)
+                    };
+                    *pair = PairRow(next.0 + own);
                 }
-            };
+            }
+            index = end;
         }
         self.pairs_valid = true;
     }
@@ -826,20 +873,64 @@ mod tests {
         let pairs = table.pairs.as_deref().expect("built");
         // A = 1, then A again: two symbols in two bits.
         let both = pairs[0b11 << (LOOKUP_BITS - 2)];
-        assert_eq!(
-            both,
-            PairRow {
-                symbols: 0,
-                nb_bits: 2,
-                shift: 16
-            }
-        );
+        assert_eq!(both, PairRow::new(0, 2, 16));
+        assert_eq!((both.symbols(), both.nb_bits(), both.shift()), (0, 2, 16));
         assert!(table.pairs_valid);
         assert_eq!(table.retained_bytes(), 2 * TABLE_SIZE + 4 * TABLE_SIZE);
         // A new tree invalidates them.
         let src = [132, 0x43, 0x20, 0x10];
         table.read(&src).expect("valid");
         assert!(!table.pairs_valid);
+    }
+
+    /// The pair row of `index` by its definition, from the single rows.
+    fn naive_pair(rows: &[Row; TABLE_SIZE], index: usize) -> PairRow {
+        let first = rows[index];
+        let first_bits = u32::from(first >> 8);
+        let second = rows[(index << first_bits) & INDEX_MASK];
+        let second_bits = u32::from(second >> 8);
+        if first_bits + second_bits <= LOOKUP_BITS {
+            PairRow::new(
+                (first & 0xff) | (second & 0xff) << 8,
+                (first_bits + second_bits) as u8,
+                16,
+            )
+        } else {
+            PairRow::new(first & 0xff, first_bits as u8, 8)
+        }
+    }
+
+    #[test]
+    fn pair_rows_follow_their_definition_for_every_tree_depth() {
+        // Direct weights 1..=n for n symbols plus the implied one give a
+        // tree of depth n + 1; uniform and lopsided trees cover the rest.
+        let mut trees: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+            (1..=11).map(|n: u8| (1..=n).rev().collect()).collect();
+        trees.push(alloc::vec![1; 127]);
+        trees.push([alloc::vec![7, 6, 5], alloc::vec![1; 30]].concat());
+        trees.push([alloc::vec![9], alloc::vec![2; 40], alloc::vec![1; 30]].concat());
+        let mut checked = 0;
+        for weights in trees {
+            let mut src = alloc::vec![127 + weights.len() as u8];
+            for pair in weights.chunks(2) {
+                src.push(pair[0] << 4 | pair.get(1).copied().unwrap_or(0));
+            }
+            let Ok((mut table, _)) = read(&src) else {
+                continue;
+            };
+            table.build_pairs();
+            let pairs = table.pairs.as_deref().expect("built");
+            for (index, &pair) in pairs.iter().enumerate() {
+                assert_eq!(
+                    pair,
+                    naive_pair(&table.rows, index),
+                    "log {} index {index}",
+                    table.log
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 12, "{checked} trees");
     }
 
     #[test]

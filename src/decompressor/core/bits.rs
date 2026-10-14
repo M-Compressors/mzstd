@@ -314,12 +314,16 @@ impl Sentinel {
         self.pos - start
     }
 
-    /// Moves back by the consumed whole bytes and refills.
+    /// Moves back by the consumed whole bytes and refills. Positions
+    /// never pass `last`, the start of `src`'s last whole word: clamping to
+    /// it changes nothing but lets the compiler drop the bounds check.
     #[inline(always)]
-    pub(crate) fn reload(&mut self, src: &[u8]) {
+    pub(crate) fn reload(&mut self, src: &[u8], last: usize) {
         let consumed = self.bits.trailing_zeros();
         self.pos -= (consumed >> 3) as usize;
-        self.bits = (read64(src, self.pos) | 1) << (consumed & 7);
+        let at = self.pos.min(last);
+        let word = src[at..at + 8].try_into().unwrap_or([0; 8]);
+        self.bits = (u64::from_le_bytes(word) | 1) << (consumed & 7);
     }
 
     /// The next `64 - shift` bits.
