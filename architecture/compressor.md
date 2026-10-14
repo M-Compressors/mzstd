@@ -105,13 +105,20 @@ sequenceDiagram
     C-->>Caller: size or EncodeError
 ```
 
-All one-shot entry points funnel into `core::compress_once_into`, which is
+The slice entry points use `core::compress_once_into`, which is
 `ZSTD_compress2` with a stable input: the input is a segment of its own
 (`Segment::Input(id)`, with a fresh id per call), so the engine matches
-directly in caller memory and never copies it. `compress` sizes its output
-with `compressBound`; `compress_into` appends and rolls the vector back on
-failure; `compress_to_uninit` writes through a temporary initialized buffer
-only as large as the destination.
+directly in caller memory and never copies it. `compress_to_uninit` writes
+through a temporary initialized buffer only as large as the destination.
+
+`compress` and `compress_into` use `core::compress_once_append`: they reserve
+`compressBound` capacity, but for inputs larger than 128 KiB initialize only
+the frame header and the room required by each next block. The shared engine
+pipeline writes through `core::output::VecOutput`, reusing the initialized
+tail between blocks. Highly compressible frames therefore avoid zeroing a
+destination as large as their input. Inputs up to 128 KiB keep the slice path.
+`compress_into` preserves the existing prefix and rolls the vector back on
+failure. Returned capacity and retention policy are unchanged.
 
 A destination smaller than the frame fails with `OutputTooSmall` exactly when
 `ZSTD_compress2` fails with `dstSize_tooSmall`; the reference needs room for

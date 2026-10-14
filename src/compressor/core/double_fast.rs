@@ -5,7 +5,7 @@ use fearless_simd::Simd;
 use fearless_simd_macros::simd;
 
 use super::match_state::{BlockInput, MatchState};
-use super::mem::{count_slices, hash_ptr, hash_word, load32, load64};
+use super::mem::{count_slices_simd, hash_ptr, hash_word, load32, load64};
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
 use super::window::HASH_READ_SIZE;
 
@@ -67,6 +67,8 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     let mut anchor = istart;
     let prefix_lowest_index = ms.lowest_prefix_index(block.end, cparams.window_log);
     let prefix_lowest = (prefix_lowest_index - base) as usize;
+    // The candidate load's bound also enforces the searchable lower limit.
+    let history = &src[prefix_lowest..];
     // A block shorter than HASH_READ_SIZE never enters the search: the
     // first `ip1 > ilimit` test fails for any `ilimit < 1`.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE as usize);
@@ -79,7 +81,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     let index = |p: usize| p as u32 + base;
     let read32 = |p: usize| load32(src, p);
     let read64 = |p: usize| load64(src, p);
-    let count = |a: usize, b: usize| count_slices(&src[a..], &src[b..]);
+    let count = |a: usize, b: usize| count_slices_simd(simd, &src[a..], &src[b..]);
 
     let mut ip = istart;
     ip += usize::from(ip == prefix_lowest);
@@ -152,7 +154,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
 
             word1 = read64(ip1);
             hl1 = hash_lw(word1);
-            if idxl0 >= prefix_lowest_index && read64((idxl0 - base) as usize) == word0 {
+            if super::mem::matches64(history, idxl0.wrapping_sub(prefix_lowest_index), word0) {
                 let mut matchl0 = (idxl0 - base) as usize;
                 let mut m_length = count(ip + 8, matchl0 + 8) + 8;
                 let offset = (ip - matchl0) as u32;
@@ -165,7 +167,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
             }
 
             idxl1 = hash_long[hl1 & mask_l];
-            if idxs0 >= prefix_lowest_index && read32((idxs0 - base) as usize) == word0 as u32 {
+            if super::mem::matches32(
+                history,
+                idxs0.wrapping_sub(prefix_lowest_index),
+                word0 as u32,
+            ) {
                 break Next::SearchNextLong { idxs0, word1 };
             }
 
@@ -204,7 +210,12 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                 let mut matchs0 = (idxs0 - base) as usize;
                 let mut m_length = count(ip + 4, matchs0 + 4) + 4;
                 let mut offset = (ip - matchs0) as u32;
-                if idxl1 > prefix_lowest_index && read64((idxl1 - base) as usize) == word1 {
+                // This second long candidate uses a strict lower limit in C.
+                if super::mem::matches64(
+                    &history[1..],
+                    idxl1.wrapping_sub(prefix_lowest_index + 1),
+                    word1,
+                ) {
                     let matchl1 = (idxl1 - base) as usize;
                     let l1len = count(ip1 + 8, matchl1 + 8) + 8;
                     if l1len > m_length {
@@ -371,7 +382,7 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
                 prefix_start_index,
             )
         } else {
-            count_slices(&src[ip..], &src[(m - base) as usize..])
+            count_slices_simd(simd, &src[ip..], &src[(m - base) as usize..])
         }
     };
     // Backward extension of a match at window index `m` for offset `ip`.

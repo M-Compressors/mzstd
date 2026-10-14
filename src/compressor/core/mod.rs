@@ -13,6 +13,7 @@ pub(crate) mod match_state;
 pub(crate) mod mem;
 pub(crate) mod opt;
 mod opt_count;
+mod output;
 pub(crate) mod params;
 pub(crate) mod presplit;
 pub(crate) mod seq_store;
@@ -22,7 +23,6 @@ pub(crate) mod window;
 
 #[cfg(test)]
 use alloc::vec;
-#[cfg(test)]
 use alloc::vec::Vec;
 
 use cctx::{Engine, RequestedParams};
@@ -49,6 +49,37 @@ pub(crate) fn compress_once_into(
     };
     let src = Addr::new(Segment::Input(input_id), 0);
     engine.compress_end(&segments, dst, src, input.len())
+}
+
+/// The same frame pipeline with output initialized one block at a time.
+pub(crate) fn compress_once_append(
+    engine: &mut Engine,
+    requested: &RequestedParams,
+    input: &[u8],
+    input_id: u64,
+    dst: &mut Vec<u8>,
+    bound: usize,
+) -> Result<usize, CoreError> {
+    let start = dst.len();
+    let limit = start.checked_add(bound).ok_or(CoreError::DstSizeTooSmall)?;
+    dst.reserve(bound);
+    let pledged = input.len() as u64;
+    engine.begin(requested.resolve(pledged), pledged);
+    let segments = Segments {
+        buffer: &[],
+        input: (input, input_id),
+    };
+    let src = Addr::new(Segment::Input(input_id), 0);
+    engine.compress_end_to(
+        &segments,
+        &mut output::VecOutput {
+            buffer: dst,
+            start,
+            limit,
+        },
+        src,
+        input.len(),
+    )
 }
 
 /// [`compress_once_into`] into a fresh buffer of `compressBound` bytes.
@@ -317,6 +348,7 @@ mod advanced_tests {
         ];
         let mut rng = corpus::Rng::new(env_number(option_env!("MZSTD_SEED"), 0xDEAD_BEEF));
         let mut engine = Engine::new();
+        let mut append_engine = Engine::new();
         let default_cases = if cfg!(debug_assertions) { 30 } else { 300 };
         let cases = env_number(option_env!("MZSTD_CASES"), default_cases) as usize;
         for case in 0..cases {
@@ -324,6 +356,21 @@ mod advanced_tests {
             let input = &inputs[case % inputs.len()];
             let expected = zstd_ffi::oracle::compress2(input, &oracle_params(&requested));
             let ours = compress_once(&mut engine, &requested, input, case as u64);
+            let mut appended = vec![0xa5; 7];
+            let appended_result = compress_once_append(
+                &mut append_engine,
+                &requested,
+                input,
+                case as u64,
+                &mut appended,
+                cctx::compress_bound(input.len()).unwrap(),
+            )
+            .map(|size| appended[7..7 + size].to_vec());
+            assert_eq!(&appended[..7], &[0xa5; 7]);
+            assert_eq!(
+                appended_result, ours,
+                "Vec vs slice, case {case}: {requested:?}"
+            );
             match (ours, expected) {
                 (Ok(ours), Ok(expected)) => assert!(
                     ours == expected,

@@ -2,19 +2,43 @@
 
 ## Unreleased
 
+- **Reuse the Huffman tree during depth selection.** Optimal-depth trials
+  restore leaf lengths from the original internal nodes instead of sorting
+  and rebuilding the same tree for each depth. Table selection and encoded
+  bytes remain identical to zstd 1.5.7.
+
+- **Less work on incompressible blocks.** After a failed Huffman attempt,
+  raw literals that already exceed the block's compression threshold cause
+  an early raw-block decision. This avoids copying a literals section and
+  encoding sequences that would be discarded. Short output buffers retain
+  their existing error behavior, and frames remain byte-identical to C.
+
+- **Simpler fast/dfast candidate checks.** Bounded reads from the searchable
+  history reject stale indices and guard the comparison word with one range
+  check. The search order and minimum-match specializations are unchanged.
+
+- **Wider match comparisons.** Fast, double-fast and lazy search share a
+  word-first, 128-byte scan in the selected SIMD backend. On AVX2 it tests
+  four vectors together, then resolves the first differing word. Short
+  matches and bounded tails keep their exact bytewise semantics.
+
+- **Less output initialization in cold compression.** `compress` and
+  `compress_into` reserve the same capacity but initialize the output of
+  inputs larger than 128 KiB one block at a time, reusing unwritten room.
+  The RLE check uses bulk slice comparison. Frames remain byte-identical
+  to zstd 1.5.7; caller-owned slices keep their exact capacity semantics.
+
 - **Faster empty and tiny inputs at levels 11-22.** The optimal parser's
   position and match tables are sized per block on first use
   (`min(block + 3, ZSTD_OPT_SIZE)` entries) instead of being filled to
-  4099 entries at every frame start. Cold `Compressor::new(level 19)
-  .compress(b"")` went from 4.08 to 0.49 µs (zstd 1.5.7: 0.98 µs) and a
-  44-byte input at level 13 from 8.5 to 5.1 µs (zstd: 5.2 µs). Frames are
-  unchanged.
-- **Faster run-length input.** The RLE block test compares 32-byte chunks
-  instead of single bytes, and match lengths beyond 32 bytes are counted
-  32 bytes at a time. 1 MiB of one repeated byte compresses in 65 µs at
-  level 1 (was 332 µs; zstd 59 µs), 114 µs at level 3 (was 387 µs; zstd
-  111 µs) and 705 µs at level 9 (was 913 µs; zstd 715 µs). Frames are
-  unchanged.
+  4099 entries at every frame start. Frames are unchanged.
+
+- Updated [compression benchmarks](docs/benchmarks/encoder-comparison.md)
+  for the final working tree: 384 measurements, median speed relative to C
+  1.000×, with lower mean latency in 96 of 192 dataset/level pairs. All
+  frames remain byte-identical to zstd 1.5.7. Large text remains slower;
+  the aggregate does not establish an overall lead.
+
 - **Faster `Decompressor::decompress` and `decompress_into`.** Raw and RLE
   blocks are appended in one pass instead of zeroing room and copying over
   it; frames that declare a content size are decoded into a vector cut at

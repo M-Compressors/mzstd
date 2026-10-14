@@ -116,6 +116,18 @@ impl<'a> Mem<'a> {
 /// tail. Only a run shorter than a word is compared byte by byte.
 #[inline]
 pub(crate) fn count_slices(a: &[u8], b: &[u8]) -> usize {
+    count_slices_with(a, b, count_long)
+}
+
+/// The same exact count in the match finder's already-selected SIMD context.
+/// The first word stays inline; only longer runs enter the feature-enabled scan.
+#[inline]
+pub(crate) fn count_slices_simd<S: fearless_simd::Simd>(simd: S, a: &[u8], b: &[u8]) -> usize {
+    count_slices_with(a, b, |a, b| count_long_simd(simd, a, b))
+}
+
+#[inline(always)]
+fn count_slices_with(a: &[u8], b: &[u8], long: impl FnOnce(&[u8], &[u8]) -> usize) -> usize {
     let limit = a.len().min(b.len());
     let (a, b) = (&a[..limit], &b[..limit]);
     let (Some(first_a), Some(first_b)) = (a.first_chunk::<8>(), b.first_chunk::<8>()) else {
@@ -125,19 +137,30 @@ pub(crate) fn count_slices(a: &[u8], b: &[u8]) -> usize {
     if difference != 0 {
         return difference.trailing_zeros() as usize >> 3;
     }
-    count_long(a, b)
+    long(a, b)
 }
 
-/// [`count_slices`] past an equal first word, kept out of line: most
-/// candidates differ within it, and the word loop's setup would otherwise be
-/// hoisted into every caller's search loop.
-///
-/// Words are compared up to 32 bytes, where most matches end; longer runs
-/// are skipped 32 bytes at a time, OR-ing the chunks' differences in vector
-/// registers, and the word loop then finds the first difference in the
-/// chunk that has one.
+/// Baseline callers keep their compact 32-byte loop. Keeping the scan out
+/// of line avoids hoisting its setup into the first-word candidate check.
 #[inline(never)]
 fn count_long(a: &[u8], b: &[u8]) -> usize {
+    count_long_chunks::<32>(a, b)
+}
+
+/// Inline the dispatch wrapper, while its feature-enabled entry stays out
+/// of line. Auto-vectorization of the 128-byte XOR/OR reduction uses four
+/// AVX2 registers and one combined test, without retaining per-vector masks.
+#[fearless_simd_macros::simd]
+#[inline(always)]
+fn count_long_simd<S: fearless_simd::Simd>(simd: S, a: &[u8], b: &[u8]) -> usize {
+    count_long_chunks::<128>(a, b)
+}
+
+/// Past an equal first word: words up to 32 bytes, large chunks, 32-byte
+/// chunks, words, then an overlapping last word. The intermediate loop
+/// handles both a mismatching large chunk and a tail shorter than one.
+#[inline(always)]
+fn count_long_chunks<const CHUNK: usize>(a: &[u8], b: &[u8]) -> usize {
     let word = |at: usize| -> Option<u64> {
         let x = a.get(at..at + 8)?;
         let y = b.get(at..at + 8)?;
@@ -151,14 +174,26 @@ fn count_long(a: &[u8], b: &[u8]) -> usize {
             None => return count_tail(a, b, matched),
         }
     }
+    if CHUNK > 32 {
+        while let (Some(x), Some(y)) = (
+            a.get(matched..matched + CHUNK)
+                .and_then(|x| <&[u8; CHUNK]>::try_from(x).ok()),
+            b.get(matched..matched + CHUNK)
+                .and_then(|y| <&[u8; CHUNK]>::try_from(y).ok()),
+        ) {
+            if x.iter().zip(y).fold(0u8, |acc, (p, q)| acc | (p ^ q)) != 0 {
+                break;
+            }
+            matched += CHUNK;
+        }
+    }
     while let (Some(x), Some(y)) = (
         a.get(matched..matched + 32)
             .and_then(|x| <&[u8; 32]>::try_from(x).ok()),
         b.get(matched..matched + 32)
             .and_then(|y| <&[u8; 32]>::try_from(y).ok()),
     ) {
-        let differs = x.iter().zip(y).fold(0u8, |acc, (p, q)| acc | (p ^ q));
-        if differs != 0 {
+        if x.iter().zip(y).fold(0u8, |acc, (p, q)| acc | (p ^ q)) != 0 {
             break;
         }
         matched += 32;
@@ -337,6 +372,32 @@ pub(crate) fn load64(src: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
+/// Compares a four-byte candidate if the whole word is in `src`.
+/// Match finders pass the searchable history and an index with its lower
+/// bound subtracted using wrapping arithmetic. An older index becomes a
+/// large offset, so the same range check rejects stale entries and guards
+/// the word load. No bytes outside the history are read.
+#[inline(always)]
+pub(crate) fn matches32(src: &[u8], at: u32, word: u32) -> bool {
+    let at = at as usize;
+    let Some(end) = at.checked_add(4) else {
+        return false;
+    };
+    src.get(at..end)
+        .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == word)
+}
+
+/// Eight-byte counterpart of [`matches32`].
+#[inline(always)]
+pub(crate) fn matches64(src: &[u8], at: u32, word: u64) -> bool {
+    let at = at as usize;
+    let Some(end) = at.checked_add(8) else {
+        return false;
+    };
+    src.get(at..end)
+        .is_some_and(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()) == word)
+}
+
 /// The nine bytes at offset `at` of `src`: a probed position and the one
 /// after it, both readable as whole words without further bounds tests
 /// ([`window_word`]).
@@ -420,6 +481,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn candidate_words_reject_stale_indices_and_partial_tails() {
+        let bytes: alloc::vec::Vec<_> = (0..32u8).collect();
+        for start in 0..8 {
+            for end in start..=bytes.len() {
+                let history = &bytes[start..end];
+                for index in 0..=40u32 {
+                    let at = index.wrapping_sub(start as u32);
+                    let word32 = [
+                        index as u8,
+                        (index + 1) as u8,
+                        (index + 2) as u8,
+                        (index + 3) as u8,
+                    ];
+                    let word64 = core::array::from_fn(|i| (index + i as u32) as u8);
+                    assert_eq!(
+                        matches32(history, at, u32::from_le_bytes(word32)),
+                        index as usize >= start && index as usize + 4 <= end
+                    );
+                    assert_eq!(
+                        matches64(history, at, u64::from_le_bytes(word64)),
+                        index as usize >= start && index as usize + 8 <= end
+                    );
+                    assert!(!matches32(history, at, u32::MAX));
+                    assert!(!matches64(history, at, u64::MAX));
+                }
+                for at in u32::MAX - 8..=u32::MAX {
+                    assert!(!matches32(history, at, 0));
+                    assert!(!matches64(history, at, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reads_are_little_endian_and_index_addressed() {
         let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
         let mem = Mem::new(&bytes, 100);
@@ -496,6 +591,42 @@ mod tests {
             }
             // The shorter side bounds the count.
             assert_eq!(count_slices(&base, a), len);
+        }
+    }
+
+    #[test]
+    fn simd_counts_match_bytewise_at_unaligned_chunk_boundaries() {
+        use crate::Backend;
+
+        let lengths: alloc::vec::Vec<usize> = (0..=65)
+            .chain([127, 128, 129, 159, 160, 161, 255, 256, 257, 511, 512])
+            .collect();
+        let base: alloc::vec::Vec<u8> = (0..576).map(|i| (i * 37) as u8).collect();
+        for backend in Backend::available() {
+            for (left_offset, right_offset) in [(0, 1), (1, 0), (3, 7), (15, 31), (31, 63)] {
+                for &len in &lengths {
+                    let left = &base[left_offset..left_offset + len];
+                    let mut storage = alloc::vec![0u8; right_offset + len + 1];
+                    storage[right_offset..right_offset + len].copy_from_slice(left);
+                    for diff in 0..=len {
+                        if diff < len {
+                            storage[right_offset + diff] ^= 0x80;
+                        }
+                        let right = &storage[right_offset..];
+                        let expected = count_bytewise(left, right);
+                        let got = fearless_simd::dispatch!(backend.0, simd => count_slices_simd(simd, left, right));
+                        assert_eq!(got, expected, "{backend} len {len} diff {diff}");
+                        let reversed = fearless_simd::dispatch!(backend.0, simd => count_slices_simd(simd, right, left));
+                        assert_eq!(
+                            reversed, expected,
+                            "{backend} reversed len {len} diff {diff}"
+                        );
+                        if diff < len {
+                            storage[right_offset + diff] ^= 0x80;
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -14,6 +14,7 @@ use super::entropy::{FseRepeat, Tables};
 use super::error::CoreError;
 use super::ldm::{LdmState, RawSeqStore};
 use super::match_state::MatchState;
+use super::output::{Output, SliceOutput};
 use super::params::{
     self, CONTENT_SIZE_UNKNOWN, CParamOverrides, CParams, LDM_DEFAULT_WINDOW_LOG, ParamSwitch,
     Strategy,
@@ -399,13 +400,26 @@ impl Engine {
         len: usize,
         last_frame_chunk: bool,
     ) -> Result<usize, CoreError> {
+        self.compress_continue_to(segments, &mut SliceOutput(dst), src, len, last_frame_chunk)
+    }
+
+    fn compress_continue_to<O: Output>(
+        &mut self,
+        segments: &Segments<'_>,
+        dst: &mut O,
+        src: Addr,
+        len: usize,
+        last_frame_chunk: bool,
+    ) -> Result<usize, CoreError> {
         if self.stage == Stage::Created {
             return Err(CoreError::StageWrong);
         }
         let mut fh_size = 0;
         if self.stage == Stage::Init {
-            fh_size =
-                self.write_frame_header(dst, self.pledged_src_size_plus_one.wrapping_sub(1))?;
+            fh_size = self.write_frame_header(
+                dst.prepare(0, FRAME_HEADER_SIZE_MAX)?,
+                self.pledged_src_size_plus_one.wrapping_sub(1),
+            )?;
             self.stage = Stage::Ongoing;
         }
         if len == 0 {
@@ -423,7 +437,7 @@ impl Engine {
             self.ldm.window.update(src, len, false);
         }
         let c_size =
-            self.compress_frame_chunk(segments, &mut dst[fh_size..], src, len, last_frame_chunk)?;
+            self.compress_frame_chunk(segments, dst, fh_size, src, len, last_frame_chunk)?;
         self.consumed_src_size += len as u64;
         self.produced_c_size += (c_size + fh_size) as u64;
         if self.pledged_src_size_plus_one != 0
@@ -443,8 +457,19 @@ impl Engine {
         src: Addr,
         len: usize,
     ) -> Result<usize, CoreError> {
-        let c_size = self.compress_continue(segments, dst, src, len, true)?;
-        let end = self.write_epilogue(&mut dst[c_size..])?;
+        self.compress_end_to(segments, &mut SliceOutput(dst), src, len)
+    }
+
+    pub(crate) fn compress_end_to<O: Output>(
+        &mut self,
+        segments: &Segments<'_>,
+        dst: &mut O,
+        src: Addr,
+        len: usize,
+    ) -> Result<usize, CoreError> {
+        let c_size = self.compress_continue_to(segments, dst, src, len, true)?;
+        let end = self
+            .write_epilogue(dst.prepare(c_size, FRAME_HEADER_SIZE_MAX + BLOCK_HEADER_SIZE + 4)?)?;
         if self.pledged_src_size_plus_one != 0
             && self.pledged_src_size_plus_one != self.consumed_src_size + 1
         {
@@ -523,10 +548,11 @@ impl Engine {
 
     /// Compresses a chunk into one or more blocks (`ZSTD_compress_frameChunk`).
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
-    fn compress_frame_chunk(
+    fn compress_frame_chunk<O: Output>(
         &mut self,
         segments: &Segments<'_>,
-        dst: &mut [u8],
+        dst: &mut O,
+        output_start: usize,
         src: Addr,
         len: usize,
         last_frame_chunk: bool,
@@ -537,7 +563,7 @@ impl Engine {
         // Positions are tracked as addresses: overflow correction and the
         // btultra2 statistics pass both move the window's base.
         let mut pos = src;
-        let mut op = 0usize;
+        let mut op = output_start;
         let start_index = self.ms.window.index_of(src);
 
         if self.applied.fparams.checksum {
@@ -556,7 +582,11 @@ impl Engine {
             let block_size =
                 self.optimal_block_size(view.prefix.slice(ip, ip + remaining as u32), savings);
             let last_block = last_frame_chunk && block_size == remaining;
-            if dst.len() - op < BLOCK_HEADER_SIZE + 2 + 1 {
+            let out = dst.prepare(
+                op,
+                compress_bound(block_size).ok_or(CoreError::SrcSizeWrong)?,
+            )?;
+            if out.len() < BLOCK_HEADER_SIZE + 2 + 1 {
                 return Err(CoreError::DstSizeTooSmall);
             }
             self.overflow_correct_if_needed(ip, ip + block_size as u32);
@@ -573,7 +603,6 @@ impl Engine {
 
             let view = self.ms.window.view(segments, block_end);
             let block_src = view.prefix.slice(ip, block_end);
-            let out = &mut dst[op..];
             let c_size = if self.applied.post_block_splitter {
                 super::split_block::compress_split_block(
                     self, segments, &view, ip, block_end, out, last_block,
@@ -602,10 +631,10 @@ impl Engine {
             self.is_first_block = false;
         }
 
-        if last_frame_chunk && op > 0 {
+        if last_frame_chunk && op > output_start {
             self.stage = Stage::Ending;
         }
-        Ok(op)
+        Ok(op - output_start)
     }
 
     /// Bytes held by tables and buffers between frames.

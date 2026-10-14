@@ -12,11 +12,12 @@ deviation changes some frame.
 
 ```mermaid
 graph TD
-    Mod["core::mod: compress_once_into"] --> Cctx[cctx: Engine, params, frame chunks]
+    Mod["core::mod: compress_once_into, compress_once_append"] --> Cctx[cctx: Engine, params, frame chunks]
     Stream[stream: ZSTD_compressStream2] --> Cctx
     Cctx --> Params[params: levels, bounds, adjust, resolve]
     Cctx --> Window[window: Segment, Addr, WindowState]
     Cctx --> Block[block: buildSeqStore, entropy, block emit]
+    Cctx --> Output["output: fixed slice or incrementally initialized Vec"]
     Cctx --> Presplit[presplit: pre-splitter]
     Block --> Split[split_block: post splitter]
     Block --> MS[match_state: tables, opt state]
@@ -225,8 +226,18 @@ sequenceDiagram
     two-container, unrolled loop, whose shape depends on the table log and
     on whether the destination holds the tight bound; every shape writes
     the bits the one-symbol-at-a-time writer writes (tested against it).
+    Optimal-depth selection sorts and builds the unlimited tree once.
+    Each subsequent depth trial restores leaf lengths from the unchanged
+    internal-node heights before applying the reference's height limit;
+    table pricing, tie order and the selected depth are unchanged.
   - `sequences::encode` walks the codes with zipped iterators and masked
     table indices.
+- `literals::try_compress` reports a raw-literals fallback without copying
+  it. If those raw bytes alone reach `block_size - min_gain`, entropy coding
+  returns the raw-block decision immediately. This shortcut requires a
+  destination large enough for the raw block; smaller caller-owned buffers
+  follow the reference's original capacity/error path. A block with no
+  sequences can still use Huffman literals, so the Huffman attempt is kept.
 - `presplit` (`ZSTD_splitBlock`, by fingerprint distance) chooses block sizes
   before match finding for the strategies that enable it; `split_block`
   (`ZSTD_compressBlock_splitBlock`) splits the sequences of a finished block
@@ -286,8 +297,13 @@ reference's templates are:
 - positions are offsets into the block's prefix slice and the reference's
   `base` is the prefix's first index, so a read is one fixed-width load
   (`mem::load32`, `mem::load64`) with a single bound test;
+- no-dictionary candidates are read from the searchable history slice with
+  `mem::matches32` / `matches64`. Wrapping subtraction of the lower window
+  index turns a stale entry into an out-of-range offset, so one fallible
+  word read checks both the lower limit and the end of the readable input;
 - hash indices are masked with `len - 1` after an up-front non-empty
-  assertion, which proves them in bounds without a compare;
+  assertion; this bounds the index, although the compiler can retain a
+  comparison when a masked value passes through the search loop's state;
 - the fast loop keeps only `ip0` and `ip2` of the reference's
   `ip0..ip3` pipeline (`ip1 = ip0 + 1`, `ip3 = ip2 + 1` at every probe),
   and reads both probed positions of each through a nine-byte window
@@ -313,11 +329,18 @@ line, `count_long` compares words up to 32 bytes, where most matches end,
 then skips equal 32-byte chunks (their XORs OR-ed in vector registers), then
 finds the difference a word at a time, finishing with one word that ends at
 the limit. Run-length inputs, whose matches span whole blocks, spend their
-time there.
+time there. Fast/dfast and lazy search use `mem::count_slices_simd` in
+the already-selected backend: the same short-word path, then 128-byte
+chunks and a 32-byte cleanup loop. The XOR/OR reduction auto-vectorizes
+to four AVX2 registers and one `vptest` per 128 bytes. The first differing
+chunk is resolved in byte order with words; every load stays inside both
+windows. The feature-entry wrapper is inlined, while the scan stays out
+of the candidate loop.
 
 `block::is_rle` (`ZSTD_isRLE`) decides whether a compressed block is
-re-emitted as an RLE block; it compares 32-byte chunks against the first
-byte, which compiles to vector compares.
+re-emitted as an RLE block. It compares `src[1..]` with
+`src[..src.len() - 1]`: equal adjacent bytes imply a constant run. Slice
+equality delegates the bulk scan to the platform comparison implementation.
 
 ### Lazy finders and SIMD dispatch
 
@@ -365,7 +388,7 @@ Kernels, all safe code:
 | Kernel | Reference | What it does |
 | --- | --- | --- |
 | `lazy::row::match_mask` | `ZSTD_row_getMatchMask` | One `u8x16`/`u8x32`/`u8x64` compare of a tag row with the tag, `to_bitmask`, then a rotation so bit 0 is the row's head. |
-| `lazy::count::count`, `common_run` | `ZSTD_count` | The first 8 bytes inline (XOR + trailing zeros). Past them, `long_run` (out of line, `#[simd]`) compares two more words, then native vectors, then words, then one overlapping last word. |
+| `lazy::count::count`, `common_run` | `ZSTD_count` | Window adapters for the shared `mem::count_slices_simd` word and vector scan described above. |
 | `Ctx::tree_step` | `ZSTD_count` + byte compare in the DUBT | Without an extDict, one 8-byte load per side gives both the common length and the two bytes that order the runs. |
 | `Probe` | `MEM_read32(match + ml - 3) == MEM_read32(ip + ml - 3)` | Cuts the searched window once per search (to the block end, which can precede the prefix end under LDM), and keeps its probe word until `ml` changes. |
 
@@ -468,38 +491,23 @@ buffers are always large enough) into `EncodeError::Internal`.
 
 ## Known gaps
 
-- SIMD: the lazy finders compare row tags with one vector compare and
-  count long matches with native vectors; the optimal parser and LDM use
-  vector match-length kernels (`opt_count`); fast/dfast and the entropy
-  coders run in the backend's feature context without vector code.
+- SIMD: the lazy finders compare row tags with one vector compare;
+  fast/dfast and lazy search share the 128-byte match-length scan. The
+  optimal parser and LDM use native-vector kernels (`opt_count`). The entropy
+  coders run in the backend's feature context without explicit vector code.
   Histogram counting is scalar. Output is identical on every backend.
-- Levels -5 to 12 run at 0.75-0.98x the reference's speed on text and
-  random data ([benchmarks](../docs/benchmarks/encoders/README.md)). Cycle
-  profiles put the whole difference in the fast, dfast and row-based lazy
-  finders, which execute 17-52% more instructions than the reference's
-  (bounds tests on window and table reads, values spilled under register
-  pressure, per-candidate bookkeeping); entropy coding is at parity.
-  Measured against the unchanged binary on one pinned core (alternating
-  runs, about 1% noise), none of these gained on Alice at level 1: reads
-  clamped with `min` before each load (+5%, the select serializes each load
-  behind its clamp), the search loop out of line (+5%, it loses the AVX2
-  context and adds a call per match), the reference's branchless candidate
-  test via `select_unpredictable` (+0-4%), a constant table size for the
-  block's hash log (+2%), direct loads instead of the 9-byte window (±0),
-  `count_long` inlined (±1%), a sequence store with preallocated slots and
-  cursors (+2% instructions), and, at levels 5-9, per-block row
-  specialization, per-candidate prefetch and 64-byte-aligned rows (±0). As
-  an upper bound, a throwaway build with every read in the fast search loop
-  unchecked ran 2.5% faster on Alice and 6% on 1 MiB of text: bounds tests
-  are part of the gap but not most of it. The WSL2 host exposes no hardware
-  performance counters, so the remaining cycles could only be attributed by
-  sampling and by valgrind's simulations.
+- The [2026-10-14 benchmarks](../docs/benchmarks/encoder-comparison.md)
+  measure a median 1.000x the reference across all 192 dataset/level pairs,
+  including empty and tiny input. Text remains slower: Alice at level 1
+  reaches 0.785x C's speed, and cyclic Alice at 1 MiB reaches 0.843x at
+  level 1 and 0.847x at level 3. Across levels their medians are 0.925x
+  and 0.934x. These end-to-end measurements include match finding, entropy
+  coding and allocation; they do not attribute the gap to a single kernel.
 - The row finder issues the reference's row prefetches (`ZSTD_row_prefetch`
   from `ZSTD_row_fillHashCache` and `ZSTD_row_nextCachedHash`, 8 positions
-  ahead) through the `branches` crate's safe `prefetch_read_data`. On binary
-  level 9 that took 21.4 → 14.0 ms. The reference's per-candidate prefetch
-  in `ZSTD_RowFindBestMatch` measured no gain (slightly slower on text) and
-  is not issued. The hash chain and binary tree have no prefetch points
+  ahead) through the `branches` crate's safe `prefetch_read_data`. The
+  reference's per-candidate prefetch in `ZSTD_RowFindBestMatch` is not
+  issued. The hash chain and binary tree have no prefetch points
   outside dictionary modes, so none are ported.
 - The reference also resets indices when it reallocates its workspace for
   larger parameters; mzstd resets them only on first use or near

@@ -100,6 +100,130 @@ fn one_shot_matches_compress2() {
     }
 }
 
+#[test]
+fn vec_output_matches_slice_output_across_blocks_and_reused_capacity() {
+    let mut alternating = vec![b'a'; 3 * (1 << 17) + 7];
+    alternating[1 << 17..2 << 17].copy_from_slice(&corpus::random(1 << 17, 123));
+    let inputs = [
+        vec![b'a'; (1 << 17) - 1],
+        vec![b'a'; 1 << 17],
+        vec![b'a'; (1 << 17) + 1],
+        alternating,
+        corpus::text(1 << 20, 124),
+        corpus::random((1 << 18) + 3, 125),
+        Vec::new(),
+    ];
+    let prefix = b"preserve this prefix\0";
+    for level in [-5, 1, 3, 9, 16, 19] {
+        for checksum in [false, true] {
+            let config = EncoderConfig::default()
+                .with_level(Level::try_from(level).unwrap())
+                .with_checksum(checksum)
+                .with_content_size(!checksum);
+            let mut encoder = Compressor::new(config).unwrap();
+            let mut output = prefix.to_vec();
+            for input in &inputs {
+                let bound = Compressor::max_compressed_size(input.len()).unwrap();
+                // Leave nonzero bytes in retained capacity, including an
+                // earlier frame's unwritten scratch and a non-frame prefix.
+                output.resize(prefix.len() + bound, 0xa5);
+                output.truncate(prefix.len());
+                let range = encoder.compress_into(input, &mut output).unwrap();
+                assert_eq!(&output[..range.start], prefix);
+                assert_eq!(range.end, output.len());
+                let reference = oracle::compress2(input, &oracle_params(&config)).unwrap();
+                assert_eq!(
+                    &output[range],
+                    reference,
+                    "level {level}, {} bytes",
+                    input.len()
+                );
+
+                let mut slice = vec![0x5a; bound];
+                let written = encoder.compress_to_slice(input, &mut slice).unwrap();
+                assert_eq!(&slice[..written], reference);
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_literal_fallback_matches_c_at_output_capacity_boundaries() {
+    // A de Bruijn sequence over eight symbols has no repeated four-byte
+    // window, so the match finders emit only literals. Huffman can still
+    // compress those literals: no sequences alone must not imply a raw block.
+    fn de_bruijn(t: usize, p: usize, word: &mut [u8; 5], out: &mut Vec<u8>) {
+        if t > 4 {
+            if 4usize.is_multiple_of(p) {
+                out.extend_from_slice(&word[1..=p]);
+            }
+        } else {
+            word[t] = word[t - p];
+            de_bruijn(t + 1, p, word, out);
+            for symbol in word[t - p] + 1..8 {
+                word[t] = symbol;
+                de_bruijn(t + 1, t, word, out);
+            }
+        }
+    }
+    let mut huffman_only = Vec::new();
+    de_bruijn(1, 1, &mut [0; 5], &mut huffman_only);
+    let windows: std::collections::BTreeSet<_> = huffman_only.windows(4).collect();
+    assert_eq!(windows.len(), huffman_only.len() - 3);
+    let frame = oracle::compress2(&huffman_only, &Params::level(1)).unwrap();
+    assert!(frame.len() < huffman_only.len());
+
+    // A few matches still save less than minGain. Raw literals alone can
+    // rule out a compressed block even when the sequence count is nonzero.
+    let mut few_matches = corpus::random(65_536, 74);
+    few_matches.copy_within(64..192, 4096);
+    let inputs = [
+        corpus::random(63, 71),
+        corpus::random(1501, 72),
+        corpus::random(65_536, 73),
+        few_matches,
+        huffman_only,
+    ];
+    for level in [-5, 1, 3, 9, 16] {
+        let config = EncoderConfig::default().with_level(Level::try_from(level).unwrap());
+        let params = oracle_params(&config);
+        let mut encoder = Compressor::new(config).unwrap();
+        for input in &inputs {
+            let frame = oracle::compress2(input, &params).unwrap();
+            let mut capacities = vec![
+                0,
+                5,
+                input.len() - 1,
+                input.len(),
+                input.len() + 3,
+                frame.len() - 1,
+                frame.len(),
+                frame.len() + 1,
+                Compressor::max_compressed_size(input.len()).unwrap(),
+            ];
+            capacities.sort_unstable();
+            capacities.dedup();
+            for capacity in capacities {
+                let theirs = oracle::compress2_capacity(input, &params, capacity);
+                let mut out = vec![0xa5; capacity];
+                let ours = encoder.compress_to_slice(input, &mut out);
+                assert_eq!(
+                    ours.is_ok(),
+                    theirs.is_ok(),
+                    "level {level}, {} bytes, capacity {capacity}",
+                    input.len()
+                );
+                if let Ok(written) = ours {
+                    assert_eq!(&out[..written], theirs.unwrap());
+                }
+            }
+            // Reuse after the short-destination failures must also preserve
+            // the preceding frame's repeat-offset and entropy-table rules.
+            assert_eq!(encoder.compress(input).unwrap(), frame);
+        }
+    }
+}
+
 /// Drives a session with a fresh 128 KiB output buffer per call, as
 /// `oracle::compress_stream` does.
 fn stream(encoder: &mut Compressor, size: InputSize, steps: &[(&[u8], Operation)]) -> Vec<u8> {

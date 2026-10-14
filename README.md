@@ -91,22 +91,23 @@ either for a whole input at once or for input that arrives in chunks. It require
 
 ### Our benchmarks
 
-Compression is close to zstd 1.5.7 and writes byte-identical frames;
-decompression is generally slightly faster than zstd's, depending on the
-workload and level.
+Compression writes byte-identical frames to zstd 1.5.7 and reaches about
+1.000× its speed across the comparison corpus; decompression reaches 1.033×.
+These medians include empty and tiny inputs. Compressible text remains slower.
 
 <details>
 <summary>Compression benchmark results and methodology</summary>
 
 ![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
 
-**Recorded 2026-10-13 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
+**Recorded 2026-10-14 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
 Each value is the median of per-dataset ratios across eight equally weighted datasets,
 including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
 frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
-median over all 192 dataset/level pairs is **0.975×**: faster than C on empty, tiny
-and run-length input, within 1–3% at levels 11–12 and 16–22, and 4–8% behind at
-levels -5 to 10, where text and random data take longer in the match finders.
+median over all 192 dataset/level pairs is **1.000×**, with lower mean latency
+in 96 pairs. The margin does not establish an overall lead. Across levels,
+Alice text reaches a median **0.925×** and cyclic Alice at 1 MiB **0.934×**;
+empty, tiny and repeated-byte inputs are faster than C.
 
 The benchmark includes compressor construction, allocation, compression, and disposal.
 Results apply to the [recorded revision and machine][bench-levels].

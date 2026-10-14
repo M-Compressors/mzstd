@@ -5,12 +5,16 @@
 
 The published 384 rows cover two decoders on eight identical C-written
 frames at each source level, recorded as `dec-2026-10-13` (mzstd at
-`e6db371` plus the unreleased changes in the [changelog](../../CHANGELOG.md),
+`e6db371` plus the then-unreleased changes, identified by the
+[source hashes](decoder-comparison-environment.json),
 zstd 1.5.7). mzstd's median speed relative to C is **1.033×** across all 192
 dataset/level pairs; mzstd is faster in 120 of them, and in all 120 its 95%
 mean timing interval lies wholly below C's. Empty and tiny inputs have the
 same weight as large inputs. Per-workload results include cases where mzstd
 is slower.
+
+This remains the latest complete decoder run. The 2026-10-14
+[encoder update](encoder-comparison.md) uses a separate run and source state.
 
 | Source level | zstd C | mzstd |
 | ---: | ---: | ---: |
@@ -75,18 +79,21 @@ measurement per case.
 
 The [environment record](decoder-comparison-environment.json) hashes the
 measured sources, and the [size manifest](decoder-comparison-2026-10-13/sizes.csv)
-lists every frame. The decoder sweep ran concurrently with the encoder sweep
-on another physical core, sharing the L3 cache. This is one WSL2 host;
+lists every frame. The decoder sweep ran concurrently with the earlier
+2026-10-13 encoder sweep on another physical core, sharing the L3 cache.
+This is one WSL2 host;
 frequency, thermal state and scheduling are not controlled, and confidence
 bounds do not capture every source of host or allocator variation.
 
-Reproduce from the repository root:
+Reproduce from the repository root with a fresh baseline name:
 
 ```sh
 cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench decoders --locked -- --test
-taskset -c 6 cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench decoders --locked -- --save-baseline dec-2026-10-13
-python3 benchmarks/comparison/report.py --decoding --baseline dec-2026-10-13 --csv docs/benchmarks/decoder-comparison.csv
-python3 benchmarks/comparison/decoder_docs.py --csv docs/benchmarks/decoder-comparison.csv --environment docs/benchmarks/decoder-comparison-environment.json --report docs/benchmarks/decoder-comparison.md --output docs/benchmarks/decoders
+taskset -c 6 cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench decoders --locked -- --save-baseline my-decoders
+python3 benchmarks/comparison/report.py --decoding --baseline my-decoders --csv /tmp/my-decoders.csv
+cp benchmarks/comparison/target/criterion-decoders/sizes.csv /tmp/my-decoders-sizes.csv
 ```
 
 Raw samples remain local under `benchmarks/comparison/target/criterion-decoders/`.
+Use the [benchmark guide](../benchmarking.md#decoder-comparison) to regenerate
+the published pages from the recorded CSV and environment metadata.

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const DECODERS: [&str; 2] = ["c-zstd", "mzstd"];
 
 /// Restores `frame` through one decoder's cold one-shot API.
-fn decompress(decoder: &str, frame: &[u8], output_bytes: usize) -> Result<Vec<u8>> {
+pub(super) fn decompress(decoder: &str, frame: &[u8], output_bytes: usize) -> Result<Vec<u8>> {
     match decoder {
         // C's one-shot API needs the output capacity up front; reading it
         // from the frame header is part of the measured call.

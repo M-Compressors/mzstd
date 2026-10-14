@@ -13,10 +13,13 @@ is described with the commands.
 ```mermaid
 graph TD
     subgraph comparison["benchmarks/comparison (own workspace, excluded from the root)"]
-        Lib["lib.rs: run_encoders, run_decoders"] --> Core["core (private): corpora, cold encoders, validation"]
+        Lib["lib.rs: run_encoders, run_decoders, run_profile"] --> Core["core (private): corpora, cold encoders, validation"]
         Core --> Dec["core::decoder (private): cold decoders"]
+        Core --> Profile["core::profile (private): one validated case"]
         BEnc["benches/encoders.rs"] --> Lib
         BDec["benches/decoders.rs"] --> Lib
+        BProfile["bin/profile.rs"] --> Lib
+        Paired["paired.py: randomized AB/BA process pairs"] --> BProfile
         Report["report.py: Criterion run to CSV"] --> Docs["level_docs.py: compression level pages and dataset charts"]
         Report --> Plot["plot.py: overview, throughput and size charts"]
         Report --> DecDocs["decoder_docs.py: decompression level pages and charts"]
@@ -34,7 +37,12 @@ graph TD
 The package has its own `[workspace]` and lockfile, and the root workspace
 excludes it, so Criterion output and the comparison's dependency resolution
 never touch the library's own checks. Its `core` module is private and
-exposes only the two entry points the bench binaries call.
+exposes the encoder and decoder benchmark entry points plus the focused
+profiling driver. The driver validates one case before entering an uninlined
+collection boundary, so Callgrind can exclude corpus setup and preflight.
+`paired.py` runs saved driver binaries with randomized AB/BA process ordering
+and records every pair for analysis; it does not generate the published
+Criterion matrix. See the [profiling commands](../docs/benchmarking.md#profiling).
 
 ## Corpus and matrix
 
@@ -83,8 +91,9 @@ sequenceDiagram
   `Decompressor::default().decompress`. Buffers on the C side are
   uninitialized `Vec` capacity, which C fills; mzstd's API returns its own
   vector.
-- **Sampling.** 20 samples, 1 s warm-up and at least 3 s of measurement per
-  case; Criterion command-line options override them.
+- **Sampling defaults.** 20 samples, 1 s warm-up and at least 3 s of measurement
+  per case; Criterion command-line options override them. Each published
+  environment record stores the settings actually used for that run.
 
 ## Report generation
 

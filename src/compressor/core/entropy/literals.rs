@@ -78,15 +78,16 @@ pub(crate) struct LiteralsSettings {
     pub(crate) backend: Backend,
 }
 
-/// Writes the literals section (`ZSTD_compressLiterals`).
+/// Attempts a compressed or RLE literals section (`ZSTD_compressLiterals`).
+/// Returns zero when the caller should store the literals uncompressed.
 ///
 /// `next` starts as a copy of `prev` and ends as the Huffman state the next
 /// block inherits.
 ///
 /// # Errors
 ///
-/// [`CoreError::DstSizeTooSmall`] when not even the raw section fits.
-pub(crate) fn compress(
+/// [`CoreError::DstSizeTooSmall`] when the compressed header does not fit.
+pub(crate) fn try_compress(
     dst: &mut [u8],
     src: &[u8],
     prev: &HufTables,
@@ -103,10 +104,10 @@ pub(crate) fn compress(
     next.clone_from(prev);
 
     if settings.disable_compression {
-        return no_compress(dst, src);
+        return Ok(0);
     }
     if src_size < min_literals_to_compress(strategy, prev.repeat) {
-        return no_compress(dst, src);
+        return Ok(0);
     }
     if dst.len() < lh_size + 1 {
         return Err(CoreError::DstSizeTooSmall);
@@ -147,7 +148,7 @@ pub(crate) fn compress(
         Ok(size) if size != 0 && size < src_size - min_gain(src_size, strategy) => size,
         _ => {
             next.clone_from(prev);
-            return no_compress(dst, src);
+            return Ok(0);
         }
     };
     if c_lit_size == 1 && (src_size >= 8 || src.iter().all(|&b| b == src[0])) {
@@ -211,7 +212,7 @@ mod tests {
         let prev = HufTables::default();
         let mut next = HufTables::default();
         let mut dst = [0u8; 256];
-        let size = compress(
+        let size = try_compress(
             &mut dst,
             &[7; 100],
             &prev,
@@ -233,7 +234,7 @@ mod tests {
         };
         let mut next = HufTables::default();
         let mut dst = [0u8; 64];
-        let size = compress(
+        let size = try_compress(
             &mut dst,
             &[9; 6],
             &prev,
@@ -249,25 +250,25 @@ mod tests {
         let prev = HufTables::default();
         let mut next = HufTables::default();
         let mut dst = [0u8; 256];
-        let size = compress(
+        let size = try_compress(
             &mut dst,
             b"short",
             &prev,
             &mut next,
             settings(Strategy::Fast),
         );
-        assert_eq!(size, Ok(6));
+        assert_eq!(size, Ok(0));
         let disabled = LiteralsSettings {
             disable_compression: true,
             ..settings(Strategy::BtUltra2)
         };
         let text = b"abababababababababababababababababababababababababababababababababababab";
         assert_eq!(
-            compress(&mut dst, text, &prev, &mut next, disabled),
-            Ok(text.len() + 2)
+            try_compress(&mut dst, text, &prev, &mut next, disabled),
+            Ok(0)
         );
         assert!(
-            compress(
+            try_compress(
                 &mut dst[..2],
                 text,
                 &prev,

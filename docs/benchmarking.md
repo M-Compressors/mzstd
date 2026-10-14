@@ -91,18 +91,24 @@ python3 benchmarks/comparison/level_docs.py \
 python3 benchmarks/comparison/plot.py \
   --csv docs/benchmarks/encoder-comparison.csv \
   --output docs/benchmarks/encoders/charts \
-  --subtitle 'i7-13700KF; e6db371 + working tree; 20 samples; 1 core; 2026-10-13'
+  --subtitle 'i7-13700KF; fb36eb6 + working tree; 20 samples; 1 core; 2026-10-14'
 ```
 
 `level_docs.py` writes the index, 24 level pages and their detailed charts.
 `plot.py` writes `overview.svg`, `throughput.svg` and `size.svg` into the same
 charts directory. All eight corpora contribute to the medians. The published
-encoder CSV is `enc-2026-10-13`, with its
-[size manifest](benchmarks/encoder-comparison-2026-10-13/sizes.csv); the decoder
-CSV is `dec-2026-10-13`, with its
+encoder CSV is `parity-final-20261014` (2026-10-14), with its
+[size manifest](benchmarks/encoder-comparison-2026-10-14/sizes.csv) and
+[raw Criterion samples](benchmarks/encoder-comparison-2026-10-14/criterion-samples.json.gz).
+It uses 20 samples, 0.2 s warmup, 0.5 s requested measurement and 2,000
+bootstrap resamples on CPU 2, without a concurrent decoder sweep; see the
+[recorded command and limits](benchmarks/encoder-comparison.md).
+The latest decoder CSV remains `dec-2026-10-13` (2026-10-13), with its
 [size manifest](benchmarks/decoder-comparison-2026-10-13/sizes.csv). Each
 environment record identifies the measured sources; regenerating charts reuses
-those measurements and does not rerun the benchmark.
+those measurements and does not rerun the benchmark. When publishing a fresh
+run, update the CSV, archived manifest and environment record together before
+regenerating pages and charts.
 
 ## Decoder comparison
 
@@ -199,14 +205,47 @@ against the same C library, after checking identical output.
 
 ## Profiling
 
+The comparison package also supplies a focused driver with the same datasets
+and cold APIs. Arguments are `encode|decode`, `c-zstd|mzstd`, corpus, level,
+and a positive iteration count. It validates the selected case before the
+loop; use Criterion for reported timings and this driver for diagnosis or
+paired process runs.
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --manifest-path benchmarks/comparison/Cargo.toml --bin profile --locked
+taskset -c 2 benchmarks/comparison/target/release/profile encode mzstd repeated-1m 1 10000
+valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*profile_encode*' \
+  benchmarks/comparison/target/release/profile encode mzstd repeated-1m 1 30
+```
+
+For decoding, use `decode` and `--toggle-collect='*profile_decode*'`.
+The uninlined collection boundaries exclude corpus construction and preflight.
+
+Save each build's `profile` executable before rebuilding, then collect paired
+runs with a fixed core and randomized AB/BA ordering:
+
+```sh
+python3 benchmarks/comparison/paired.py /tmp/profile-before /tmp/profile-after \
+  --csv /tmp/my-comparison.csv --output /tmp/paired.json \
+  --cpu 2 --pairs 10 --seconds 0.15 --filter '^(text-1m|repeated-1m)/l(1|3|9)$'
+```
+
+Both processes use the same iteration count, calibrated from the CSV. The JSON
+retains every pair; it is not a significance claim. Use a new output path for
+each run. To compare C with Rust, pass the same executable twice and add
+`--baseline-implementation c-zstd`. Keep builds and other CPU-heavy work out of
+timed runs. Include tiny, incompressible, warm and streaming cases when checking
+for regressions, and report intervals and noisy cases alongside improvements.
+
 - **Stages.** `cargo build --release --features hotpath` turns on the
   `hotpath::measure` anchors at the codec's stage boundaries; a binary whose
   `main` carries `#[hotpath::main]` prints the timing table on exit.
-- **Cycles.** `samply record --save-only --rate 20000 -o profile.json.gz --
+- **Sampling.** `samply record --save-only --rate 20000 -o profile.json.gz --
   <binary>` samples a release build (needs `perf_event_paranoid <= 1`). The
   leaf addresses map onto `objdump -d` or `addr2line` of the binary for
-  per-instruction or per-line cycle counts; C and Rust profiles of the same
-  workload compare directly.
+  instruction and source attribution. Samples locate hotspots; they are not
+  exact per-instruction cycle counts. Record the event and sampling settings
+  when comparing C and Rust profiles of the same workload.
 - **Instructions and cache.** `valgrind --tool=callgrind` (optionally with
   `--dump-instr=yes` or `--cache-sim=yes`) on a build with
   `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` gives exact instruction

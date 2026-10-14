@@ -9,7 +9,7 @@ use fearless_simd::Simd;
 use fearless_simd_macros::simd;
 
 use super::match_state::{BlockInput, MatchState};
-use super::mem::{count_slices, hash_at, hash_ptr, hash_word, load32, window_word, window9};
+use super::mem::{count_slices_simd, hash_at, hash_ptr, hash_word, load32, window_word, window9};
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
 use super::window::HASH_READ_SIZE;
 
@@ -68,6 +68,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     let iend = src.len();
     let prefix_start_index = ms.lowest_prefix_index(block.end, cparams.window_log);
     let prefix_start = (prefix_start_index - base) as usize;
+    let history = &src[prefix_start..];
     // A block shorter than HASH_READ_SIZE never enters the search: the
     // first `ip3 >= ilimit` test fails for any `ilimit <= 0`.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE as usize);
@@ -140,9 +141,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
                 ip0 = ip2;
                 break Found::Rep;
             }
-            if match_idx >= prefix_start_index
-                && window_word::<0>(w0) as u32 == read32((match_idx - base) as usize)
-            {
+            if super::mem::matches32(
+                history,
+                match_idx.wrapping_sub(prefix_start_index),
+                window_word::<0>(w0) as u32,
+            ) {
                 table[hash1 & mask] = index(ip0 + 1);
                 break Found::Offset;
             }
@@ -155,9 +158,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
             // Probe `ip0` (the old `ip1`); `ip1` is now the old `ip2`.
             current0 = index(ip0);
             table[hash0 & mask] = current0;
-            if match_idx >= prefix_start_index
-                && window_word::<1>(w0) as u32 == read32((match_idx - base) as usize)
-            {
+            if super::mem::matches32(
+                history,
+                match_idx.wrapping_sub(prefix_start_index),
+                window_word::<1>(w0) as u32,
+            ) {
                 if step <= 4 {
                     table[hash1 & mask] = index(ip2);
                 }
@@ -207,7 +212,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         }
 
         // _match:
-        m_length += count_slices(&src[ip0 + m_length..], &src[match0 + m_length..]);
+        m_length += count_slices_simd(simd, &src[ip0 + m_length..], &src[match0 + m_length..]);
         seq_store.store_seq_from(src, anchor, ip0 - anchor, offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
@@ -218,8 +223,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
             table[hash(ip0 - 2)] = index(ip0 - 2);
             if rep_offset2 > 0 {
                 while ip0 <= ilimit && read32(ip0) == read32(ip0 - rep_offset2 as usize) {
-                    let r_length =
-                        count_slices(&src[ip0 + 4..], &src[ip0 + 4 - rep_offset2 as usize..]) + 4;
+                    let r_length = count_slices_simd(
+                        simd,
+                        &src[ip0 + 4..],
+                        &src[ip0 + 4 - rep_offset2 as usize..],
+                    ) + 4;
                     core::mem::swap(&mut rep_offset1, &mut rep_offset2);
                     table[hash(ip0)] = index(ip0);
                     ip0 += r_length;
@@ -339,7 +347,7 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
                 prefix_start_index,
             )
         } else {
-            count_slices(&src[ip..], &src[(m - base) as usize..])
+            count_slices_simd(simd, &src[ip..], &src[(m - base) as usize..])
         }
     };
     let k_step_incr: usize = 1 << (SEARCH_STRENGTH - 1);

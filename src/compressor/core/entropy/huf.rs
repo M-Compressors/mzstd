@@ -815,17 +815,36 @@ pub(crate) fn optimal_table_log(
     }
     let symbol_cardinality = cardinality(count, max_symbol_value);
     let min_table_log = highbit32(symbol_cardinality) + 1;
+    if min_table_log > max_table_log {
+        return max_table_log;
+    }
+    let mut tree = Tree {
+        nodes: [Node::default(); TREE_SLOTS],
+    };
+    sort(&mut tree, count, max_symbol_value);
+    let non_null_rank = build_tree(&mut tree, max_symbol_value);
     let mut opt_size = usize::MAX - 1;
     let mut opt_log = max_table_log;
     let mut table = CTable::default();
     let mut header = [0u8; HEADER_TRIAL_CAPACITY];
     for guess in min_table_log..=max_table_log {
-        let Ok(max_bits) = table.build(count, max_symbol_value, guess) else {
+        // Height limiting changes only the leaves' lengths. The sorted
+        // counts, parents and internal-node heights remain the unlimited
+        // tree, so restore the leaf heights instead of rebuilding it.
+        if guess != min_table_log {
+            for n in 0..=non_null_rank {
+                let parent = tree.at(n).parent as isize;
+                tree.at_mut(n).nb_bits = tree.at(parent).nb_bits + 1;
+            }
+        }
+        let max_bits = set_max_height(&mut tree, non_null_rank, guess);
+        if max_bits > TABLE_LOG_MAX {
             continue;
-        };
+        }
         if max_bits < guess && guess > min_table_log {
             break;
         }
+        table.fill_from_tree(&tree, non_null_rank, max_symbol_value, max_bits);
         let Ok(h_size) = table.write(&mut header, max_symbol_value, max_bits) else {
             continue;
         };
@@ -1057,11 +1076,13 @@ mod tests {
                     optimal_depth: depth,
                     ..Flags::default()
                 };
-                assert_eq!(
-                    optimal_table_log(11, total, max, &count, flags),
-                    zstd_ffi::oracle::huf_optimal_table_log(11, total, &count, depth),
-                    "{count:?} depth {depth}"
-                );
+                for max_log in [5, 6, 8, 11, 12] {
+                    assert_eq!(
+                        optimal_table_log(max_log, total, max, &count, flags),
+                        zstd_ffi::oracle::huf_optimal_table_log(max_log, total, &count, depth),
+                        "{count:?} depth {depth} max_log {max_log}"
+                    );
+                }
             }
         }
     }

@@ -7,6 +7,7 @@ use std::time::Duration;
 use zstd_ffi as ffi;
 
 pub(super) mod decoder;
+pub(super) mod profile;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

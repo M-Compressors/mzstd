@@ -159,13 +159,14 @@ fn entropy_compress_internal(
     next: &mut Tables,
     engine_params: &super::cctx::AppliedParams,
     dst: &mut [u8],
+    block_size: usize,
     backend: Backend,
 ) -> Result<usize, CoreError> {
     let strategy = engine_params.cparams.strategy;
     let nb_seq = store.nb_seq();
     let lit_size = store.literals.len();
     let suspect = nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
-    let mut op = literals::compress(
+    let mut op = literals::try_compress(
         dst,
         &store.literals,
         &prev.huf,
@@ -177,6 +178,18 @@ fn entropy_compress_internal(
             backend,
         },
     )?;
+    if op == 0 {
+        // Raw literals alone already make this block too large to keep.
+        // Avoid copying them and encoding sequences into a doomed result.
+        // A short destination still follows the ordinary error path below.
+        if lit_size >= block_size - min_gain(block_size, strategy) && dst.len() >= block_size {
+            if nb_seq == 0 {
+                next.fse.clone_from(&prev.fse);
+            }
+            return Ok(0);
+        }
+        op = literals::no_compress(dst, &store.literals)?;
+    }
 
     if dst.len() - op < 3 + 1 {
         return Err(CoreError::DstSizeTooSmall);
@@ -226,11 +239,12 @@ pub(crate) fn entropy_compress(
     backend: Backend,
 ) -> Result<usize, CoreError> {
     let capacity = dst.len();
-    let c_size = match entropy_compress_internal(store, prev, next, params, dst, backend) {
-        Ok(0) => return Ok(0),
-        Err(CoreError::DstSizeTooSmall) if block_size <= capacity => return Ok(0),
-        other => other?,
-    };
+    let c_size =
+        match entropy_compress_internal(store, prev, next, params, dst, block_size, backend) {
+            Ok(0) => return Ok(0),
+            Err(CoreError::DstSizeTooSmall) if block_size <= capacity => return Ok(0),
+            other => other?,
+        };
     let max_c_size = block_size - min_gain(block_size, params.cparams.strategy);
     if c_size >= max_c_size {
         return Ok(0);
@@ -240,18 +254,14 @@ pub(crate) fn entropy_compress(
 
 /// Whether every byte of `src` is the same (`ZSTD_isRLE`).
 ///
-/// Whole 32-byte chunks are compared at once: OR-ing each byte's difference
-/// from the first compiles to vector compares, where testing byte by byte
-/// costs several instructions per byte on the run-length inputs this sees.
+/// Equal adjacent slices mean every byte equals its predecessor. Slice
+/// equality uses the platform's bulk comparison, including its vector
+/// loop and short-input handling.
 pub(crate) fn is_rle(src: &[u8]) -> bool {
-    let Some(&first) = src.first() else {
+    let Some((_, tail)) = src.split_first() else {
         return true;
     };
-    let (chunks, tail) = src.as_chunks::<32>();
-    tail.iter().all(|&byte| byte == first)
-        && chunks
-            .iter()
-            .all(|chunk| chunk.iter().fold(0, |acc, &byte| acc | (byte ^ first)) == 0)
+    tail == &src[..tail.len()]
 }
 
 /// Compresses one block body into `dst` (`ZSTD_compressBlock_internal`).

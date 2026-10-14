@@ -239,8 +239,28 @@ impl Compressor {
     ) -> Result<Range<usize>, EncodeError> {
         let bound = Self::max_compressed_size(src.len())?;
         let start = dst.len();
-        dst.resize(start + bound, 0);
-        match self.compress_to_slice(src, &mut dst[start..]) {
+        let limit = start.checked_add(bound).ok_or(SizeOverflow)?;
+        let result = if src.len() <= crate::shared::format::BLOCK_SIZE_MAX {
+            // A single block needs its full bound anyway. Keep the direct
+            // slice path here, without another call for empty/tiny frames.
+            dst.resize(limit, 0);
+            self.compress_to_slice(src, &mut dst[start..])
+        } else {
+            self.stream.reset_session();
+            let id = self.next_id();
+            let result = super::core::compress_once_append(
+                &mut self.engine,
+                &self.requested,
+                src,
+                id,
+                dst,
+                bound,
+            )
+            .map_err(|error| EncodeError::from_core(error, bound, Some(src.len() as u64)));
+            self.apply_retention();
+            result
+        };
+        match result {
             Ok(written) => {
                 dst.truncate(start + written);
                 Ok(start..start + written)

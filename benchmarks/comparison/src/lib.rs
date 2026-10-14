@@ -26,3 +26,15 @@ pub fn run_encoders() -> Result<(), Box<dyn std::error::Error>> {
 pub fn run_decoders() -> Result<(), Box<dyn std::error::Error>> {
     core::decoder::run()
 }
+
+/// Profiles one comparison case, using the same corpus and cold APIs as
+/// the Criterion suite. Arguments: codec, implementation, corpus, level,
+/// iteration count.
+///
+/// # Errors
+///
+/// Returns an error for invalid arguments, codec failures or a failed
+/// preflight comparison.
+pub fn run_profile() -> Result<(), Box<dyn std::error::Error>> {
+    core::profile::run()
+}
