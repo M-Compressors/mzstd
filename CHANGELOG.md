@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v0.2.1](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.1) - 2026-10-14
 
 - **Reuse the Huffman tree during depth selection.** Optimal-depth trials
   restore leaf lengths from the original internal nodes instead of sorting
