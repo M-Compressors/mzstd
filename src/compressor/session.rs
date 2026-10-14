@@ -286,7 +286,8 @@ macro_rules! session_methods {
         }
 
         /// [`Self::process`] into uninitialized memory, such as
-        /// [`Vec::spare_capacity_mut`], without a temporary buffer.
+        /// [`Vec::spare_capacity_mut`](alloc::vec::Vec::spare_capacity_mut),
+        /// without a temporary buffer.
         ///
         /// It produces the same bytes, `consumed` and `produced` counts,
         /// statuses and errors as [`Self::process`], and calls of the two
