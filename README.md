@@ -176,7 +176,6 @@ and verified.
 
 ## Not supported
 
-- Dictionaries
 - Magicless frames
 - `targetCBlockSize`
 - External sequence producers
