@@ -449,6 +449,19 @@ pub(crate) fn matches32(src: &[u8], at: u32, word: u32) -> bool {
     *candidate(src, at, &word) == word
 }
 
+/// [`matches32`] with branches: whether the four bytes at offset `at` lie
+/// in `src`, then whether they equal `word`. On large inputs a candidate is
+/// rarely outside the history and rarely matches, so both branches predict
+/// well, and the comparison needs no stand-in word.
+#[inline(always)]
+pub(crate) fn matches32_branchy(src: &[u8], at: u32, word: u32) -> bool {
+    let at = at as usize;
+    match src.get(at..at + 4) {
+        Some(bytes) => u32::from_le_bytes(bytes.try_into().unwrap_or_default()) == word,
+        None => false,
+    }
+}
+
 /// Eight-byte counterpart of [`matches32`].
 #[inline(always)]
 pub(crate) fn matches64(src: &[u8], at: u32, word: u64) -> bool {

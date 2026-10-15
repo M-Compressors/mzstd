@@ -1,12 +1,28 @@
 # Changelog
 
-## Unreleased
+## [v0.2.5](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.5) - 2026-10-15
 
+- **Faster fast levels (-5 to 2).** The hash widths of the default
+  parameters for inputs above 256 KiB are compiled in, which turns the hash
+  shift and table mask into constants, and a candidate's validity is
+  checked with a branch once the history before a block is several times
+  the table's size, where that branch predicts well (the branch-free check
+  stays for blocks whose table is still filling). On the first 20 MB of
+  Silesia (`silesia.tar`, warm contexts) levels -5 to 2 compress 5-10%
+  faster. Frames are unchanged.
+- **btlazy2 (levels 13-15) is as fast as zstd.** The binary-tree walk picks
+  the side to descend with a branch, as the reference does, instead of a
+  branch-free select: the walk is a chain of dependent cache misses, and a
+  predicted branch starts the next node's load before the comparison that
+  picks it resolves. On the first 5 MB of Silesia levels 13 and 15
+  compress 17% and 21% faster. Frames are unchanged.
 - **Sessions without a dictionary are small again.** `PreparedDictionary`
   keeps its tables behind one `Box`, so it is pointer-sized and an
   `EncoderSessionOwned` (default `D = PreparedDictionary`) no longer reserves
   about 8 KiB inline for a dictionary it may not have: 40 bytes instead of
   8192 on 64-bit targets. The public API is unchanged.
+- **Benchmarks.** Both comparison suites were rerun on this release; the
+  previous run's archives were replaced.
 
 ## [v0.2.4](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.4) - 2026-10-15
 

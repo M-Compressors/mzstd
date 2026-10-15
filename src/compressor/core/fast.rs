@@ -167,18 +167,39 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     let (literals, [offset_1, offset_2]) = if in_prefix {
         let scan = scan(prefix_start_index);
         let ip0 = (ip0 - prefix_start_index) as usize;
-        compress_scan::<S, MLS, true>(
-            simd,
-            table,
-            seq_store,
-            &scan,
-            ip0,
-            [rep_offset1, rep_offset2],
-        )
+        let reps = [rep_offset1, rep_offset2];
+        // A candidate is checked with branches once the history before the
+        // block is several times the table's size: its entries are then
+        // mostly inside the window, and both branches predict well. While
+        // the table is still filling, a select spares the mispredictions.
+        let warm = u64::from(block.start - prefix_start_index) >= 4 << cparams.hash_log;
+        macro_rules! scan {
+            ($hlog:literal) => {
+                if warm {
+                    compress_scan::<S, MLS, true, $hlog, true>(
+                        simd, table, seq_store, &scan, ip0, reps,
+                    )
+                } else {
+                    compress_scan::<S, MLS, true, $hlog, false>(
+                        simd, table, seq_store, &scan, ip0, reps,
+                    )
+                }
+            };
+        }
+        // The hash widths of the default parameters for large inputs
+        // (negative levels, levels 1 and 2) are compiled in with their
+        // match lengths: the hash shift and the table mask become
+        // constants, which frees two of the loop's registers.
+        match (MLS, cparams.hash_log) {
+            (6, 13) => scan!(13),
+            (7, 14) => scan!(14),
+            (6, 16) => scan!(16),
+            _ => scan!(0),
+        }
     } else {
         let scan = scan(base);
         let ip0 = (ip0 - base) as usize;
-        compress_scan::<S, MLS, false>(
+        compress_scan::<S, MLS, false, 0, false>(
             simd,
             table,
             seq_store,
@@ -208,6 +229,17 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     literals
 }
 
+/// Whether the candidate at offset `at` of `history` starts with `word`:
+/// with branches (`BRANCHY`) or with a select (see [`super::mem::matches32`]).
+#[inline(always)]
+fn candidate_matches<const BRANCHY: bool>(history: &[u8], at: u32, word: u32) -> bool {
+    if BRANCHY {
+        super::mem::matches32_branchy(history, at, word)
+    } else {
+        super::mem::matches32(history, at, word)
+    }
+}
+
 /// The bytes one `fast` block searches and the parameters it searches them
 /// with.
 struct Scan<'a> {
@@ -234,7 +266,13 @@ struct Scan<'a> {
 /// `IN_PREFIX` states that `scan.prefix_start` is zero, so the candidates'
 /// history is all of `src` and its lower bound the window index `origin`.
 #[inline(always)]
-fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
+fn compress_scan<
+    S: Simd,
+    const MLS: u32,
+    const IN_PREFIX: bool,
+    const HLOG: u32,
+    const BRANCHY: bool,
+>(
     simd: S,
     table: &mut [u32],
     seq_store: &mut SeqStore,
@@ -245,10 +283,12 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
     let Scan {
         src,
         origin: base,
-        hlog,
         step_size,
         ..
     } = *scan;
+    // `HLOG`, when not zero, is the table's hash width known at compile
+    // time; the caller selects it only when `scan.hlog` equals it.
+    let hlog = if HLOG == 0 { scan.hlog } else { HLOG };
     let prefix_start = if IN_PREFIX { 0 } else { scan.prefix_start };
     let prefix_start_index = base + prefix_start as u32;
     let history = &src[prefix_start..];
@@ -267,8 +307,12 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
     // Hashes are below the table size (`1 << hash_log`); masking with
     // `len - 1` changes nothing and, with the table known to be non-empty,
     // proves every index in bounds.
-    assert!(!table.is_empty());
-    let mask = table.len() - 1;
+    let mask = if HLOG == 0 {
+        table.len().wrapping_sub(1)
+    } else {
+        (1 << HLOG) - 1
+    };
+    assert!(!table.is_empty() && table.len() > mask);
     // The search keeps references to the slots it will write rather than
     // their hashes, so a slot is bounds checked once, where its hash is
     // computed.
@@ -309,7 +353,7 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
                 ip0 = ip2;
                 break Found::Rep;
             }
-            if super::mem::matches32(
+            if candidate_matches::<BRANCHY>(
                 history,
                 match_idx.wrapping_sub(prefix_start_index),
                 window_word::<0>(w0) as u32,
@@ -326,7 +370,7 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
             // Probe `ip0` (the old `ip1`); `ip1` is now the old `ip2`.
             current0 = index(ip0);
             slot0.set(current0);
-            if super::mem::matches32(
+            if candidate_matches::<BRANCHY>(
                 history,
                 match_idx.wrapping_sub(prefix_start_index),
                 window_word::<1>(w0) as u32,
@@ -1258,6 +1302,34 @@ pub(crate) mod tests {
         assert_eq!(dict.count_2segments(simd, b"ab", 0, 4), 2);
         // At the dictionary's end the count runs from the prefix start.
         assert_eq!(dict.count_2segments(simd, b"efgefh", 3, 8), 2);
+    }
+
+    #[test]
+    fn large_inputs_take_the_default_table_widths_like_the_reference() {
+        // Above 256 KiB, levels -5, -1, 1 and 2 select the compiled-in hash
+        // widths; their first blocks check candidates with a select and,
+        // once the history outgrows the table, later ones with branches.
+        let input = [
+            corpus::text(400_000, 11),
+            corpus::binary(300_000, 12),
+            corpus::random(60_000, 13),
+            corpus::text(500_000, 14),
+        ]
+        .concat();
+        for level in [-5, -1, 1, 2] {
+            let expected = oracle::compress(&input, level);
+            let requested = RequestedParams {
+                compression_level: level,
+                ..RequestedParams::default()
+            };
+            for backend in Backend::available() {
+                let mut engine = Engine::with_backend(backend);
+                let mut dst = vec![0u8; compress_bound(input.len()).expect("bound")];
+                let size = compress_once_into(&mut engine, &requested, None, &input, 1, &mut dst)
+                    .expect("compresses");
+                assert!(dst[..size] == expected[..], "{backend} level {level}");
+            }
+        }
     }
 
     #[test]

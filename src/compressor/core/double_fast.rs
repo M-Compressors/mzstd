@@ -995,7 +995,9 @@ fn compress_block_dms_mls<S: Simd, const MLS: u32>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::cctx::{Engine, RequestedParams, compress_bound};
     use super::super::cdict::AttachPref;
+    use super::super::compress_once_into;
     use super::super::dict_tests::{inputs, request, trained};
     use super::super::fast::tests::{
         check_every_backend, check_stream, many_blocks, raw_dictionary, tiny_inputs,
@@ -1005,7 +1007,8 @@ mod tests {
     use super::*;
     use crate::Backend;
     use crate::dictionary::DictionaryContent;
-    use zstd_ffi::corpus;
+    use alloc::vec;
+    use zstd_ffi::{corpus, oracle};
 
     #[test]
     fn dfast_levels_attach_dictionaries_like_the_reference() {
@@ -1070,6 +1073,33 @@ mod tests {
             for chunk in [1_000, 7_001, 1 << 17] {
                 let requested = request(level, None, AttachPref::Default);
                 check_stream(&requested, &trained, DictionaryContent::Auto, &input, chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn large_inputs_compress_like_the_reference() {
+        // Above 256 KiB, levels 3 and 4 use the large-input table widths
+        // and fill several blocks of history.
+        let input = [
+            corpus::text(400_000, 11),
+            corpus::binary(300_000, 12),
+            corpus::random(60_000, 13),
+            corpus::text(500_000, 14),
+        ]
+        .concat();
+        for level in [3, 4] {
+            let expected = oracle::compress(&input, level);
+            let requested = RequestedParams {
+                compression_level: level,
+                ..RequestedParams::default()
+            };
+            for backend in Backend::available() {
+                let mut engine = Engine::with_backend(backend);
+                let mut dst = vec![0u8; compress_bound(input.len()).expect("bound")];
+                let size = compress_once_into(&mut engine, &requested, None, &input, 1, &mut dst)
+                    .expect("compresses");
+                assert!(dst[..size] == expected[..], "{backend} level {level}");
             }
         }
     }

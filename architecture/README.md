@@ -70,13 +70,14 @@ signatures. Each codec compiles on its own, with or without `std`.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
   and dispatched once per block. In the cold comparison against zstd 1.5.7
   ([benchmarks](../docs/benchmarks/README.md), i7-13700KF, AVX2, one core,
-  2026-10-14) compression runs at a median 1.092x the reference's speed,
-  faster in 158 of 192 dataset/level pairs, and decompression at 1.022x.
-  These medians include empty and tiny inputs. The encoder still trails on
-  text at its fastest levels (Alice 0.87-0.88x at levels -5 to 1) and at
-  the lazy levels (0.93-0.98x;
+  2026-10-15, mzstd 0.2.5) compression runs at a median 1.099x the
+  reference's speed, faster in 157 of 192 dataset/level pairs, and
+  decompression at 1.024x. These medians include empty and tiny inputs. The
+  encoder still trails on text at its fastest levels (Alice 0.89-0.94x at
+  levels -5 to 1), on large inputs at the dfast and lazy levels, and at the
+  lazy levels on Alice (0.93-0.96x at levels 5 to 10;
   [encoder core](encoder-core.md#known-gaps)). The decoder trails on
-  compressible text (0.79-0.97x): its sequence loop executes about 5% more
+  compressible text (0.81-1.01x): its sequence loop executes about 5% more
   instructions than the reference's and `decompress` zeroes its output
   before decoding into it
   ([decoder fast paths](decoder-performance.md#known-gaps)).

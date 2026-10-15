@@ -356,9 +356,18 @@ reference's templates are:
   `ZSTD_GEN_DFAST_FN`), so the hash width is a constant (`mem::hash_word`,
   `mem::hash_at`);
 - `compress_block_mls` handles the repeat-offset setup and the
-  saved-offset restore, then calls `compress_scan::<S, MLS, IN_PREFIX>`
-  with a small `Scan` (dfast also a `Tables { long, small }`), which
-  returns the trailing literals and the two repeat offsets;
+  saved-offset restore, then calls `compress_scan` with a small `Scan`
+  (dfast also a `Tables { long, small }`), which returns the trailing
+  literals and the two repeat offsets;
+- fast compiles in the hash widths of the default parameters for inputs
+  above 256 KiB with their match lengths: `compress_scan::<S, MLS,
+  IN_PREFIX, HLOG, BRANCHY>` has instances for `(MLS, hashLog)` = (6, 13)
+  (negative levels, and level 1 up to 128 KiB), (7, 14) (level 1) and
+  (6, 16) (level 2). The hash shift becomes an immediate and the table mask
+  a constant, which frees two of the loop's registers; one test of the
+  table's length before the loop proves the masked indices in bounds.
+  Other parameters take the instance with the width read at run time
+  (`0`). Only the prefix loop is specialized;
 - `IN_PREFIX` holds when the block starts in the prefix and both repeat
   offsets reach no further back than the prefix start from the block's
   first position. Every later repeat offset is then `ip - match` with the
@@ -366,13 +375,23 @@ reference's templates are:
   become offsets from the prefix start and the search loop drops the window
   base, the history pointer and its length. Otherwise the base-relative
   loop runs (`IN_PREFIX = false`);
-- candidates are tested without a branch on their validity
-  (`mem::matches32` / `matches64`, the reference's
-  `ZSTD_match4Found_cmov` / `ZSTD_selectAddr`): an out-of-prefix or stale
-  candidate reads a stand-in word chosen by the probed word's low bit
-  (`DUMMIES`), which can never equal it, so only the equality compare
-  branches. Stale and valid entries are about equally likely, which made
-  the validity branch the finder's main source of mispredictions;
+- dfast, and fast while its table is still filling, test candidates
+  without a branch on their validity (`mem::matches32` / `matches64`, the
+  reference's `ZSTD_match4Found_cmov` / `ZSTD_selectAddr`): an
+  out-of-prefix or stale candidate reads a stand-in word chosen by the
+  probed word's low bit (`DUMMIES`), which can never equal it, so only the
+  equality compare branches. While the table fills, stale and valid
+  entries are about equally likely, which made the validity branch the
+  finder's main source of mispredictions;
+- fast's prefix loop switches to branches (`BRANCHY`,
+  `mem::matches32_branchy`: is the word inside the history, then does it
+  equal the probed word) for a block whose history before it is at least
+  four times the table's size (`4 << hashLog` bytes). Its entries are then
+  almost all inside the window and rarely match, so both branches predict
+  well, and the select's stand-in costs more than they do. On the first
+  20 MB of `silesia.tar` this made levels -5, -1 and 1 8-10% faster; on
+  Alice (152 KB) the branches alone were 4-7% slower, the per-block choice
+  0-3% faster;
 - the loops hold `&Cell<u32>` references to the hash slots they will write,
   which removes the bounds check on a table index carried across
   iterations;
@@ -394,11 +413,18 @@ reference's templates are:
 ```mermaid
 flowchart TD
     A[compress_block_mls: rep offsets, saved offsets] --> B{block in prefix and reps within it?}
-    B -- yes --> C["compress_scan::<S, MLS, true>: offsets from the prefix start"]
-    B -- no --> D["compress_scan::<S, MLS, false>: offsets from the window base"]
-    C --> E[probe: hash slots as Cell refs, window load = exit test]
+    B -- yes --> W{"fast: default (MLS, hashLog)?"}
+    W -- yes --> CW["compress_scan with constant widths"]
+    W -- "no, or dfast" --> CR["compress_scan with run-time widths"]
+    CW --> Y{"fast: history >= 4 << hashLog?"}
+    CR --> Y
+    Y -- yes --> C1["BRANCHY: validity branch, then compare"]
+    Y -- "no, or dfast" --> C2["select: stand-in word if invalid"]
+    B -- no --> D["compress_scan::<.., false, ..>: offsets from the window base, select"]
+    C1 --> E[probe: hash slots as Cell refs, window load = exit test]
+    C2 --> E
     D --> E
-    E --> F{"candidate word == probed word? (stand-in word if invalid)"}
+    E --> F{"candidate word == probed word?"}
     F -- no --> E
     F -- yes --> G[extend back, count forward, store_seq_from, insert hashes, repcode loop]
     G --> E
@@ -515,10 +541,16 @@ pair in one store. Prefix tree walks use `TreeRun`, which cuts the run once
 and counts up to four words inline, ordering the runs with a byte-swapped
 compare; longer runs continue in `long_tree_step`, out of line, with the
 vector scan (word-at-a-time counting of run-length input, whose matches span
-whole blocks, made levels 13-15 on 1 MiB of repeated bytes 18% slower); `TreeLinks` picks the side with `select_unpredictable` (the side
-is close to a coin flip) and writes the dummy link to a `NO_LINK` sentinel,
-so its write check doubles as the bounds check. ExtDict walks use
-`Ctx::ext_tree_step`.
+whole blocks, made levels 13-15 on 1 MiB of repeated bytes 18% slower); `TreeLinks::descend` picks the side with a branch, as the reference
+does, and writes the dummy link to a `NO_LINK` sentinel, so its write check
+doubles as the bounds check. The side is close to a coin flip, but the walk
+is a chain of dependent cache misses: a predicted branch starts the next
+node's load before the byte comparison that picks it resolves, where a
+`select_unpredictable` made every step wait for it. On the first 5 MB of
+Silesia (`silesia.tar`) the branch made levels 13 and 15 17% and 21%
+faster than the select, as fast as the reference (the optimal parser's walk
+measured the same, see [optimal parser](optimal-parser.md)). ExtDict walks
+use `Ctx::ext_tree_step`.
 
 ```mermaid
 flowchart TD
@@ -687,10 +719,35 @@ buffers are always large enough) into `EncodeError::Internal`.
   The lazy finders now run at or below the reference's instruction count
   and remain 2–8% slower on text for reasons not yet attributed (no
   hardware counters under WSL2).
-- Fast's branch-free candidate check costs about 5-8% on random 64 KiB
-  input at levels -5 to 1 (still at or above the reference's speed there),
-  where the validity branch it replaces predicts well; it is kept for its
-  gain on text.
+- The select's stand-in picked by the word's low bit was measured
+  (2026-10-15, first 20 MB of `silesia.tar`) against one fixed stand-in
+  followed by the validity test, as `ZSTD_match4Found_cmov` does: the
+  latter was 1% slower at level 1 and 3% slower at level 3.
+- On the Silesia corpus (`silesia.tar`, 2026-10-15, warm contexts and the
+  fastest of several runs, as lzbench measures) fast compresses about
+  5-10% faster than before the constant widths and the validity branches,
+  at 0.91-0.93x the reference's speed; dfast and greedy/lazy/lazy2 still
+  run 6-14% slower than the reference; btlazy2 and the optimal parser are
+  at or above its speed. Fast's prefix loop executes about 58 instructions per two probed
+  positions against the reference's 45: bounds checks on the repcode read
+  and the probe windows, and reloads of spilled values.
+- Measured and rejected (2026-10-15, first 20 MB of `silesia.tar`):
+  carrying fast's `current0` out of the loop instead of through it
+  (0.5-1% slower), reading the repcode word at `ip2.saturating_sub(rep)`
+  to drop its bounds check (2-3% slower with the select, noise with the
+  branches), the search loop out of line in its own function (5-10%
+  slower: the call and the result per match cost more than the registers
+  it freed), dfast's candidates with branches (level 3 +1%, level 4 6%
+  slower), and dfast's compiled-in table widths (no change at levels 3
+  and 4). A sequence store written through a block-long cursor kept its
+  positions in registers and gave dfast 5%, but its buffers had to be
+  initialized at full capacity to be written safely: a cold one-shot call
+  on 64 KiB then paid about 2.5 us more (32-50% at levels -5 to 1), so the
+  store stays on `Vec`. The constant widths for every match length at once instead
+  of per default pair cost 100 KB of code for the same instruction count;
+  timings of one build against another varied by about 3% with the
+  register allocation alone, so these comparisons interleave several
+  runs of both builds.
 - The row finder issues the reference's row prefetches (`ZSTD_row_prefetch`
   from `ZSTD_row_fillHashCache` and `ZSTD_row_nextCachedHash`, 8 positions
   ahead) and its per-candidate prefetch through the `branches` crate's safe

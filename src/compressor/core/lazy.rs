@@ -747,9 +747,11 @@ impl TreeLinks {
     /// returns that side's child to visit next, or `None` when `m` is at
     /// or below `bt_low` and the walk ends.
     ///
-    /// Which side a candidate takes is as likely one way as the other, so
-    /// the side is selected without a branch; the reference's two arms do
-    /// the same writes.
+    /// The side is a branch, as in the reference, although it is taken
+    /// either way about as often: the walk is a chain of dependent cache
+    /// misses, and a predicted branch lets the next node's load start
+    /// before the comparison that picks it resolves, where a select would
+    /// wait for it on every step.
     #[inline(always)]
     fn descend(
         &mut self,
@@ -760,21 +762,26 @@ impl TreeLinks {
         lower: bool,
         bt_low: u32,
     ) -> Option<u32> {
-        use core::hint::select_unpredictable as select;
-        set_link(bt, select(lower, self.smaller, self.larger), m);
-        self.common_smaller = select(lower, match_length, self.common_smaller);
-        self.common_larger = select(lower, self.common_larger, match_length);
         let ends = m <= bt_low;
-        let child = if ends {
-            NO_LINK
+        let child = if lower {
+            set_link(bt, self.smaller, m);
+            self.common_smaller = match_length;
+            if ends {
+                self.smaller = NO_LINK;
+                return None;
+            }
+            self.smaller = next + 1;
+            next + 1
         } else {
-            next + usize::from(lower)
+            set_link(bt, self.larger, m);
+            self.common_larger = match_length;
+            if ends {
+                self.larger = NO_LINK;
+                return None;
+            }
+            self.larger = next;
+            next
         };
-        self.smaller = select(lower, child, self.smaller);
-        self.larger = select(lower, self.larger, child);
-        if ends {
-            return None;
-        }
         bt.get(child).copied()
     }
 

@@ -329,6 +329,21 @@ which already matches the reference's 21 GB/s.
   serializes the copies; decoding a batch of sequences before executing it,
   in two out-of-line loops, executes about 15% more instructions; one
   allocation for the three sequence tables changes nothing.
+- Measured and rejected (2026-10-15, `silesia.tar` levels 1, 3 and 19):
+  copying matches with offsets of 32 or more in 16-byte chunks, as
+  `ZSTD_wildcopy` does, instead of 32-byte ones (no faster; the hot store
+  after the match load is a cache miss on the match source, which the
+  reference pays too); gathering each stream's symbols of a single-symbol
+  Huffman round in one word instead of an array (8% more samples in
+  `decode_streams`). Filling Huffman rows by weight in fixed-size runs, as
+  `HUF_readDTableX1_wksp` does, and spreading FSE tables without "less than
+  one" symbols without per-cell checks, as `ZSTD_buildFSETable_body` does,
+  cut table building by about 30% of its samples on `silesia.tar` level 3,
+  but the whole decode did not get measurably faster, and the cold
+  one-shot comparison decoded text 2.5-4% slower (Alice level 3, cyclic
+  Alice levels 3 and 19; 11 interleaved process pairs) with an unchanged
+  `SequenceTables::execute` source executing 1.6% more instructions: the
+  changed modules moved its inlining and layout.
 
 - Compressible text decodes at 0.81-0.96x the reference's speed through
   `decompress` ([benchmarks](../docs/benchmarks/decoders/README.md)): the
