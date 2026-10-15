@@ -249,7 +249,7 @@ impl Compressor {
     ) -> Result<Option<&'d CDict>, EncodeError> {
         match dictionary {
             None => Ok(None),
-            Some(dictionary) if dictionary.serves(&self.requested) => Ok(Some(&dictionary.cdict)),
+            Some(dictionary) if dictionary.serves(&self.requested) => Ok(Some(dictionary.cdict())),
             Some(_) => Err(EncodeError::DictionaryMismatch),
         }
     }

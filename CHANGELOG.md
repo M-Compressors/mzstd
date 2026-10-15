@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Sessions without a dictionary are small again.** `PreparedDictionary`
+  keeps its tables behind one `Box`, so it is pointer-sized and an
+  `EncoderSessionOwned` (default `D = PreparedDictionary`) no longer reserves
+  about 8 KiB inline for a dictionary it may not have: 40 bytes instead of
+  8192 on 64-bit targets. The public API is unchanged.
+
 ## [v0.2.4](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.4) - 2026-10-15
 
 - **Dictionaries.** `mzstd::dictionary` reads raw-content and

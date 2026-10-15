@@ -286,6 +286,21 @@ fn owned_sessions_and_adapters_write_the_one_shot_frame() {
 }
 
 #[test]
+fn sessions_without_a_dictionary_reserve_only_a_pointer_for_one() {
+    // The dictionary's tables live behind one allocation, so the
+    // `Option<PreparedDictionary>` of an owned session costs a pointer.
+    assert_eq!(
+        size_of::<PreparedDictionary>(),
+        size_of::<Box<PreparedDictionary>>()
+    );
+    assert_eq!(
+        size_of::<Option<PreparedDictionary>>(),
+        size_of::<PreparedDictionary>()
+    );
+    assert!(size_of::<mzstd::EncoderSessionOwned>() <= 64);
+}
+
+#[test]
 fn a_dictionary_serves_only_its_configuration() {
     let dictionary = prepare(
         b"some dictionary content",

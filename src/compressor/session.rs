@@ -213,7 +213,7 @@ impl Core {
         let result = compressor.stream.compress(
             &mut compressor.engine,
             &compressor.requested,
-            dictionary.map(|dictionary| &dictionary.cdict),
+            dictionary.map(|dictionary| dictionary.cdict()),
             output,
             input,
             operation.to_core(),

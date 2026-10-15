@@ -42,6 +42,50 @@ with `std`, `writer_with_dictionary` and `reader_with_dictionary`.
 `D: AsRef<PreparedDictionary>` (an `Arc` shares one) and returns it from
 `into_parts`.
 
+### Ownership and size
+
+`PreparedDictionary` is a single `Box` around its private `Prepared`
+contents: the `CDict` (its byte copy, `MatchState` and `BlockState` entropy
+tables, about 7.9 KiB inline before its heap tables), the configuration, the
+dictionary key and, with `decompression`, the decoder's `DecodeParts`. The
+handle is therefore one pointer wide, and `Option<PreparedDictionary>` uses
+the box's niche. An `EncoderSessionOwned` started without a dictionary
+carries `None` in that one word instead of reserving room for the tables
+(about 8 KiB per session in 0.2.4). Encoder entry points reach the
+tables through the crate-private `PreparedDictionary::cdict`; building a
+dictionary costs one extra allocation and every use one extra indirection
+at frame start.
+
+```mermaid
+classDiagram
+    class PreparedDictionary {
+        -inner: Box~Prepared~
+        +id() Option~DictionaryId~
+        +config() &EncoderConfig
+        +as_bytes() &[u8]
+        +content() DictionaryContent
+        +retained_bytes() usize
+        ~cdict() &CDict
+        ~decode_view() DictView
+        ~serves(&RequestedParams) bool
+    }
+    class Prepared {
+        cdict: CDict
+        config: EncoderConfig
+        key: RequestedParams
+        decode: DecodeParts
+    }
+    class EncoderSessionOwned~D~ {
+        compressor: Box~Compressor~
+        dictionary: Option~D~
+        core: Core
+    }
+    PreparedDictionary *-- Prepared : Box
+    Prepared *-- CDict
+    Prepared *-- DecodeParts : decompression
+    EncoderSessionOwned *-- PreparedDictionary : Option, default D
+```
+
 A prepared dictionary's tables depend on the configuration's level, explicit
 parameters, LDM switch and size hint, as the reference's local `CDict`
 depends on `requestedParams`. A compressor accepts it when its own

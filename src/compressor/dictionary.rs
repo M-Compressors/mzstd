@@ -129,11 +129,13 @@ impl<'a> DictionaryBuilder<'a> {
         let requested = requested_params(&self.config);
         let cdict = CDict::new(Box::from(self.bytes), self.content, &requested)?;
         Ok(PreparedDictionary {
-            #[cfg(feature = "decompression")]
-            decode: crate::dictionary::decode::parse_decode_parts(self.bytes, self.content)?,
-            cdict,
-            config: self.config,
-            key: dictionary_key(&requested),
+            inner: Box::new(Prepared {
+                #[cfg(feature = "decompression")]
+                decode: crate::dictionary::decode::parse_decode_parts(self.bytes, self.content)?,
+                cdict,
+                config: self.config,
+                key: dictionary_key(&requested),
+            }),
         })
     }
 }
@@ -175,7 +177,14 @@ pub(crate) fn dictionary_key(requested: &RequestedParams) -> RequestedParams {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PreparedDictionary {
-    pub(crate) cdict: CDict,
+    /// Boxed so the handle is one pointer wide: a session that may hold a
+    /// dictionary (`Option<PreparedDictionary>`) stays small without one.
+    inner: Box<Prepared>,
+}
+
+/// What a [`PreparedDictionary`] owns.
+struct Prepared {
+    cdict: CDict,
     config: EncoderConfig,
     key: RequestedParams,
     /// The decoder's tables, so the dictionary also decodes its frames.
@@ -197,7 +206,7 @@ impl PreparedDictionary {
     /// ```
     #[must_use]
     pub const fn id(&self) -> Option<DictionaryId> {
-        DictionaryId::new(self.cdict.dict_id)
+        DictionaryId::new(self.inner.cdict.dict_id)
     }
 
     /// The configuration the dictionary was prepared for.
@@ -214,7 +223,7 @@ impl PreparedDictionary {
     /// ```
     #[must_use]
     pub const fn config(&self) -> &EncoderConfig {
-        &self.config
+        &self.inner.config
     }
 
     /// The dictionary as it was given to the builder.
@@ -229,7 +238,7 @@ impl PreparedDictionary {
     /// ```
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.cdict.bytes()
+        self.inner.cdict.bytes()
     }
 
     /// How the bytes were read.
@@ -245,7 +254,7 @@ impl PreparedDictionary {
     /// ```
     #[must_use]
     pub const fn content(&self) -> DictionaryContent {
-        self.cdict.content()
+        self.inner.cdict.content()
     }
 
     /// Bytes the dictionary keeps allocated: its copy of the bytes and its
@@ -262,22 +271,27 @@ impl PreparedDictionary {
     /// ```
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
-        let bytes = self.cdict.retained_bytes();
+        let bytes = self.inner.cdict.retained_bytes();
         #[cfg(feature = "decompression")]
-        let bytes = bytes + self.decode.retained_bytes();
+        let bytes = bytes + self.inner.decode.retained_bytes();
         bytes
+    }
+
+    /// The compression tables.
+    pub(crate) fn cdict(&self) -> &CDict {
+        &self.inner.cdict
     }
 
     /// The decoder's view of this dictionary.
     #[cfg(feature = "decompression")]
     pub(crate) fn decode_view(&self) -> crate::decompressor::DictView<'_> {
-        self.decode.view(self.cdict.bytes())
+        self.inner.decode.view(self.inner.cdict.bytes())
     }
 
     /// Whether compressors with `requested` parameters may use this
     /// dictionary.
     pub(crate) fn serves(&self, requested: &RequestedParams) -> bool {
-        dictionary_key(requested) == self.key
+        dictionary_key(requested) == self.inner.key
     }
 }
 
@@ -298,7 +312,7 @@ impl core::fmt::Debug for PreparedDictionary {
             .field("id", &self.id())
             .field("content", &self.content())
             .field("len", &self.as_bytes().len())
-            .field("config", &self.config)
+            .field("config", &self.inner.config)
             .finish_non_exhaustive()
     }
 }
