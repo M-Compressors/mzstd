@@ -2,12 +2,14 @@
 //!
 //! A [`BlockDecoder`] holds the entropy state a frame carries from one
 //! compressed block to the next: the literals Huffman table, the three
-//! sequence tables and the repeat offsets.
+//! sequence tables and the repeat offsets. A Zstandard-format dictionary
+//! seeds all of them at the frame start.
 
 use fearless_simd::Simd;
 
 use super::BlockError;
 use super::copy::MatchCopy;
+use super::dictionary::DecoderEntropy;
 use super::literals::LiteralsDecoder;
 use super::sequences::{BlockContext, SequenceSection, SequenceTables};
 use crate::Backend;
@@ -96,11 +98,15 @@ impl BlockDecoder {
         self.literals.retained_bytes() + self.sequences.retained_bytes()
     }
 
-    /// Restores the frame-start state, keeping allocations.
-    pub(crate) fn reset(&mut self) {
-        self.literals.reset();
-        self.sequences.reset();
-        self.reps = REP_START;
+    /// Restores the frame-start state, keeping allocations: the frame
+    /// inherits `dictionary`'s tables and repeat offsets
+    /// (`ZSTD_copyDDictParameters`), or starts with none and the format's
+    /// initial offsets.
+    pub(crate) fn reset(&mut self, dictionary: Option<&DecoderEntropy>) {
+        let inherited = dictionary.is_some();
+        self.literals.reset(inherited);
+        self.sequences.reset(inherited);
+        self.reps = dictionary.map_or(REP_START, |entropy| entropy.reps);
     }
 
     /// Regenerates one block into `out[op..]`, returning the end of its
@@ -117,7 +123,7 @@ impl BlockDecoder {
         content: &[u8],
         out: &mut [u8],
         op: usize,
-        context: BlockContext,
+        context: BlockContext<'_>,
     ) -> Result<usize, BlockError> {
         match header.kind {
             BlockKind::Raw => {
@@ -155,7 +161,10 @@ impl BlockDecoder {
         target: Target<'_>,
     ) -> Result<usize, BlockError> {
         let Target { out, op, context } = target;
-        let (literals, used) = self.literals.decode(simd, content, context.block_max)?;
+        let tree = context.entropy.map(|entropy| &entropy.huffman);
+        let (literals, used) = self
+            .literals
+            .decode(simd, content, context.block_max, tree)?;
         let sequences = content.get(used..).unwrap_or(&[]);
         let (count, header_size) = self.sequences.read_header(sequences)?;
         if count == 0 {
@@ -189,8 +198,8 @@ pub(crate) struct Target<'a> {
     pub(crate) out: &'a mut [u8],
     /// Where the block's output starts.
     pub(crate) op: usize,
-    /// The history's start and the frame's limits.
-    pub(crate) context: BlockContext,
+    /// The history's start, the frame's limits and its dictionary.
+    pub(crate) context: BlockContext<'a>,
 }
 
 #[cfg(test)]
@@ -199,10 +208,12 @@ mod tests {
     use crate::decompressor::core::copy::WILDCOPY_OVERLENGTH;
     use alloc::vec::Vec;
 
-    const CONTEXT: BlockContext = BlockContext {
+    const CONTEXT: BlockContext<'static> = BlockContext {
         history_start: 0,
         window: 1 << 17,
         block_max: 1 << 17,
+        dictionary: &[],
+        entropy: None,
     };
 
     /// Decodes one block after `out` and appends its output.
@@ -211,7 +222,7 @@ mod tests {
         header: &BlockHeader,
         content: &[u8],
         out: &mut Vec<u8>,
-        context: BlockContext,
+        context: BlockContext<'_>,
     ) -> Result<(), BlockError> {
         let start = out.len();
         let mut buffer = out.clone();
@@ -302,7 +313,42 @@ mod tests {
         };
         decode(&mut decoder, &header, &content, &mut out, CONTEXT).expect("valid");
         assert_eq!(out, b"abcxxxx");
-        decoder.reset();
+        decoder.reset(None);
         assert_eq!(decoder.reps, REP_START);
+    }
+
+    #[test]
+    fn a_dictionary_seeds_offsets_and_repeat_tables() {
+        let bytes =
+            crate::decompressor::core::dictionary::tests::dictionary([2, 4, 8], b"ABCDEFGH");
+        let (entropy, _) = DecoderEntropy::load(&bytes).expect("valid");
+        let mut decoder = BlockDecoder::default();
+        decoder.reset(Some(&entropy));
+        assert_eq!(decoder.reps, [2, 4, 8]);
+        // Raw literals "x", one sequence with every table repeated: the
+        // dictionary's tables give literal length 0 (code 0), offset code 0
+        // and match length 3 (code 0) with no extra bits; the stream holds
+        // only the fifteen initial state bits. A zero literal length makes
+        // offset code 0 select repeat offset 2, four bytes back into the
+        // dictionary.
+        let content = [1 << 3, b'x', 1, 0xfc, 0x00, 0x80];
+        let header = BlockHeader {
+            last: true,
+            kind: BlockKind::Compressed,
+            size: content.len(),
+        };
+        let mut context = CONTEXT;
+        context.dictionary = b"ABCDEFGH";
+        context.entropy = Some(&entropy);
+        let mut out = Vec::new();
+        decode(&mut decoder, &header, &content, &mut out, context).expect("valid");
+        assert_eq!(out, b"EFGx");
+        assert_eq!(decoder.reps, [4, 2, 8]);
+        // Without the tables, repeat modes have nothing to repeat.
+        decoder.reset(None);
+        assert_eq!(
+            decode(&mut decoder, &header, &content, &mut Vec::new(), CONTEXT),
+            Err(BlockError::Invalid(InvalidDataKind::SequencesSection))
+        );
     }
 }

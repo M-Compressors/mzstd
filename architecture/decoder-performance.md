@@ -133,6 +133,11 @@ flowchart TD
 - Every stream finishes with the single-symbol table in the reference's
   cautious loop and must be consumed exactly; the pair decoder never
   decides how a stream ends.
+- The loops reach a table through `TableAccess`: the decoder's own table
+  (`&mut HuffmanTable`, `decode_streams`) builds its pair rows on first
+  use, a dictionary's shared table (`&HuffmanTable`,
+  `decode_streams_shared`) only uses rows built when the dictionary was
+  parsed. Both are monomorphized, so the own-table path compiles as before.
 
 ## Sequences
 
@@ -196,6 +201,32 @@ reaches further back — so every index is below `2^31 + 2^19`
 wrap, which lets the compiler relate the executor's room tests to the
 copies' bounds checks and drop many of them. The masks never change a
 valid index.
+
+### Dictionaries
+
+A dictionary adds nothing to the per-sequence fast path. Its content is
+not copied into the output: `Executor` carries it as a slice that only the
+cold `execute_exactly` reads. The fast path's test is the one it always
+had, `offset > lit_end || offset > window`; a sequence failing it, which
+without a dictionary is always an error, now calls `execute_exactly`,
+which reports the error or, with a dictionary, copies the match's head
+from the dictionary's tail and the rest from the output. The dictionary's
+tables are picked once per block (`TableSlot::get`), and its repeat
+offsets once per frame. The index bounds above are unchanged: the cut
+output still starts at the history's first byte or a window before the
+block.
+
+Measured on a loaded i7-13700KF (AVX2, pinned), `cargo bench --bench
+decompress -- 'decompress-(dictionary|small)'`: a thousand JSON-like
+records of about 120 bytes, each its own level-3 frame with a 16 KiB
+dictionary trained on similar records, decode in 198 µs against zstd
+1.5.7's 135 µs (1.47x), and the same records compressed without a
+dictionary in 1.60 ms against 1.11 ms (1.44x). The dictionary adds no gap
+of its own beyond the decoder's per-frame overhead on tiny frames. Frames
+without a dictionary decode as before: on a quiet host, text level 1
+2.12 → 2.06 ms, text level 3 1.85 → 1.80 ms, binary level 3 3.49 →
+3.43 ms, random 19.7 → 19.1 µs, streaming mixed 2.46 → 2.44 ms (Criterion
+medians, before and after the change).
 
 ## Output paths
 

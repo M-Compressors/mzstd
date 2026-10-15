@@ -1,4 +1,6 @@
+use super::core::DictView;
 use super::{DecodeError, Decompressor};
+use crate::dictionary::{DecodeDictionary, DictionaryRef};
 
 /// Whether more input may follow a call.
 ///
@@ -89,7 +91,9 @@ impl From<DecodeFailure> for DecodeError {
 
 /// An incremental decoding operation borrowing its [`Decompressor`].
 ///
-/// Created by [`Decompressor::start`]. Input and output move through
+/// Created by [`Decompressor::start`], or by
+/// [`Decompressor::start_with_dictionary`], which also borrows the
+/// dictionary every frame starts from. Input and output move through
 /// caller-owned slices of any size; the session keeps its own buffers for
 /// the headers and block being assembled and for regenerated output not yet
 /// delivered. The decoder's [`RetentionPolicy`](crate::RetentionPolicy)
@@ -98,26 +102,31 @@ impl From<DecodeFailure> for DecodeError {
 #[derive(Debug)]
 pub struct DecoderSession<'d> {
     decoder: &'d mut Decompressor,
+    dictionary: Option<DictView<'d>>,
 }
 
 impl<'d> DecoderSession<'d> {
-    pub(super) fn new(decoder: &'d mut Decompressor) -> Self {
+    pub(super) fn new(decoder: &'d mut Decompressor, dictionary: Option<DictView<'d>>) -> Self {
         decoder.apply_retention();
         let config = decoder.config;
         decoder.stream.reset(config);
-        Self { decoder }
+        Self {
+            decoder,
+            dictionary,
+        }
     }
 }
 
-/// Runs one call on `decoder` and applies its retention policy once the
-/// operation has ended, successfully or not.
+/// Runs one call on `decoder` with `dictionary` and applies its retention
+/// policy once the operation has ended, successfully or not.
 fn process_on(
     decoder: &mut Decompressor,
+    dictionary: Option<DictView<'_>>,
     input: &[u8],
     output: &mut [u8],
     operation: DecodeOperation,
 ) -> Result<DecodeProgress, DecodeFailure> {
-    let result = decoder.stream.process(input, output, operation);
+    let result = decoder.stream.process(input, output, operation, dictionary);
     if result
         .as_ref()
         .map_or(true, |progress| progress.status == DecoderStatus::Finished)
@@ -183,7 +192,7 @@ impl DecoderSession<'_> {
         output: &mut [u8],
         operation: DecodeOperation,
     ) -> Result<DecodeProgress, DecodeFailure> {
-        process_on(self.decoder, input, output, operation)
+        process_on(self.decoder, self.dictionary, input, output, operation)
     }
 
     /// Delivers pending output without offering input or ending it.
@@ -252,6 +261,11 @@ impl DecoderSession<'_> {
 /// [`Decompressor::into_session`]; [`Self::into_decompressor`] hands the
 /// decoder back.
 ///
+/// [`Decompressor::into_session_with_dictionary`] also hands it a
+/// dictionary, as any `D: AsRef<DecodeDictionary>`: the dictionary itself,
+/// or an `Arc` of it to share one between sessions. Without one, `D` keeps
+/// its default and no dictionary is ever constructed.
+///
 /// # Examples
 ///
 /// ```
@@ -271,16 +285,20 @@ impl DecoderSession<'_> {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug)]
-pub struct DecoderSessionOwned {
+pub struct DecoderSessionOwned<D = DecodeDictionary> {
     decoder: Decompressor,
+    dictionary: Option<D>,
 }
 
-impl DecoderSessionOwned {
-    pub(super) fn new(mut decoder: Decompressor) -> Self {
+impl<D: AsRef<DecodeDictionary>> DecoderSessionOwned<D> {
+    pub(super) fn new(mut decoder: Decompressor, dictionary: Option<D>) -> Self {
         decoder.apply_retention();
         let config = decoder.config;
         decoder.stream.reset(config);
-        Self { decoder }
+        Self {
+            decoder,
+            dictionary,
+        }
     }
 
     /// Decodes as much of `input` into `output` as it can, exactly as
@@ -295,7 +313,11 @@ impl DecoderSessionOwned {
         output: &mut [u8],
         operation: DecodeOperation,
     ) -> Result<DecodeProgress, DecodeFailure> {
-        process_on(&mut self.decoder, input, output, operation)
+        let dictionary = self
+            .dictionary
+            .as_ref()
+            .map(|dictionary| DictionaryRef::from(dictionary.as_ref()).view());
+        process_on(&mut self.decoder, dictionary, input, output, operation)
     }
 
     /// Delivers pending output, as [`DecoderSession::flush`].

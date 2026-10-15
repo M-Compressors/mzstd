@@ -150,3 +150,49 @@ pub fn standard() -> Vec<(&'static str, Vec<u8>)> {
     inputs.push(("sources", sources()));
     inputs
 }
+
+/// `count` small JSON-like records sharing field names and value
+/// vocabularies, the shape dictionaries are made for.
+pub fn records(count: usize, seed: u64) -> Vec<Vec<u8>> {
+    const NAMES: [&str; 8] = [
+        "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi",
+    ];
+    const CITIES: [&str; 6] = ["Berlin", "Lisbon", "Oslo", "Prague", "Tallinn", "Vienna"];
+    const TAGS: [&str; 7] = [
+        "compression",
+        "dictionary",
+        "frame",
+        "stream",
+        "window",
+        "entropy",
+        "sequence",
+    ];
+    let mut rng = Rng::new(seed);
+    (0..count)
+        .map(|index| {
+            let mut pick = |n: usize| (rng.next_u64() % n as u64) as usize;
+            let mut record = alloc::format!(
+                "{{\"id\":{},\"user\":\"{}\",\"city\":\"{}\",\"score\":{},\"active\":{},\"tags\":[",
+                1000 + index * 7 + pick(5),
+                NAMES[pick(NAMES.len())],
+                CITIES[pick(CITIES.len())],
+                pick(100_000),
+                pick(2) == 0,
+            );
+            for tag in 0..1 + pick(4) {
+                if tag > 0 {
+                    record.push(',');
+                }
+                record.push('"');
+                record.push_str(TAGS[pick(TAGS.len())]);
+                record.push('"');
+            }
+            record.push_str("],\"note\":\"");
+            for _ in 0..pick(12) {
+                record.push(char::from(b'a' + pick(26) as u8));
+            }
+            record.push_str("\"}\n");
+            record.into_bytes()
+        })
+        .collect()
+}

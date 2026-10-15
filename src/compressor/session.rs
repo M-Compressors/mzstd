@@ -13,6 +13,7 @@ use core::mem::MaybeUninit;
 use super::core::error::CoreError;
 use super::core::output::Destination;
 use super::core::stream::EndOp;
+use super::dictionary::PreparedDictionary;
 use super::encoder::Compressor;
 use super::error::EncodeError;
 
@@ -179,6 +180,7 @@ impl Core {
     fn process<D: Destination + ?Sized>(
         &mut self,
         compressor: &mut Compressor,
+        dictionary: Option<&PreparedDictionary>,
         input: &[u8],
         output: &mut D,
         operation: Operation,
@@ -211,6 +213,7 @@ impl Core {
         let result = compressor.stream.compress(
             &mut compressor.engine,
             &compressor.requested,
+            dictionary.map(|dictionary| &dictionary.cdict),
             output,
             input,
             operation.to_core(),
@@ -243,8 +246,22 @@ impl Core {
     }
 }
 
+/// The dictionary a borrowed session compresses with.
+const fn borrowed_dictionary<'d>(
+    dictionary: &Option<&'d PreparedDictionary>,
+) -> Option<&'d PreparedDictionary> {
+    *dictionary
+}
+
+/// The dictionary an owned session compresses with.
+fn owned_dictionary<D: AsRef<PreparedDictionary>>(
+    dictionary: &Option<D>,
+) -> Option<&PreparedDictionary> {
+    dictionary.as_ref().map(AsRef::as_ref)
+}
+
 macro_rules! session_methods {
-    ($compressor:ident) => {
+    ($compressor:ident, $dictionary:expr) => {
         /// Moves the frame forward by one step: takes what it can from
         /// `input`, writes what it can into `output`, and reports exactly how
         /// much of each it moved and what it needs next.
@@ -282,7 +299,9 @@ macro_rules! session_methods {
             operation: Operation,
         ) -> Result<Progress, EncodeError> {
             let compressor = &mut *self.$compressor;
-            self.core.process(compressor, input, output, operation)
+            let dictionary = $dictionary(&self.dictionary);
+            self.core
+                .process(compressor, dictionary, input, output, operation)
         }
 
         /// [`Self::process`] into uninitialized memory, such as
@@ -322,7 +341,9 @@ macro_rules! session_methods {
             operation: Operation,
         ) -> Result<Progress, EncodeError> {
             let compressor = &mut *self.$compressor;
-            self.core.process(compressor, input, output, operation)
+            let dictionary = $dictionary(&self.dictionary);
+            self.core
+                .process(compressor, dictionary, input, output, operation)
         }
 
         /// Makes everything accepted so far decodable, without taking input.
@@ -411,18 +432,30 @@ macro_rules! session_methods {
 #[derive(Debug)]
 pub struct EncoderSession<'c> {
     compressor: &'c mut Compressor,
+    dictionary: Option<&'c PreparedDictionary>,
     core: Core,
 }
 
 impl<'c> EncoderSession<'c> {
     pub(crate) fn new(compressor: &'c mut Compressor, stream: StreamConfig) -> Self {
+        Self::with_dictionary(compressor, None, stream)
+    }
+
+    /// A session compressing with `dictionary`, which the caller checked
+    /// serves the compressor.
+    pub(crate) fn with_dictionary(
+        compressor: &'c mut Compressor,
+        dictionary: Option<&'c PreparedDictionary>,
+        stream: StreamConfig,
+    ) -> Self {
         Self {
             compressor,
+            dictionary,
             core: Core::new(stream),
         }
     }
 
-    session_methods!(compressor);
+    session_methods!(compressor, borrowed_dictionary);
 }
 
 /// One incremental frame that owns its compressor.
@@ -439,21 +472,40 @@ impl<'c> EncoderSession<'c> {
 /// assert!(compressor.retained_bytes() > 0);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// A session started with
+/// [`Compressor::into_session_with_dictionary`] also owns its dictionary,
+/// of any type `D` that borrows as a [`PreparedDictionary`] (the dictionary
+/// itself, a `Box` or an `Arc` of one).
 #[derive(Debug)]
-pub struct EncoderSessionOwned {
+pub struct EncoderSessionOwned<D = PreparedDictionary> {
     compressor: alloc::boxed::Box<Compressor>,
+    dictionary: Option<D>,
     core: Core,
 }
 
 impl EncoderSessionOwned {
     pub(crate) fn new(compressor: Compressor, stream: StreamConfig) -> Self {
+        Self::with_dictionary(compressor, None, stream)
+    }
+}
+
+impl<D: AsRef<PreparedDictionary>> EncoderSessionOwned<D> {
+    /// A session compressing with `dictionary`, which the caller checked
+    /// serves the compressor.
+    pub(crate) fn with_dictionary(
+        compressor: Compressor,
+        dictionary: Option<D>,
+        stream: StreamConfig,
+    ) -> Self {
         Self {
             compressor: alloc::boxed::Box::new(compressor),
+            dictionary,
             core: Core::new(stream),
         }
     }
 
-    session_methods!(compressor);
+    session_methods!(compressor, owned_dictionary);
 
     /// Starts a new frame on the same compressor.
     ///
@@ -472,6 +524,28 @@ impl EncoderSessionOwned {
     pub fn reinit(&mut self, stream: StreamConfig) {
         self.compressor.begin_stream(stream);
         self.core = Core::new(stream);
+    }
+
+    /// Returns the compressor and the dictionary, if any, abandoning an
+    /// unfinished frame.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::Compressor;
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"history").build()?;
+    /// let session = Compressor::default().into_session_with_dictionary(dictionary, Default::default())?;
+    /// let (_compressor, dictionary) = session.into_parts();
+    /// assert_eq!(dictionary.map(|dictionary| dictionary.as_bytes().len()), Some(7));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_parts(self) -> (Compressor, Option<D>) {
+        let mut compressor = *self.compressor;
+        compressor.stream.reset_session();
+        (compressor, self.dictionary)
     }
 
     /// Returns the compressor, abandoning an unfinished frame.

@@ -3,7 +3,8 @@
 //! Raw literals are borrowed straight from the block; RLE and
 //! Huffman-coded literals are regenerated into a reusable buffer. The
 //! Huffman table of the last `Compressed_Literals_Block` is kept for
-//! `Treeless_Literals_Block`s later in the same frame.
+//! `Treeless_Literals_Block`s later in the same frame; before the frame's
+//! first one, a Zstandard-format dictionary's table serves them.
 //!
 //! Sequence execution copies literals in whole chunks, so every
 //! [`Literals`] view carries [`WILDCOPY_OVERLENGTH`] readable bytes past
@@ -54,14 +55,27 @@ impl<'a> Literals<'a> {
     }
 }
 
+/// The tree a `Treeless_Literals_Block` reuses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TreeSource {
+    /// None: the frame has neither described a tree nor inherited one.
+    #[default]
+    Missing,
+    /// The decoder's own table, from the frame's last
+    /// `Compressed_Literals_Block`.
+    Own,
+    /// The dictionary's table, until the frame describes a tree.
+    Dictionary,
+}
+
 /// Literals state carried across the blocks of one frame.
 #[derive(Debug, Default)]
 pub(crate) struct LiteralsDecoder {
     /// Table of the last Huffman-compressed literals block, allocated on
     /// first use.
     huffman: Option<Box<HuffmanTable>>,
-    /// Whether `huffman` holds a table `Treeless_Literals_Block`s may reuse.
-    has_table: bool,
+    /// Which table `Treeless_Literals_Block`s reuse.
+    tree: TreeSource,
     /// Regenerated literals and their slack.
     buffer: Vec<u8>,
 }
@@ -100,19 +114,28 @@ impl LiteralsDecoder {
     }
 
     /// Forgets the previous Huffman table at a frame start, keeping its
-    /// allocation.
-    pub(crate) fn reset(&mut self) {
-        self.has_table = false;
+    /// allocation; with `dictionary_tree`, treeless blocks reuse the
+    /// dictionary's table until the frame describes its own (the
+    /// reference's `litEntropy`).
+    pub(crate) fn reset(&mut self, dictionary_tree: bool) {
+        self.tree = if dictionary_tree {
+            TreeSource::Dictionary
+        } else {
+            TreeSource::Missing
+        };
     }
 
     /// Decodes the literals section at the start of a compressed block's
     /// `content`, returning the literals and the section's size.
+    /// `dictionary` is the dictionary's table, which treeless blocks use
+    /// until the frame describes a tree.
     #[inline(always)]
     pub(crate) fn decode<'a, S: fearless_simd::Simd>(
         &'a mut self,
         simd: S,
         content: &'a [u8],
         block_max: usize,
+        dictionary: Option<&HuffmanTable>,
     ) -> Result<(Literals<'a>, usize), InvalidDataKind> {
         let invalid = InvalidDataKind::LiteralsSection;
         if content.len() < MIN_COMPRESSED_BLOCK {
@@ -163,7 +186,7 @@ impl LiteralsDecoder {
                 ))
             }
             kind @ (EncodingType::Compressed | EncodingType::Repeat) => {
-                if kind == EncodingType::Repeat && !self.has_table {
+                if kind == EncodingType::Repeat && self.tree == TreeSource::Missing {
                     return Err(invalid);
                 }
                 if content.len() < MIN_HUFFMAN_SECTION {
@@ -190,21 +213,27 @@ impl LiteralsDecoder {
                     .get(header_size..header_size + compressed)
                     .ok_or(invalid)?;
                 let streams = if kind == EncodingType::Compressed {
-                    self.has_table = false;
+                    self.tree = TreeSource::Missing;
                     let table = self.huffman.get_or_insert_with(Box::default);
                     let used = table.read(section)?;
-                    self.has_table = true;
+                    self.tree = TreeSource::Own;
                     section.get(used..).ok_or(invalid)?
                 } else {
                     section
                 };
-                let table = self.huffman.as_deref_mut().ok_or(invalid)?;
                 let len = size + WILDCOPY_OVERLENGTH;
                 if self.buffer.len() < len {
                     self.buffer.resize(len, 0);
                 }
                 let buffer = &mut self.buffer[..len];
-                table.decode_streams(simd, streams, &mut buffer[..size], four_streams)?;
+                let out = &mut buffer[..size];
+                if self.tree == TreeSource::Dictionary {
+                    let table = dictionary.ok_or(invalid)?;
+                    table.decode_streams_shared(simd, streams, out, four_streams)?;
+                } else {
+                    let table = self.huffman.as_deref_mut().ok_or(invalid)?;
+                    table.decode_streams(simd, streams, out, four_streams)?;
+                }
                 Ok((
                     Literals {
                         bytes: buffer,
@@ -224,7 +253,7 @@ mod tests {
     fn decode(content: &[u8]) -> Result<(Vec<u8>, usize), InvalidDataKind> {
         let mut decoder = LiteralsDecoder::default();
         decoder
-            .decode(fearless_simd::Fallback::new(), content, 1 << 17)
+            .decode(fearless_simd::Fallback::new(), content, 1 << 17, None)
             .map(|(literals, used)| {
                 assert!(literals.bytes.len() >= literals.len + WILDCOPY_OVERLENGTH);
                 (literals.as_slice().to_vec(), used)
@@ -267,7 +296,12 @@ mod tests {
         let mut decoder = LiteralsDecoder::default();
         assert_eq!(
             decoder
-                .decode(fearless_simd::Fallback::new(), &[4 << 3, 0, 0, 0, 0], 3)
+                .decode(
+                    fearless_simd::Fallback::new(),
+                    &[4 << 3, 0, 0, 0, 0],
+                    3,
+                    None
+                )
                 .map(|_| ()),
             Err(InvalidDataKind::LiteralsSection)
         );
@@ -316,7 +350,7 @@ mod tests {
         content.push(stream);
         let mut decoder = LiteralsDecoder::default();
         let (literals, used) = decoder
-            .decode(fearless_simd::Fallback::new(), &content, 1 << 17)
+            .decode(fearless_simd::Fallback::new(), &content, 1 << 17, None)
             .expect("valid");
         assert_eq!(literals.as_slice(), [0, 1]);
         assert_eq!(used, 8);
@@ -325,7 +359,7 @@ mod tests {
         let bytes = u32::to_le_bytes(header);
         let treeless = [bytes[0], bytes[1], bytes[2], stream, 0];
         let (literals, used) = decoder
-            .decode(fearless_simd::Fallback::new(), &treeless, 1 << 17)
+            .decode(fearless_simd::Fallback::new(), &treeless, 1 << 17, None)
             .expect("valid");
         assert_eq!(literals.as_slice(), [0, 1]);
         assert_eq!(used, 4);
@@ -336,7 +370,7 @@ mod tests {
         wide.extend_from_slice(&[1, 0, 1, 0, 1, 0]);
         assert_eq!(
             decoder
-                .decode(fearless_simd::Fallback::new(), &wide, 1 << 17)
+                .decode(fearless_simd::Fallback::new(), &wide, 1 << 17, None)
                 .map(|_| ()),
             Err(InvalidDataKind::HuffmanStream)
         );
@@ -350,10 +384,80 @@ mod tests {
         // only when it is 0x01.
         *widest.last_mut().expect("stream") = 0x01;
         let (literals, used) = decoder
-            .decode(fearless_simd::Fallback::new(), &widest, 1 << 17)
+            .decode(fearless_simd::Fallback::new(), &widest, 1 << 17, None)
             .expect("valid");
         assert_eq!(literals.as_slice(), [0, 1, 0, 1, 0, 1]);
         assert_eq!(used, 15);
+    }
+
+    #[test]
+    fn treeless_blocks_use_the_dictionary_tree_until_the_frame_describes_one() {
+        let mut dictionary = HuffmanTable::default();
+        // The RFC example tree: A = 0 and B = 1 at one and two bits.
+        dictionary.read(&[132u8, 0x43, 0x20, 0x10]).expect("valid");
+        dictionary.build_shared();
+        let stream = 0b0000_1101u8; // A then B.
+        let header = 3 | (2 << 4) | (1 << 14);
+        let bytes = u32::to_le_bytes(header);
+        let treeless = [bytes[0], bytes[1], bytes[2], stream, 0];
+        let mut decoder = LiteralsDecoder::default();
+        // Without an inherited tree, treeless blocks are invalid.
+        assert_eq!(
+            decoder
+                .decode(
+                    fearless_simd::Fallback::new(),
+                    &treeless,
+                    1 << 17,
+                    Some(&dictionary)
+                )
+                .map(|_| ()),
+            Err(InvalidDataKind::LiteralsSection)
+        );
+        decoder.reset(true);
+        // The dictionary's tree is required once the frame inherits it.
+        assert_eq!(
+            decoder
+                .decode(fearless_simd::Fallback::new(), &treeless, 1 << 17, None)
+                .map(|_| ()),
+            Err(InvalidDataKind::LiteralsSection)
+        );
+        let (literals, used) = decoder
+            .decode(
+                fearless_simd::Fallback::new(),
+                &treeless,
+                1 << 17,
+                Some(&dictionary),
+            )
+            .expect("valid");
+        assert_eq!((literals.as_slice(), used), (&[0u8, 1][..], 4));
+        // A described tree replaces it: symbols 1 and 2 at one bit each.
+        let tree = [129u8, 0x01];
+        let header = 2 | (2 << 4) | (3 << 14);
+        let bytes = u32::to_le_bytes(header);
+        let mut content = alloc::vec![bytes[0], bytes[1], bytes[2]];
+        content.extend_from_slice(&tree);
+        content.push(0b0000_0110);
+        let (own, _) = decoder
+            .decode(
+                fearless_simd::Fallback::new(),
+                &content,
+                1 << 17,
+                Some(&dictionary),
+            )
+            .expect("valid");
+        let own = own.as_slice().to_vec();
+        assert!(own.iter().all(|&symbol| symbol == 1 || symbol == 2));
+        let mut treeless = treeless;
+        treeless[3] = 0b0000_0110;
+        let (again, _) = decoder
+            .decode(
+                fearless_simd::Fallback::new(),
+                &treeless,
+                1 << 17,
+                Some(&dictionary),
+            )
+            .expect("the frame's own tree");
+        assert_eq!(again.as_slice(), own);
     }
 
     #[test]

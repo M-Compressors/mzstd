@@ -10,14 +10,15 @@
 use alloc::boxed::Box;
 
 use super::block;
+use super::cdict::{AttachPref, CDict};
 use super::entropy::{FseRepeat, Tables};
 use super::error::CoreError;
 use super::ldm::{LdmState, RawSeqStore};
 use super::match_state::MatchState;
 use super::output::Output;
 use super::params::{
-    self, CONTENT_SIZE_UNKNOWN, CParamOverrides, CParams, LDM_DEFAULT_WINDOW_LOG, ParamSwitch,
-    Strategy,
+    self, CONTENT_SIZE_UNKNOWN, CParamMode, CParamOverrides, CParams, LDM_DEFAULT_WINDOW_LOG,
+    ParamSwitch, Strategy,
 };
 use super::presplit;
 use super::seq_store::SeqStore;
@@ -133,6 +134,9 @@ pub(crate) struct RequestedParams {
     /// `0` for the format maximum.
     pub(crate) max_block_size: usize,
     pub(crate) use_row_match_finder: ParamSwitch,
+    /// Whether a dictionary is attached, copied or loaded
+    /// (`ZSTD_c_forceAttachDict`).
+    pub(crate) attach_dict_pref: AttachPref,
 }
 
 impl Default for RequestedParams {
@@ -148,6 +152,7 @@ impl Default for RequestedParams {
             pre_block_splitter_level: 0,
             max_block_size: 0,
             use_row_match_finder: ParamSwitch::Auto,
+            attach_dict_pref: AttachPref::Default,
         }
     }
 }
@@ -182,20 +187,43 @@ impl AppliedParams {
 impl RequestedParams {
     /// Resolves the parameters for a frame of `pledged` bytes
     /// (`ZSTD_CCtx_init_compressStream2` up to `ZSTD_compressBegin_internal`).
+    #[inline]
     pub(crate) fn resolve(&self, pledged: u64) -> AppliedParams {
+        self.resolve_for(pledged, 0, CParamMode::Unknown)
+    }
+
+    /// The compression parameters for a frame of `pledged` bytes and a
+    /// dictionary of `dict_size` bytes used as `mode` says
+    /// (`ZSTD_getCParamsFromCCtxParams`).
+    #[inline(always)]
+    pub(crate) fn cparams_for(&self, pledged: u64, dict_size: u64, mode: CParamMode) -> CParams {
         let mut hint = pledged;
         if hint == CONTENT_SIZE_UNKNOWN && self.src_size_hint > 0 {
             hint = u64::from(self.src_size_hint);
         }
-        let mut cparams = params::level_cparams(self.compression_level, hint);
+        let mut cparams = params::level_cparams_for(self.compression_level, hint, dict_size, mode);
         if self.ldm.enable == ParamSwitch::Enable {
             cparams.window_log = LDM_DEFAULT_WINDOW_LOG;
         }
-        let cparams = params::adjust_cparams(
+        params::adjust_cparams_for(
             cparams.overridden(&self.cparams),
             hint,
+            dict_size,
+            mode,
             self.use_row_match_finder,
-        );
+        )
+    }
+
+    /// [`Self::resolve`] for a frame compressed with a dictionary of
+    /// `dict_size` bytes used as `mode` says.
+    #[inline(always)]
+    pub(crate) fn resolve_for(
+        &self,
+        pledged: u64,
+        dict_size: u64,
+        mode: CParamMode,
+    ) -> AppliedParams {
+        let cparams = self.cparams_for(pledged, dict_size, mode);
         AppliedParams {
             compression_level: self.compression_level,
             cparams,
@@ -227,7 +255,7 @@ pub(crate) struct BlockState {
 
 impl BlockState {
     /// `ZSTD_reset_compressedBlockState`.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.rep = REP_START;
         self.entropy.reset();
     }
@@ -267,6 +295,8 @@ pub(crate) struct Engine {
     pub(crate) ldm_store: RawSeqStore,
     /// The SIMD level every kernel of this engine runs with.
     pub(crate) backend: Backend,
+    /// The ID the frame header names, `0` for none (`dictID`).
+    pub(crate) dict_id: u32,
 }
 
 impl Engine {
@@ -291,6 +321,7 @@ impl Engine {
             ldm: LdmState::default(),
             ldm_store: RawSeqStore::default(),
             backend: Backend::default(),
+            dict_id: 0,
         }
     }
 
@@ -305,7 +336,126 @@ impl Engine {
     }
 
     /// Starts a frame (`ZSTD_resetCCtx_internal` without dictionaries).
+    #[inline]
     pub(crate) fn begin(&mut self, applied: AppliedParams, pledged: u64) {
+        self.begin_sized(applied, pledged, 0);
+    }
+
+    /// Starts a frame compressed with `cdict` (`ZSTD_compressBegin_internal`
+    /// with a dictionary): attaches it or copies its tables
+    /// (`ZSTD_resetCCtx_usingCDict`), or, under [`AttachPref::ForceLoad`],
+    /// loads its bytes into this context's own tables.
+    ///
+    /// `applied` must come from [`RequestedParams::resolve_for`] with
+    /// `cdict`'s size and [`CDict::cparam_mode`], and `segments` must
+    /// resolve the dictionary segment to `cdict`'s bytes.
+    pub(crate) fn begin_with_dict(
+        &mut self,
+        mut applied: AppliedParams,
+        pledged: u64,
+        cdict: &CDict,
+        pref: AttachPref,
+        segments: &Segments<'_>,
+    ) -> Result<(), CoreError> {
+        if pref == AttachPref::ForceLoad {
+            self.begin_sized(applied, pledged, cdict.content_size());
+            let ldm_params = self.applied.ldm;
+            let ldm_enabled = ldm_params.enable == ParamSwitch::Enable;
+            let id = super::cdict::insert_dictionary(
+                &mut self.prev,
+                &mut self.ms,
+                ldm_enabled.then_some(&mut self.ldm),
+                segments,
+                cdict.content(),
+                self.applied.fparams.no_dict_id,
+                &super::cdict::LoadParams {
+                    use_row_match_finder: self.applied.use_row_match_finder,
+                    force_window: false,
+                    ldm: ldm_enabled.then_some(&ldm_params),
+                },
+                super::cdict::TableLoad::Fast,
+                super::cdict::FillPurpose::CCtx,
+            )
+            .map_err(|_| CoreError::Generic)?;
+            self.dict_id = id;
+            return Ok(());
+        }
+        let window_log = applied.cparams.window_log;
+        if cdict.should_attach(pref, pledged) {
+            // ZSTD_resetCCtx_byAttachingCDict: tables sized for the input
+            // alone, the dictionary's parameters otherwise.
+            let mut cparams = params::adjust_cparams_for(
+                cdict.cparams(),
+                pledged,
+                cdict.content_size(),
+                CParamMode::AttachDict,
+                applied.use_row_match_finder,
+            );
+            cparams.window_log = window_log;
+            applied.cparams = cparams;
+            applied.use_row_match_finder = cdict.use_row_match_finder;
+            self.begin(applied, pledged);
+            let cdict_end = cdict.ms.window.end_index();
+            if cdict_end != cdict.ms.window.dict_limit {
+                let ms = &mut self.ms;
+                ms.dict_match_state = true;
+                // Dictionary indices, translated below the input's, must
+                // never go negative.
+                if ms.window.dict_limit < cdict_end {
+                    ms.window.next_src = ms.window.base.add(i64::from(cdict_end));
+                    ms.window.clear();
+                }
+                ms.loaded_dict_end = ms.window.dict_limit;
+            }
+        } else {
+            // ZSTD_resetCCtx_byCopyingCDict.
+            let mut cparams = cdict.cparams();
+            cparams.window_log = window_log;
+            applied.cparams = cparams;
+            applied.use_row_match_finder = cdict.use_row_match_finder;
+            self.begin(applied, pledged);
+            self.ms.copy_dictionary_tables(&cdict.ms);
+        }
+        self.dict_id = cdict.dict_id;
+        (*self.prev).clone_from(&cdict.block_state);
+        Ok(())
+    }
+
+    /// Makes the `len` bytes at `src` history the frame may match into, as
+    /// a raw-content prefix (`ZSTD_compressBegin_advanced_internal` with
+    /// `ZSTD_dct_rawContent`, `ZSTD_dtlm_fast` and `forceWindow`, the way
+    /// ZSTDMT primes a job with the overlap before it): the bytes fill the
+    /// window and the match finder's tables, nothing is written for them, and
+    /// they stay subject to the window like any input. Call it right after
+    /// [`Self::begin`].
+    #[cfg(not(feature = "no_std"))]
+    pub(crate) fn load_prefix(&mut self, segments: &Segments<'_>, src: Addr, len: usize) {
+        if len < 8 {
+            return;
+        }
+        self.prev.reset();
+        let ldm_params = self.applied.ldm;
+        let ldm_enabled = ldm_params.enable == ParamSwitch::Enable;
+        super::cdict::load_dictionary_content(
+            &mut self.ms,
+            ldm_enabled.then_some(&mut self.ldm),
+            segments,
+            src,
+            len,
+            &super::cdict::LoadParams {
+                use_row_match_finder: self.applied.use_row_match_finder,
+                force_window: true,
+                ldm: ldm_enabled.then_some(&ldm_params),
+            },
+            super::cdict::TableLoad::Fast,
+            super::cdict::FillPurpose::CCtx,
+        );
+    }
+
+    /// `ZSTD_resetCCtx_internal` for a frame that will load
+    /// `loaded_dict_size` bytes of dictionary into this context.
+    #[inline]
+    fn begin_sized(&mut self, applied: AppliedParams, pledged: u64, loaded_dict_size: u64) {
         self.is_first_block = true;
         self.applied = applied;
         if self.applied.ldm.enable == ParamSwitch::Enable {
@@ -316,7 +466,10 @@ impl Engine {
         let block_size = self.applied.max_block_size.min(window_size);
 
         let index_too_close = self.ms.window.end_index() > CURRENT_MAX - (16 << 20);
-        let reset_index = index_too_close || !self.initialized;
+        // ZSTD_dictTooBig: a dictionary beyond ZSTD_CHUNKSIZE_MAX loads into
+        // fresh indices.
+        let dict_too_big = loaded_dict_size > u64::from(u32::MAX - CURRENT_MAX);
+        let reset_index = index_too_close || dict_too_big || !self.initialized;
 
         self.pledged_src_size_plus_one = pledged.wrapping_add(1);
         self.consumed_src_size = 0;
@@ -327,6 +480,7 @@ impl Engine {
         self.block_size_max = block_size;
         self.xxh.reset(0);
         self.stage = Stage::Init;
+        self.dict_id = 0;
         self.prev.reset();
         self.ms
             .reset(cparams, self.applied.use_row_match_finder, reset_index);
@@ -339,9 +493,15 @@ impl Engine {
     }
 
     /// Writes the frame header (`ZSTD_writeFrameHeader`).
+    #[inline]
     fn write_frame_header(&self, dst: &mut [u8], pledged: u64) -> Result<usize, CoreError> {
         let fparams = self.applied.fparams;
-        let dict_id_size_code = 0u8;
+        let dict_id = self.dict_id;
+        let dict_id_size_code = if fparams.no_dict_id {
+            0
+        } else {
+            u8::from(dict_id > 0) + u8::from(dict_id >= 256) + u8::from(dict_id >= 65536)
+        };
         let checksum = u8::from(fparams.checksum);
         let window_size = 1u64 << self.applied.cparams.window_log;
         let single_segment = fparams.content_size && window_size >= pledged;
@@ -366,6 +526,21 @@ impl Engine {
         if !single_segment {
             dst[pos] = window_log_byte;
             pos += 1;
+        }
+        match dict_id_size_code {
+            0 => {}
+            1 => {
+                dst[pos] = dict_id as u8;
+                pos += 1;
+            }
+            2 => {
+                dst[pos..pos + 2].copy_from_slice(&(dict_id as u16).to_le_bytes());
+                pos += 2;
+            }
+            _ => {
+                dst[pos..pos + 4].copy_from_slice(&dict_id.to_le_bytes());
+                pos += 4;
+            }
         }
         match fcs_code {
             0 => {
@@ -505,6 +680,7 @@ impl Engine {
     }
 
     /// `ZSTD_optimalBlockSize`.
+    #[inline]
     fn optimal_block_size(&self, src: &[u8], savings: i64) -> usize {
         const SPLIT_LEVELS: [usize; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
         let block_size_max = self.block_size_max;
@@ -524,23 +700,6 @@ impl Engine {
             (level - 2) as usize
         };
         presplit::split_block(&src[..block_size_max], level)
-    }
-
-    /// `ZSTD_overflowCorrectIfNeeded`.
-    fn overflow_correct_if_needed(&mut self, ip: u32, iend: u32) {
-        let cparams = self.applied.cparams;
-        let cycle_log = params::cycle_log(cparams.chain_log, cparams.strategy);
-        let max_dist = 1u32 << cparams.window_log;
-        let ms = &mut self.ms;
-        if ms
-            .window
-            .need_overflow_correction(cycle_log, max_dist, ms.loaded_dict_end, ip, iend)
-        {
-            let correction = ms.window.correct_overflow(cycle_log, max_dist, ip);
-            ms.reduce_index(correction);
-            ms.next_to_update = ms.next_to_update.saturating_sub(correction);
-            ms.loaded_dict_end = 0;
-        }
     }
 
     /// Compresses a chunk into one or more blocks (`ZSTD_compress_frameChunk`).
@@ -586,14 +745,23 @@ impl Engine {
             if out.len() < BLOCK_HEADER_SIZE + 2 + 1 {
                 return Err(CoreError::DstSizeTooSmall);
             }
-            self.overflow_correct_if_needed(ip, ip + block_size as u32);
+            self.ms
+                .overflow_correct_if_needed(ip, ip + block_size as u32);
             let ip = self.ms.window.index_of(pos);
             let block_end = ip + block_size as u32;
-            // ZSTD_checkDictValidity has nothing to invalidate without a
-            // dictionary.
             let ms = &mut self.ms;
-            ms.window
-                .enforce_max_dist(ip, max_dist, &mut ms.loaded_dict_end);
+            ms.window.check_dict_validity(
+                block_end,
+                max_dist,
+                &mut ms.loaded_dict_end,
+                &mut ms.dict_match_state,
+            );
+            ms.window.enforce_max_dist(
+                ip,
+                max_dist,
+                &mut ms.loaded_dict_end,
+                &mut ms.dict_match_state,
+            );
             if ms.next_to_update < ms.window.low_limit {
                 ms.next_to_update = ms.window.low_limit;
             }

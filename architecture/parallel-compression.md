@@ -59,21 +59,61 @@ sequenceDiagram
     participant T as task
     participant E as Engine (from the pool)
     T->>E: begin(plan.applied, checksum off, size unknown)
-    T->>E: compress_continue(overlap) — output discarded
-    T->>E: reset entropy tables and repeat offsets
-    T->>E: compress_continue(segment, not last)
+    alt lazy, lazy2, btlazy2
+        T->>E: compress_continue(overlap) — header and blocks, discarded
+        T->>E: entropy tables reset
+    else every other strategy
+        T->>E: load_prefix(overlap): window + tables, nothing written
+        T->>E: compress_continue(empty) — frame header, discarded
+    end
+    T->>E: repeat offsets invalidated (ZSTD_invalidateRepCodes)
+    T->>E: compress_continue(segment, not last) into the task's output
     E-->>T: the segment's blocks
     T->>T: return engine to the pool
 ```
 
 A segment may reach back into the `overlap` bytes before it: an eighth of
-the window, or the whole window for btultra and btultra2. The engine first
-compresses the overlap and throws that output away, which fills its tables
-and window with that history. Then it resets the entropy tables and repeat
-offsets, so the segment's first block refers to nothing the decoder has not
-seen: no repeated tables from discarded blocks, and no repeat offsets that
-only existed there. Matches into the overlap remain valid, because the
-decoder already holds those bytes as the previous segment's output.
+the window, or the whole window for btultra and btultra2, whose frames
+gain the most from distant history. The overlap is not capped by the segment
+size, so at level 22 (a 128 MiB window) a segment primes itself with up to
+128 MiB of earlier input.
+
+How a segment primes itself depends on the strategy
+(`FramePlan::compresses_overlap`), chosen by measurement
+(`benches/parallel.rs` `parallel-corpora`):
+
+```mermaid
+flowchart TD
+    S{strategy} -->|fast, dfast, greedy, btopt, btultra, btultra2| L["load_prefix: insert the overlap into the tables"]
+    S -->|lazy, lazy2| C1["compress the overlap, discard it: the lazy finders skip ahead through input that does not match, a load inserts every position"]
+    S -->|btlazy2| C2["compress the overlap, discard it: compression sorts the tree lazily, a load sorts all of it"]
+```
+
+With four threads, 4 MiB segments and 16 MiB inputs (synthetic text,
+binary, random and mixed data, and the 5 MiB of vendored zstd sources;
+i7-13700KF), loading instead of compressing the overlap made levels 18-22
+15-27% faster, with frames 0.01-0.09% larger (0.25-0.27% on the binary
+corpus): a compressed overlap left the optimal parser's statistics primed
+for the segment's first block, a loaded one does not. Levels 1-5 ran up to
+27% faster (random input at level 1) and levels 16-17 1-7% faster, with
+frames within 0.12% of compressing the overlap. Loading made lazy and lazy2
+up to three times slower on random input and btlazy2 9% slower on text,
+so those strategies keep compressing it. Fast and dfast load every third
+position (`ZSTD_dtlm_fast`), as ZSTDMT does: the full load only fills empty
+slots, so with the stale entries a pooled engine keeps it would make a
+segment depend on the engine's history.
+
+`Engine::load_prefix` loads the overlap the way ZSTDMT primes a job
+(`ZSTD_compressBegin_advanced_internal` with a raw-content prefix,
+`ZSTD_dtlm_fast` and `forceWindow`): `load_dictionary_content` makes the
+bytes history in the window and inserts them into the match finder's tables
+(and LDM's, when enabled) without compressing them, and the prefix remains
+subject to the window like any input. Overlap and segment are one slice, so
+the segment continues the prefix contiguously and the noDict finders run.
+The segment starts with empty entropy tables and repeat offsets that match
+nothing, so its first block refers to nothing the decoder has not seen;
+matches into the overlap stay valid, because the decoder holds those bytes
+as the previous segment's output.
 
 ## Scoped batches
 
@@ -300,7 +340,8 @@ which `std::io` would retry. The wrapped cause's source in the chain is the
   so does any stream whose input fits in one segment.
 - Every task publishes exactly once (run, drop or unwind), so `wait` and
   batch assembly never wait for a task that cannot report.
-- `in_flight <= window`; `filling` holds at most an overlap plus one segment.
+- `in_flight <= window`; `filling` holds at most an overlap plus one segment,
+  allocated once per segment at that size.
 - `process` writes exactly `output[..produced]`.
 - Engines are reused through the pool; reuse does not change output (see
   [compressor](compressor.md#retention)). An engine that unwound is never
@@ -311,11 +352,14 @@ which `std::io` would retry. The wrapped cause's source in the chain is the
 
 ## Known gaps
 
-- The overlap is re-compressed rather than loaded as a prefix the way ZSTDMT
-  loads it with `ZSTD_compressBegin_advanced_internal`. This costs CPU but
-  not correctness.
-- Frames are not ZSTDMT-identical, and there is no job-size or
-  overlap-log parameter.
+- Frames are not ZSTDMT-identical (segments are not ZSTDMT jobs, LDM runs
+  per segment rather than serially, overlaps follow their own sizes, and
+  lazy, lazy2 and btlazy2 compress their overlap instead of loading it),
+  and there is no job-size or overlap-log parameter.
+- Segment size does not follow the window as ZSTDMT's job size does: at
+  levels 18-22 small segments each prime themselves with a whole window of
+  earlier input, which can cost more than compressing the segment.
+- The parallel compressor takes no dictionary.
 - A stream copies its input into segments, and each part's blocks through
   the caller's buffer; the batch reads its slice in place.
 - A task held by the caller and never run or dropped blocks `wait` forever.

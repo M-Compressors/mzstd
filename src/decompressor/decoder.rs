@@ -1,10 +1,11 @@
 use ::core::ops::Range;
 use alloc::vec::Vec;
 
-use super::core::Stream;
+use super::core::{DictView, Stream};
 use super::{
     DecodeError, DecodeOperation, DecoderConfig, DecoderSession, DecoderSessionOwned, DecoderStatus,
 };
+use crate::dictionary::{DecodeDictionary, DictionaryRef};
 use crate::{Backend, RetentionPolicy};
 
 /// A reusable Zstandard decoder.
@@ -223,7 +224,21 @@ impl Decompressor {
     ///
     /// See [`DecoderSession::process`] for a complete loop.
     pub fn start(&mut self) -> DecoderSession<'_> {
-        DecoderSession::new(self)
+        DecoderSession::new(self, None)
+    }
+
+    /// Starts an incremental operation borrowing this decoder and
+    /// `dictionary`, which every frame of the operation starts from.
+    ///
+    /// The dictionary must be the one the frames were compressed with; see
+    /// [`DecodeDictionary`] for how IDs are checked. It stays borrowed until
+    /// the session is dropped. See [`DecoderSession::process`] for a
+    /// complete loop and [`DictionaryRef`] for an example.
+    pub fn start_with_dictionary<'d>(
+        &'d mut self,
+        dictionary: impl Into<DictionaryRef<'d>>,
+    ) -> DecoderSession<'d> {
+        DecoderSession::new(self, Some(dictionary.into().view()))
     }
 
     /// Starts an incremental operation that owns this decoder.
@@ -231,7 +246,37 @@ impl Decompressor {
     /// See [`DecoderSessionOwned`] for an example.
     #[must_use]
     pub fn into_session(self) -> DecoderSessionOwned {
-        DecoderSessionOwned::new(self)
+        DecoderSessionOwned::new(self, None)
+    }
+
+    /// Starts an incremental operation that owns this decoder and
+    /// `dictionary`, which every frame of the operation starts from.
+    ///
+    /// Pass an `Arc<DecodeDictionary>` to share one dictionary between
+    /// sessions without copying it; the session then carries no lifetime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use mzstd::dictionary::DecodeDictionary;
+    /// use mzstd::{DecodeOperation, DecoderStatus, Decompressor};
+    ///
+    /// let dictionary = Arc::new(DecodeDictionary::try_from(&b"history"[..])?);
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// let mut session = Decompressor::default().into_session_with_dictionary(Arc::clone(&dictionary));
+    /// let mut output = [0u8; 8];
+    /// let progress = session.process(&frame, &mut output, DecodeOperation::Finish)?;
+    /// assert_eq!(progress.status, DecoderStatus::Finished);
+    /// assert_eq!(&output[..progress.produced], b"ok");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn into_session_with_dictionary<D: AsRef<DecodeDictionary> + 'static>(
+        self,
+        dictionary: D,
+    ) -> DecoderSessionOwned<D> {
+        DecoderSessionOwned::new(self, Some(dictionary))
     }
 
     /// Decodes complete input into a new vector.
@@ -285,9 +330,19 @@ impl Decompressor {
         src: &[u8],
         dst: &mut Vec<u8>,
     ) -> Result<Range<usize>, DecodeError> {
+        self.decode_into(src, dst, None)
+    }
+
+    /// [`Self::decompress_into`] with an optional dictionary.
+    fn decode_into(
+        &mut self,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+        dictionary: Option<DictView<'_>>,
+    ) -> Result<Range<usize>, DecodeError> {
         let start = dst.len();
         self.stream.reset(self.config);
-        let result = self.stream.decode_all(src, dst);
+        let result = self.stream.decode_all(src, dst, dictionary);
         self.apply_retention();
         match result {
             Ok(()) => Ok(start..dst.len()),
@@ -328,16 +383,26 @@ impl Decompressor {
         src: &[u8],
         dst: &mut [u8],
     ) -> Result<usize, DecodeError> {
+        self.decode_to_slice(src, dst, None)
+    }
+
+    /// [`Self::decompress_to_slice`] with an optional dictionary.
+    fn decode_to_slice(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        dictionary: Option<DictView<'_>>,
+    ) -> Result<usize, DecodeError> {
         // Frames that declare sizes that fit decode straight into `dst`;
         // anything else, errors included, takes the incremental path, which
         // defines this method's results.
         self.stream.reset(self.config);
-        let direct = self.stream.decode_to_slice(src, dst);
+        let direct = self.stream.decode_to_slice(src, dst, dictionary);
         if let Some(written) = direct {
             self.apply_retention();
             return Ok(written);
         }
-        let mut session = self.start();
+        let mut session = DecoderSession::new(self, dictionary);
         let progress = session.process(src, dst, DecodeOperation::Finish)?;
         match progress.status {
             DecoderStatus::NeedsOutput => Err(DecodeError::OutputTooSmall {
@@ -351,5 +416,88 @@ impl Decompressor {
             }
             DecoderStatus::Finished => Ok(progress.produced),
         }
+    }
+
+    /// Decodes complete input that was compressed with `dictionary` into a
+    /// new vector; every frame starts from the dictionary.
+    ///
+    /// The dictionary is borrowed for this call only and not copied.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress`], plus [`DecodeError::DictionaryMismatch`]
+    /// for a frame that names another dictionary ID.
+    ///
+    /// # Examples
+    ///
+    /// See [`DecodeDictionary`].
+    pub fn decompress_with_dictionary<'dict>(
+        &mut self,
+        dictionary: impl Into<DictionaryRef<'dict>>,
+        src: &[u8],
+    ) -> Result<Vec<u8>, DecodeError> {
+        let mut dst = Vec::new();
+        self.decode_into(src, &mut dst, Some(dictionary.into().view()))?;
+        Ok(dst)
+    }
+
+    /// Decodes complete input that was compressed with `dictionary` onto the
+    /// end of `dst`, returning the range of the appended bytes, as
+    /// [`Self::decompress_into`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress_with_dictionary`]; `dst` is truncated back to
+    /// its original length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DecodeDictionary;
+    /// use mzstd::Decompressor;
+    /// let dictionary = DecodeDictionary::try_from(&b"history"[..])?;
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// let mut output = b"status: ".to_vec();
+    /// let range = Decompressor::default().decompress_with_dictionary_into(&dictionary, &frame, &mut output)?;
+    /// assert_eq!(&output[range], b"ok");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn decompress_with_dictionary_into<'dict>(
+        &mut self,
+        dictionary: impl Into<DictionaryRef<'dict>>,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Result<Range<usize>, DecodeError> {
+        self.decode_into(src, dst, Some(dictionary.into().view()))
+    }
+
+    /// Decodes complete input that was compressed with `dictionary` into
+    /// `dst`, returning the number of bytes written, as
+    /// [`Self::decompress_to_slice`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress_with_dictionary`], plus
+    /// [`DecodeError::OutputTooSmall`] when the output does not fit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DecodeDictionary;
+    /// use mzstd::Decompressor;
+    /// let dictionary = DecodeDictionary::try_from(&b"history"[..])?;
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x02, 0x11, 0x00, 0x00, b'o', b'k'];
+    /// let mut output = [0u8; 4];
+    /// let written = Decompressor::default().decompress_with_dictionary_to_slice(&dictionary, &frame, &mut output)?;
+    /// assert_eq!(&output[..written], b"ok");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn decompress_with_dictionary_to_slice<'dict>(
+        &mut self,
+        dictionary: impl Into<DictionaryRef<'dict>>,
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize, DecodeError> {
+        self.decode_to_slice(src, dst, Some(dictionary.into().view()))
     }
 }

@@ -12,7 +12,8 @@ graph TD
         Fse[fse: distributions, repeat flags, Appendix A tables, weight decoder]
         Huf[huffman: RFC example tree, 1 and 4 streams, invalid weights, 12-bit trees]
         Lit[literals: all size formats, RLE, treeless reuse]
-        Seq[sequences: baselines, overlapping copies, repeat-offset rules, invalid sequences]
+        Seq[sequences: baselines, overlapping copies, repeat-offset rules, invalid sequences, dictionary reach]
+        DictU[dictionary: entropy section, repeat-offset limits, truncation]
         Frame[frame / block / history / stream]
     end
     subgraph integration[tests/decoder_*.rs]
@@ -21,7 +22,9 @@ graph TD
         Corrupt[decoder_corruption: every truncation, bit flips, random damage]
         Api[decoder_api: modes, Finish contract, budgets, typed errors, retention]
         Io[decoder_io: Read / Write adapters, deferred and sink errors]
+        Dict[decoder_dictionary: raw and trained dictionaries, IDs, entropy reuse, dictionary acceptance]
     end
+    Ref --> Dict
     Ref[zstd 1.5.7 via zstd-ffi] --> Oracle
     Ref --> Golden
     Ref --> Corrupt
@@ -55,6 +58,25 @@ graph TD
   output whenever both decoders accept, and never accepting what the
   reference rejects. The only tolerated difference is the documented
   stricter Huffman stream-end check.
+- **`decoder_dictionary`** compresses with `ZSTD_compress2` and a
+  dictionary trained by `ZDICT_trainFromBuffer` on JSON-like records, or
+  48 KB of raw text, at every level from -5 to 22 (five levels in debug
+  builds), from one record to inputs past 128 KiB (so the reference both
+  attaches and copies the dictionary; forced attach, copy and load modes
+  are checked too), with checksums, unknown sizes, small windows and
+  long-distance matching. Every frame must decode through
+  `decompress_with_dictionary`, its `_into` and `_to_slice` twins, a
+  borrowed session and an owned session (`Arc`) fed random pieces, and the
+  reader and writer adapters, on every backend, and concatenations with
+  skippable and dictionary-less frames must decode. Dictionary IDs are
+  checked against the reference's verdicts (missing, other trained, raw
+  and empty dictionaries); frames whose first block uses treeless literals
+  or repeated tables are found by parsing them and must fail, as in the
+  reference, when the same bytes are loaded as raw content. Every
+  truncation of the entropy section, zero and oversized repeat offsets and
+  2000 random corruptions must be accepted or rejected exactly as
+  `ZSTD_DCtx_loadDictionary_advanced` does, and a frame decoded with an
+  accepted corrupt dictionary must equal the reference's output.
 - **`decoder_api`** and **`decoder_io`** pin the public contract: frame
   modes, the `Finish` suffix rule and `InvalidState`, failure progress,
   byte budgets, typed errors (with reference agreement where it applies),

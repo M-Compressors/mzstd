@@ -7,6 +7,7 @@
 
 mod config;
 pub(crate) mod core;
+pub(crate) mod dictionary;
 mod encoder;
 mod error;
 mod internal;

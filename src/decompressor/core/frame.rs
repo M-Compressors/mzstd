@@ -4,13 +4,19 @@
 //! [`FrameDecoder`] validates it against the caller's limits, then
 //! regenerates the frame's blocks one at a time, tracking the produced size
 //! against `Frame_Content_Size` and hashing the output for the optional
-//! content checksum.
+//! content checksum. A frame starts from the operation's dictionary, if
+//! any: its ID must match the frame's, its tables and repeat offsets seed
+//! the first block, and its content precedes the frame's output.
+
+use ::core::ops::Range;
 
 use super::BlockError;
 use super::block::{BlockDecoder, BlockHeader};
+use super::dictionary::DictView;
 use super::sequences::BlockContext;
 use crate::Backend;
 use crate::decompressor::{DecodeError, DecodeLimits, InvalidDataKind};
+use crate::dictionary::DictionaryId;
 use crate::shared::format::{
     BLOCK_SIZE_MAX, CHECKSUM_SIZE, FRAME_HEADER_SIZE_MAX, WINDOW_LOG_ABSOLUTE_MIN,
 };
@@ -134,16 +140,30 @@ impl Default for FrameDecoder {
 }
 
 impl FrameDecoder {
-    /// Validates `header` against `limits` and starts its frame.
+    /// Validates `header` against `limits` and the operation's
+    /// `dictionary`, and starts its frame from that dictionary.
+    ///
+    /// As in `ZSTD_decodeFrameHeader`, a frame that names a dictionary ID
+    /// needs a dictionary with that ID: without a dictionary it fails with
+    /// [`DecodeError::DictionaryUnsupported`], with another one with
+    /// [`DecodeError::DictionaryMismatch`]. A frame that names none decodes
+    /// with any dictionary, or without one.
     pub(crate) fn begin(
         &mut self,
         header: FrameHeader,
         limits: &DecodeLimits,
+        dictionary: Option<DictView<'_>>,
     ) -> Result<(), DecodeError> {
-        if header.dictionary_id != 0 {
-            return Err(DecodeError::DictionaryUnsupported {
-                id: header.dictionary_id,
-            });
+        if let Some(frame) = DictionaryId::new(header.dictionary_id) {
+            let Some(view) = dictionary else {
+                return Err(DecodeError::DictionaryUnsupported {
+                    id: header.dictionary_id,
+                });
+            };
+            let expected = DictionaryId::new(view.id);
+            if expected != Some(frame) {
+                return Err(DecodeError::DictionaryMismatch { expected, frame });
+            }
         }
         let limit = limits.max_window_size();
         if header.window_size > limit {
@@ -157,7 +177,7 @@ impl FrameDecoder {
         self.header = Some(header);
         self.produced = 0;
         self.hasher.reset(0);
-        self.blocks.reset();
+        self.blocks.reset(dictionary.and_then(|view| view.entropy));
         Ok(())
     }
 
@@ -186,9 +206,15 @@ impl FrameDecoder {
         self.header.is_some_and(|header| header.checksum)
     }
 
-    /// Regenerates one block into `out[op..]` on `backend`, returning the
-    /// end of its output; `out[history_start..op]` is this frame's retained
-    /// history.
+    /// Regenerates one block into `out` after `out[history]`, this frame's
+    /// retained history, on `backend`, returning the end of its output.
+    /// `dictionary` must be the one the frame began with.
+    ///
+    /// The dictionary's content precedes the frame's first byte while the
+    /// frame's output before the block is below its window: the reference
+    /// encoder only references a dictionary from blocks that end within
+    /// one window of it, and the frame's first window is then still in
+    /// `out` from `history.start`.
     ///
     /// Callers that grow their buffer give it room for
     /// [`Self::block_max`] bytes plus
@@ -202,14 +228,24 @@ impl FrameDecoder {
         block: &BlockHeader,
         content: &[u8],
         out: &mut [u8],
-        op: usize,
-        history_start: usize,
+        history: Range<usize>,
+        dictionary: Option<DictView<'_>>,
     ) -> Result<usize, DecodeError> {
+        let Range {
+            start: history_start,
+            end: op,
+        } = history;
         let header = self.header.ok_or(DecodeError::InvalidState)?;
+        let before = match dictionary {
+            Some(view) if self.produced < header.window_size => view.content,
+            _ => &[],
+        };
         let context = BlockContext {
             history_start,
             window: header.window_size,
             block_max: self.block_max,
+            dictionary: before,
+            entropy: dictionary.and_then(|view| view.entropy),
         };
         let end = self
             .blocks
@@ -317,23 +353,141 @@ mod tests {
         let limits = DecodeLimits::default();
         let with_dictionary = FrameHeader::parse(&[0x01, 0x00, 9]).expect("valid");
         assert!(matches!(
-            frame.begin(with_dictionary, &limits),
+            frame.begin(with_dictionary, &limits, None),
             Err(DecodeError::DictionaryUnsupported { id: 9 })
         ));
         // Exponent 18: a 2^28-byte window exceeds the default 2^27.
         let wide = FrameHeader::parse(&[0x00, 18 << 3]).expect("valid");
         assert!(matches!(
-            frame.begin(wide, &limits),
+            frame.begin(wide, &limits, None),
             Err(DecodeError::WindowLimitExceeded {
                 window_size: 0x1000_0000,
                 limit: 0x0800_0000
             })
         ));
         let empty = FrameHeader::parse(&[0x20, 0]).expect("valid");
-        frame.begin(empty, &limits).expect("valid");
+        frame.begin(empty, &limits, None).expect("valid");
         assert_eq!(frame.block_max(), 0);
         assert!(!frame.has_checksum());
         assert_eq!(frame.header(), Some(&empty));
+    }
+
+    #[test]
+    fn frames_need_the_dictionary_they_name() {
+        let mut frame = FrameDecoder::default();
+        let limits = DecodeLimits::default();
+        let view = |id| DictView {
+            content: b"history",
+            id,
+            entropy: None,
+        };
+        let named = FrameHeader::parse(&[0x01, 0x00, 9]).expect("valid");
+        let anonymous = FrameHeader::parse(&[0x00, 0x00]).expect("valid");
+        frame.begin(named, &limits, Some(view(9))).expect("same ID");
+        frame
+            .begin(anonymous, &limits, Some(view(9)))
+            .expect("frames without an ID take any dictionary");
+        frame
+            .begin(anonymous, &limits, Some(view(0)))
+            .expect("or one without an ID");
+        let expected = DictionaryId::new(4);
+        assert!(matches!(
+            frame.begin(named, &limits, Some(view(4))),
+            Err(DecodeError::DictionaryMismatch { expected: found, .. }) if found == expected
+        ));
+        // A raw-content dictionary has no ID, so it never matches one.
+        assert!(matches!(
+            frame.begin(named, &limits, Some(view(0))),
+            Err(DecodeError::DictionaryMismatch { expected: None, .. })
+        ));
+    }
+
+    #[test]
+    fn dictionary_content_is_reachable_within_the_first_window() {
+        let mut frame = FrameDecoder::default();
+        // A 1 KiB window, no content size.
+        let header = FrameHeader::parse(&[0x00, 0x00]).expect("valid");
+        let view = DictView {
+            content: b"0123456789",
+            id: 0,
+            entropy: None,
+        };
+        frame
+            .begin(header, &DecodeLimits::default(), Some(view))
+            .expect("valid");
+        // Raw literals "x", one sequence with RLE tables: literal length 0,
+        // match length 3, offset code 3 with extra bits 0b111: offset 12,
+        // two bytes before the dictionary's ten.
+        let content = [1 << 3, b'x', 1, 0x54, 0, 3, 0, 0x0f];
+        let block = BlockHeader {
+            last: false,
+            kind: BlockKind::Compressed,
+            size: content.len(),
+        };
+        let mut buffer = alloc::vec![0u8; 1024 + (1 << 17) + 64];
+        let error = frame
+            .decode_block(
+                Backend::default(),
+                &block,
+                &content,
+                &mut buffer,
+                0..0,
+                Some(view),
+            )
+            .expect_err("offset 12 reaches past the dictionary");
+        assert!(matches!(
+            error,
+            DecodeError::InvalidData {
+                kind: InvalidDataKind::Offset
+            }
+        ));
+        // Offset code 2 with extra bits 0b11: offset 4, into "6789".
+        let content = [1 << 3, b'x', 1, 0x54, 0, 2, 0, 0x07];
+        let end = frame
+            .decode_block(
+                Backend::default(),
+                &block,
+                &content,
+                &mut buffer,
+                0..0,
+                Some(view),
+            )
+            .expect("valid");
+        assert_eq!(&buffer[..end], b"678x");
+        // Past the first window the dictionary is out of reach.
+        let raw = BlockHeader {
+            last: false,
+            kind: BlockKind::Raw,
+            size: 1024,
+        };
+        let filler = alloc::vec![b'.'; 1024];
+        let end = frame
+            .decode_block(
+                Backend::default(),
+                &raw,
+                &filler,
+                &mut buffer,
+                0..end,
+                Some(view),
+            )
+            .expect("raw");
+        // With no retained history, the same match has nothing to copy.
+        let error = frame
+            .decode_block(
+                Backend::default(),
+                &block,
+                &content,
+                &mut buffer,
+                end..end,
+                Some(view),
+            )
+            .expect_err("the dictionary is out of reach");
+        assert!(matches!(
+            error,
+            DecodeError::InvalidData {
+                kind: InvalidDataKind::Offset
+            }
+        ));
     }
 
     /// Decodes a block after `out` and appends its output.
@@ -346,7 +500,14 @@ mod tests {
         let start = out.len();
         let mut buffer = out.clone();
         buffer.resize(start + (1 << 17) + 32, 0);
-        let end = frame.decode_block(Backend::default(), block, content, &mut buffer, start, 0)?;
+        let end = frame.decode_block(
+            Backend::default(),
+            block,
+            content,
+            &mut buffer,
+            0..start,
+            None,
+        )?;
         out.extend_from_slice(&buffer[start..end]);
         Ok(())
     }
@@ -366,7 +527,11 @@ mod tests {
             Err(DecodeError::InvalidState)
         ));
         frame
-            .begin(FrameHeader::parse(&[0x24, 3]).expect("valid"), &limits)
+            .begin(
+                FrameHeader::parse(&[0x24, 3]).expect("valid"),
+                &limits,
+                None,
+            )
             .expect("valid");
         decode(&mut frame, &raw(false, 2), b"ab", &mut out).expect("fits");
         assert!(matches!(
@@ -377,7 +542,11 @@ mod tests {
             })
         ));
         frame
-            .begin(FrameHeader::parse(&[0x24, 3]).expect("valid"), &limits)
+            .begin(
+                FrameHeader::parse(&[0x24, 3]).expect("valid"),
+                &limits,
+                None,
+            )
             .expect("valid");
         out.clear();
         decode(&mut frame, &raw(true, 3), b"abc", &mut out).expect("fits");
@@ -394,7 +563,11 @@ mod tests {
         ));
         // Producing more than declared fails before the last block.
         frame
-            .begin(FrameHeader::parse(&[0x20, 1]).expect("valid"), &limits)
+            .begin(
+                FrameHeader::parse(&[0x20, 1]).expect("valid"),
+                &limits,
+                None,
+            )
             .expect("valid");
         assert!(matches!(
             decode(&mut frame, &raw(false, 1), b"a", &mut out),

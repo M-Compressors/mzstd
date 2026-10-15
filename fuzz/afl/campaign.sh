@@ -14,18 +14,20 @@ here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
 seconds=${1:-300}
 [ "$#" -gt 0 ] && shift
-targets=${*:-"differential_c output_capacity encoder_session compressor_lifecycle parallel parameter_parsing decompress decode_streaming decode_roundtrip"}
+targets=${*:-"differential_c output_capacity encoder_session compressor_lifecycle parallel parameter_parsing decompress decode_streaming decode_roundtrip decode_dictionary compress_dictionary"}
 
 cargo afl build --release
 mkdir -p findings
 for target in $targets; do
     # Encoder targets and decode_roundtrip read a parameter header; decompress
-    # reads a frame; decode_streaming reads two piece sizes and a frame, which
-    # only its committed regressions provide.
+    # reads a frame; decode_streaming reads two piece sizes and a frame, and
+    # decode_dictionary a dictionary and frames, and compress_dictionary a
+    # header followed by a dictionary and a payload, which only their committed
+    # regressions provide.
     seeds="regressions/$target"
     case "$target" in
         decompress) [ -d seeds/frames ] && seeds=seeds/frames ;;
-        decode_streaming) ;;
+        decode_streaming | decode_dictionary | compress_dictionary) ;;
         *) [ -d seeds/params ] && seeds=seeds/params ;;
     esac
     rm -rf "findings/$target"

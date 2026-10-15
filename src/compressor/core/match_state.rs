@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use super::entropy::Tables;
 use super::ldm::RawSeqStore;
 use super::mem;
 use super::opt::OptState;
@@ -30,6 +31,24 @@ pub(crate) struct BlockInput<'a> {
     pub(crate) end: u32,
     /// The SIMD level the block's kernels run with.
     pub(crate) backend: Backend,
+    /// The attached dictionary, when the match finder runs in
+    /// dictMatchState mode.
+    pub(crate) dms: Option<DictMatchState<'a>>,
+    /// The entropy tables the block inherits; the optimal parser seeds its
+    /// first block's statistics from them when a dictionary validated them
+    /// (`ms->opt.symbolCosts`). `None` where nothing is inherited.
+    pub(crate) symbol_costs: Option<&'a Tables>,
+}
+
+/// An attached dictionary (`ms->dictMatchState`): its match finder tables
+/// and its bytes, which the context reads but never changes.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct DictMatchState<'a> {
+    /// The dictionary's tables, window state and parameters.
+    pub(crate) ms: &'a MatchState,
+    /// The dictionary's content, addressed by the dictionary's own indices
+    /// (`ext` is empty).
+    pub(crate) window: mem::Window<'a>,
 }
 
 /// A block compressor: fills `seq_store` with the block's sequences, updates
@@ -41,8 +60,12 @@ pub(crate) type BlockCompressor =
 #[derive(Debug)]
 pub(crate) struct MatchState {
     pub(crate) window: WindowState,
-    /// Index of the end of a loaded dictionary; always `0` here.
+    /// Index of the end of a loaded or attached dictionary, `0` when none
+    /// is in effect.
     pub(crate) loaded_dict_end: u32,
+    /// Whether a dictionary is attached (`ms->dictMatchState != NULL`);
+    /// the dictionary itself comes with each call's segments.
+    pub(crate) dict_match_state: bool,
     /// Index from which table updates resume.
     pub(crate) next_to_update: u32,
     /// Hash log of the 3-byte table, `0` when unused.
@@ -86,6 +109,7 @@ impl MatchState {
         Self {
             window: WindowState::new(),
             loaded_dict_end: 0,
+            dict_match_state: false,
             next_to_update: 0,
             hash_log3: 0,
             row_hash_log: 0,
@@ -116,6 +140,28 @@ impl MatchState {
         use_row_match_finder: ParamSwitch,
         reset_index: bool,
     ) {
+        self.reset_for(cparams, use_row_match_finder, reset_index, false);
+    }
+
+    /// `ZSTD_reset_matchState` for a dictionary's own tables
+    /// (`ZSTD_resetTarget_CDict`): fresh indices, clean tables, and neither
+    /// the 3-byte table nor the optimal parser's state.
+    pub(crate) fn reset_for_dictionary(
+        &mut self,
+        cparams: CParams,
+        use_row_match_finder: ParamSwitch,
+    ) {
+        self.reset_for(cparams, use_row_match_finder, true, true);
+    }
+
+    #[inline]
+    fn reset_for(
+        &mut self,
+        cparams: CParams,
+        use_row_match_finder: ParamSwitch,
+        reset_index: bool,
+        for_dictionary: bool,
+    ) {
         let strategy = cparams.strategy;
         let row = row_match_finder_used(strategy, use_row_match_finder);
         let chain_size = if strategy != Strategy::Fast && !row {
@@ -124,7 +170,7 @@ impl MatchState {
             0
         };
         let h_size = 1usize << cparams.hash_log;
-        let hash_log3 = if cparams.min_match == 3 {
+        let hash_log3 = if cparams.min_match == 3 && !for_dictionary {
             HASHLOG3_MAX.min(cparams.window_log)
         } else {
             0
@@ -145,6 +191,7 @@ impl MatchState {
         self.window.clear();
         self.next_to_update = self.window.dict_limit;
         self.loaded_dict_end = 0;
+        self.dict_match_state = false;
         self.opt.lit_length_sum = 0;
 
         // The reference zeroes its tables only when indices restart
@@ -180,7 +227,7 @@ impl MatchState {
             let row_log = cparams.search_log.clamp(4, 6);
             self.row_hash_log = cparams.hash_log - row_log;
         }
-        if strategy >= Strategy::BtOpt {
+        if strategy >= Strategy::BtOpt && !for_dictionary {
             self.opt.allocate();
         }
         self.cparams = cparams;
@@ -219,6 +266,62 @@ impl MatchState {
         }
     }
 
+    /// Copies a dictionary's tables, untagging fast and dfast entries, and
+    /// takes over its window (`ZSTD_resetCCtx_byCopyingCDict`). Both states
+    /// must have the same table parameters.
+    pub(crate) fn copy_dictionary_tables(&mut self, dict: &Self) {
+        let tagged = super::params::cdict_indices_are_tagged(&dict.cparams);
+        let copy = |dst: &mut [u32], src: &[u32]| {
+            if tagged {
+                for (dst, &src) in dst.iter_mut().zip(src) {
+                    *dst = src >> super::params::SHORT_CACHE_TAG_BITS;
+                }
+            } else {
+                dst.copy_from_slice(src);
+            }
+        };
+        let h_size = 1usize << dict.cparams.hash_log;
+        let row = row_match_finder_used(dict.cparams.strategy, dict.use_row_match_finder);
+        if row {
+            // Row tables are read from their first 64-byte boundary.
+            let dst = aligned_range(&self.hash_table, h_size);
+            let src = aligned_range(&dict.hash_table, h_size);
+            copy(&mut self.hash_table[dst], &dict.hash_table[src]);
+            let dst = aligned_range(&self.tag_table, h_size);
+            let src = aligned_range(&dict.tag_table, h_size);
+            self.tag_table[dst].copy_from_slice(&dict.tag_table[src]);
+        } else {
+            copy(&mut self.hash_table[..h_size], &dict.hash_table[..h_size]);
+        }
+        if !self.chain_table.is_empty() {
+            let chain_size = dict.chain_table.len();
+            copy(&mut self.chain_table[..chain_size], &dict.chain_table);
+        }
+        // The dictionary never fills a 3-byte table.
+        self.hash_table3.fill(0);
+        self.window = dict.window;
+        self.next_to_update = dict.next_to_update;
+        self.loaded_dict_end = dict.loaded_dict_end;
+    }
+
+    /// `ZSTD_overflowCorrectIfNeeded` before indexing `[ip, iend)`: rebases
+    /// every index when they come too close to overflowing, which also
+    /// forgets a loaded or attached dictionary.
+    pub(crate) fn overflow_correct_if_needed(&mut self, ip: u32, iend: u32) {
+        let cycle_log = super::params::cycle_log(self.cparams.chain_log, self.cparams.strategy);
+        let max_dist = 1u32 << self.cparams.window_log;
+        if self
+            .window
+            .need_overflow_correction(cycle_log, max_dist, self.loaded_dict_end, ip, iend)
+        {
+            let correction = self.window.correct_overflow(cycle_log, max_dist, ip);
+            self.reduce_index(correction);
+            self.next_to_update = self.next_to_update.saturating_sub(correction);
+            self.loaded_dict_end = 0;
+            self.dict_match_state = false;
+        }
+    }
+
     /// Subtracts `reducer` from every stored index, squashing older ones to
     /// zero (`ZSTD_reduceIndex`).
     pub(crate) fn reduce_index(&mut self, reducer: u32) {
@@ -226,6 +329,19 @@ impl MatchState {
         let preserve_mark = self.cparams.strategy == Strategy::BtLazy2;
         reduce_table(&mut self.chain_table, reducer, preserve_mark);
         reduce_table(&mut self.hash_table3, reducer, false);
+    }
+}
+
+/// Where the first `len` entries of a row table start at its first 64-byte
+/// boundary, as the reference's workspace aligns row tables; a table
+/// without [`ROW_TABLE_SLACK`] entries to spare is used from its start.
+pub(crate) fn aligned_range<T>(table: &[T], len: usize) -> core::ops::Range<usize> {
+    const ALIGN: usize = 64;
+    let skip = table.as_ptr().addr().wrapping_neg() % ALIGN / size_of::<T>().max(1);
+    if skip < ROW_TABLE_SLACK && skip + len <= table.len() {
+        skip..skip + len
+    } else {
+        0..len.min(table.len())
     }
 }
 

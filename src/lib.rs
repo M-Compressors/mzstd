@@ -2,7 +2,7 @@
 //!
 //! The encoder is a port of the reference implementation, zstd 1.5.7, and
 //! writes the same bytes it does; the decoder reads every frame RFC 8878
-//! defines apart from those that need a dictionary.
+//! defines, with or without a dictionary.
 //!
 //! # Byte identity
 //!
@@ -13,12 +13,13 @@
 //! contract covers compression levels -131072 to 22, the explicit
 //! compression parameters (window, hash, chain and search logs, minimum
 //! match, target length, strategy), long distance matching, the checksum and
-//! content-size flags, declared input sizes and size hints.
+//! content-size flags, declared input sizes, size hints, and raw-content and
+//! Zstandard-format dictionaries ([`dictionary`]), which match the reference
+//! after `ZSTD_CCtx_loadDictionary_advanced`.
 //!
 //! Parallel compression writes valid frames that decode to the input but are
-//! not those of the reference's multithreaded mode. Dictionaries, the
-//! magicless format, `targetCBlockSize` and external sequence producers are
-//! not supported.
+//! not those of the reference's multithreaded mode. The magicless format,
+//! `targetCBlockSize` and external sequence producers are not supported.
 //!
 //! # Choose your API
 //!
@@ -42,6 +43,9 @@
 //! | Stream chunked input across your threads | [`start`][parallel-start] → [`ParallelEncoderSession`] + [`ParallelTaskQueue`] | — |
 //! | Same, with the session owning the compressor | [`into_session`][parallel-into-session] → [`ParallelEncoderSessionOwned`] | — |
 //! | Push or pull through `std::io` across your threads | [`writer`][parallel-writer], [`reader`][parallel-reader] | — |
+//!
+//! Each compression and decompression shape has a `_with_dictionary` form
+//! that takes a dictionary from [`dictionary`].
 //!
 //! [`EncoderConfig`] selects the level and frame flags, and
 //! [`CompressionParams`] overrides individual parameters exactly as
@@ -192,6 +196,8 @@ extern crate alloc;
 
 #[cfg(any(feature = "compression", feature = "decompression"))]
 mod backend;
+#[cfg(any(feature = "compression", feature = "decompression"))]
+pub mod dictionary;
 #[cfg(any(feature = "compression", feature = "decompression"))]
 mod retention;
 #[cfg(any(feature = "compression", feature = "decompression"))]

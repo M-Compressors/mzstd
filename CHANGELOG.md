@@ -1,5 +1,79 @@
 # Changelog
 
+## [v0.2.4](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.4) - 2026-10-15
+
+- **Dictionaries.** `mzstd::dictionary` reads raw-content and
+  Zstandard-format dictionaries (`DictionaryContent::{Auto, Raw, Zstd}`).
+  `DictionaryBuilder` prepares a `PreparedDictionary` for one
+  `EncoderConfig`, and `Compressor` gains `compress_with_dictionary`,
+  `compress_with_dictionary_into`, `_to_slice`, `_to_uninit`,
+  `start_with_dictionary`, `into_session_with_dictionary` and, with `std`,
+  `writer_with_dictionary` and `reader_with_dictionary`; a dictionary
+  prepared for another configuration (frame options aside) is
+  `EncodeError::DictionaryMismatch`. Frames are byte-identical to zstd
+  1.5.7's `ZSTD_compress2` and `ZSTD_compressStream2` after
+  `ZSTD_CCtx_loadDictionary_advanced`: the dictionary's own tables and
+  parameters (tagged fast/dfast tables), the reference's choice between
+  attaching the dictionary and copying its tables, dictMatchState variants
+  of every match finder (fast, dfast, greedy/lazy/lazy2 with hash chains and
+  rows, btlazy2, btopt, btultra, btultra2), the dictionary's entropy tables,
+  repeat offsets and ID, and the optimal parser's first-block statistics
+  seeded from them. One exception, found by fuzzing: with a dictionary whose
+  literal or match length table omits its last symbols, the reference's
+  optimal parser reads uninitialized memory and its frames vary from run to
+  run; mzstd's stay deterministic.
+
+- **Dictionary decoding.** `DecodeDictionary` parses dictionaries as
+  zstd 1.5.7's `ZSTD_DDict` does, rejected exactly when the reference
+  rejects them; a `PreparedDictionary` decodes too, through
+  `DictionaryRef::Prepared`, without a second copy of its bytes.
+  `Decompressor` gains `decompress_with_dictionary`, `_into`, `_to_slice`,
+  `start_with_dictionary`, `into_session_with_dictionary` and, with `std`,
+  `reader_with_dictionary`/`writer_with_dictionary`. A frame naming another
+  dictionary ID fails with the new `DecodeError::DictionaryMismatch`
+  (`DictionaryUnsupported` still reports one decoded without a dictionary).
+  `EncoderSessionOwned` and `DecoderSessionOwned` gain a defaulted type
+  parameter for the dictionary they own. Decoding without a dictionary is
+  unchanged.
+
+- **Parallel segments are primed with the input before them instead of
+  compressing it.** For fast, dfast, greedy, btopt, btultra and btultra2,
+  each segment loads its overlap as a raw-content prefix, the way ZSTDMT
+  primes a job (`ZSTD_compressBegin_advanced_internal` with
+  `ZSTD_dtlm_fast` and `forceWindow`; checked byte-identical against
+  `ZSTD_CCtx_refPrefix` with `ZSTD_c_forceMaxWindow` at every level, LDM
+  included), where the overlap used to be compressed and thrown away.
+  Lazy, lazy2 and btlazy2 still compress it: loading made them up to three
+  times slower on random input (lazy, lazy2) and 9% slower on text
+  (btlazy2). Overlap sizes are unchanged. With four threads and 4 MiB
+  segments on 16 MiB of text, binary, random and mixed data and on the
+  vendored zstd sources (i7-13700KF, `benches/parallel.rs`
+  `parallel-corpora`, new): levels 18-22 run 15-27% faster (binary level
+  19: 2.34 s instead of 2.77 s) with frames 0.01-0.27% larger, levels 1-5
+  up to 27% faster and levels 16-17 1-7% faster with frames within 0.12%;
+  levels 6-15 are unchanged. Parallel output changes; serial output does
+  not. Each stream segment's buffer is now allocated once at its full size,
+  and batch assembly reserves the frame.
+
+- **Cheaper Huffman code packing.** Literals packed their codes symbol by
+  symbol with a branch; the packing is now branch-free over the whole
+  alphabet in the backend's feature context, which matters for a
+  dictionary's 256-symbol table (one 107-byte record with a dictionary: 9.2k
+  instructions instead of 11.5k). Output is unchanged.
+
+- Measured against 0.2.3 on the Criterion suites (`benches/compress.rs`,
+  `benches/decompress.rs`, pinned to one core, alternating runs): every
+  compression and decompression case without a dictionary is within ±2%,
+  and 64-byte and 1 KiB inputs execute 0.3% more instructions per call.
+  Compression with a dictionary (`benches/dictionary.rs`, trained 64 KiB
+  dictionary, JSON-like records) runs at 0.85-0.91x zstd 1.5.7's time at
+  levels 16 and 19 on 100 and 1000 records, 1.09-1.19x at levels 1-9, and
+  1.20-1.29x for a single 107-byte record.
+
+- New fuzz target `compress_dictionary` and `decode_dictionary`, and the
+  `dictionary` Criterion benchmark; the `parallel` benchmark gains a
+  per-level group.
+
 ## [v0.2.3](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.3) - 2026-10-15
 
 - **Faster fast and double-fast match finding (levels -131072 to 4).**

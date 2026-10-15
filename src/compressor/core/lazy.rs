@@ -15,6 +15,14 @@
 //! prefix-only case reads the prefix's bytes directly. Positions are window
 //! indices; an extDict candidate is read through [`mem::Window`] so a match
 //! may start in the external dictionary and continue into the prefix.
+//!
+//! An attached dictionary (dictMatchState) has its own parser,
+//! `lazy_dms_generic`, and each search a `find_dms` variant: the search runs
+//! in the context's tables as without a dictionary (the prefix-only
+//! candidate loops), then continues in the dictionary's tables
+//! ([`DictCtx`]) with the attempts the context's search left, as the
+//! reference's `dictMode == ZSTD_dictMatchState` specialization does. The
+//! prefix-only and extDict parsers are untouched by it.
 
 mod count;
 mod row;
@@ -22,7 +30,7 @@ mod row;
 use fearless_simd::Simd;
 
 use super::match_state::{
-    BlockInput, DUBT_UNSORTED_MARK, MatchState, ROW_HASH_CACHE_SIZE, ROW_TABLE_SLACK,
+    BlockInput, DUBT_UNSORTED_MARK, DictMatchState, MatchState, ROW_HASH_CACHE_SIZE, aligned_range,
 };
 use super::mem::{self, Mem, hash_ptr};
 use super::params::ROW_HASH_TAG_BITS;
@@ -69,6 +77,15 @@ impl<'a> Ctx<'a> {
 
     const fn dict_limit(&self) -> u32 {
         self.base
+    }
+
+    /// The bytes from prefix index `p` to the block end; empty when `p` is
+    /// outside them.
+    #[inline(always)]
+    fn tail(&self, p: u32) -> &'a [u8] {
+        self.src
+            .get(p.wrapping_sub(self.base) as usize..self.iend.wrapping_sub(self.base) as usize)
+            .unwrap_or_default()
     }
 
     /// Whether the four bytes at prefix index `p` repeat `offset` bytes
@@ -307,8 +324,9 @@ struct ChainWalk<'c> {
     nb_attempts: u32,
 }
 
-/// The longest match for `ip` along `walk`, its offset in `offset`; `EXT`
-/// as for [`Probe::candidate`].
+/// The longest match for `ip` along `walk`, its offset in `offset`, and
+/// the attempts left for an attached dictionary; `EXT` as for
+/// [`Probe::candidate`].
 #[inline(always)]
 fn walk_chain<S: Simd, const EXT: bool>(
     simd: S,
@@ -316,7 +334,7 @@ fn walk_chain<S: Simd, const EXT: bool>(
     walk: &ChainWalk<'_>,
     ip: u32,
     offset: &mut u32,
-) -> usize {
+) -> (usize, u32) {
     let ChainWalk {
         chain,
         chain_mask,
@@ -343,7 +361,7 @@ fn walk_chain<S: Simd, const EXT: bool>(
         match_index = chain[(match_index & chain_mask) as usize];
         nb_attempts -= 1;
     }
-    ml
+    (ml, nb_attempts)
 }
 
 /// A match search (`searchMethod_e`), specialized by the parser.
@@ -364,6 +382,19 @@ trait Search {
         simd: S,
         state: &mut Self::State<'_>,
         ctx: &Ctx<'_>,
+        ip: u32,
+        lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize;
+
+    /// `ZSTD_searchMax` in dictMatchState mode: [`Self::find`] in the
+    /// context's tables, then in the attached dictionary's with the
+    /// attempts the context's search left.
+    fn find_dms<S: Simd>(
+        simd: S,
+        state: &mut Self::State<'_>,
+        ctx: &Ctx<'_>,
+        dict: &DictCtx<'_>,
         ip: u32,
         lazy_skipping: bool,
         offset: &mut u32,
@@ -400,9 +431,27 @@ impl Search for HashChain {
         offset: &mut u32,
     ) -> usize {
         match ctx.mls {
-            5 => hc_find_best_match::<S, 5>(simd, ms, ctx, ip, lazy_skipping, offset),
-            6 => hc_find_best_match::<S, 6>(simd, ms, ctx, ip, lazy_skipping, offset),
-            _ => hc_find_best_match::<S, 4>(simd, ms, ctx, ip, lazy_skipping, offset),
+            5 => hc_find_best_match::<S, 5>(simd, ms, ctx, ip, lazy_skipping, offset).0,
+            6 => hc_find_best_match::<S, 6>(simd, ms, ctx, ip, lazy_skipping, offset).0,
+            _ => hc_find_best_match::<S, 4>(simd, ms, ctx, ip, lazy_skipping, offset).0,
+        }
+    }
+
+    #[inline(always)]
+    fn find_dms<S: Simd>(
+        simd: S,
+        ms: &mut &mut MatchState,
+        ctx: &Ctx<'_>,
+        dict: &DictCtx<'_>,
+        ip: u32,
+        lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize {
+        let (d, l) = (dict, lazy_skipping);
+        match ctx.mls {
+            5 => hc_find_best_match_dms::<S, 5>(simd, ms, ctx, d, ip, l, offset),
+            6 => hc_find_best_match_dms::<S, 6>(simd, ms, ctx, d, ip, l, offset),
+            _ => hc_find_best_match_dms::<S, 4>(simd, ms, ctx, d, ip, l, offset),
         }
     }
 }
@@ -433,6 +482,23 @@ impl Search for BinaryTree {
             (_, true) => bt_find_best_match::<S, 4, true>(simd, ms, ctx, ip, offset),
         }
     }
+
+    #[inline(always)]
+    fn find_dms<S: Simd>(
+        simd: S,
+        ms: &mut &mut MatchState,
+        ctx: &Ctx<'_>,
+        dict: &DictCtx<'_>,
+        ip: u32,
+        _lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize {
+        match ctx.mls {
+            5 => bt_find_best_match_dms::<S, 5>(simd, ms, ctx, dict, ip, offset),
+            6 => bt_find_best_match_dms::<S, 6>(simd, ms, ctx, dict, ip, offset),
+            _ => bt_find_best_match_dms::<S, 4>(simd, ms, ctx, dict, ip, offset),
+        }
+    }
 }
 
 impl Search for RowHash {
@@ -454,15 +520,39 @@ impl Search for RowHash {
     ) -> usize {
         let (s, l) = (state, lazy_skipping);
         match (ctx.mls, ctx.row_log) {
-            (5, 4) => row_find_best_match::<S, 5, 16>(simd, s, ctx, ip, l, offset),
-            (5, 5) => row_find_best_match::<S, 5, 32>(simd, s, ctx, ip, l, offset),
-            (5, _) => row_find_best_match::<S, 5, 64>(simd, s, ctx, ip, l, offset),
-            (6, 4) => row_find_best_match::<S, 6, 16>(simd, s, ctx, ip, l, offset),
-            (6, 5) => row_find_best_match::<S, 6, 32>(simd, s, ctx, ip, l, offset),
-            (6, _) => row_find_best_match::<S, 6, 64>(simd, s, ctx, ip, l, offset),
-            (_, 4) => row_find_best_match::<S, 4, 16>(simd, s, ctx, ip, l, offset),
-            (_, 5) => row_find_best_match::<S, 4, 32>(simd, s, ctx, ip, l, offset),
-            (_, _) => row_find_best_match::<S, 4, 64>(simd, s, ctx, ip, l, offset),
+            (5, 4) => row_find_best_match::<S, 5, 16>(simd, s, ctx, ip, l, offset).0,
+            (5, 5) => row_find_best_match::<S, 5, 32>(simd, s, ctx, ip, l, offset).0,
+            (5, _) => row_find_best_match::<S, 5, 64>(simd, s, ctx, ip, l, offset).0,
+            (6, 4) => row_find_best_match::<S, 6, 16>(simd, s, ctx, ip, l, offset).0,
+            (6, 5) => row_find_best_match::<S, 6, 32>(simd, s, ctx, ip, l, offset).0,
+            (6, _) => row_find_best_match::<S, 6, 64>(simd, s, ctx, ip, l, offset).0,
+            (_, 4) => row_find_best_match::<S, 4, 16>(simd, s, ctx, ip, l, offset).0,
+            (_, 5) => row_find_best_match::<S, 4, 32>(simd, s, ctx, ip, l, offset).0,
+            (_, _) => row_find_best_match::<S, 4, 64>(simd, s, ctx, ip, l, offset).0,
+        }
+    }
+
+    #[inline(always)]
+    fn find_dms<S: Simd>(
+        simd: S,
+        state: &mut RowState<'_>,
+        ctx: &Ctx<'_>,
+        dict: &DictCtx<'_>,
+        ip: u32,
+        lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize {
+        let (s, d, l) = (state, dict, lazy_skipping);
+        match (ctx.mls, ctx.row_log) {
+            (5, 4) => row_find_best_match_dms::<S, 5, 16>(simd, s, ctx, d, ip, l, offset),
+            (5, 5) => row_find_best_match_dms::<S, 5, 32>(simd, s, ctx, d, ip, l, offset),
+            (5, _) => row_find_best_match_dms::<S, 5, 64>(simd, s, ctx, d, ip, l, offset),
+            (6, 4) => row_find_best_match_dms::<S, 6, 16>(simd, s, ctx, d, ip, l, offset),
+            (6, 5) => row_find_best_match_dms::<S, 6, 32>(simd, s, ctx, d, ip, l, offset),
+            (6, _) => row_find_best_match_dms::<S, 6, 64>(simd, s, ctx, d, ip, l, offset),
+            (_, 4) => row_find_best_match_dms::<S, 4, 16>(simd, s, ctx, d, ip, l, offset),
+            (_, 5) => row_find_best_match_dms::<S, 4, 32>(simd, s, ctx, d, ip, l, offset),
+            (_, _) => row_find_best_match_dms::<S, 4, 64>(simd, s, ctx, d, ip, l, offset),
         }
     }
 
@@ -527,7 +617,8 @@ fn insert_and_find_first_index<const MLS: u32>(
     first
 }
 
-/// `ZSTD_HcFindBestMatch`.
+/// `ZSTD_HcFindBestMatch` in the context's tables: the longest match and
+/// the attempts left for an attached dictionary.
 #[inline(always)]
 fn hc_find_best_match<S: Simd, const MLS: u32>(
     simd: S,
@@ -536,7 +627,7 @@ fn hc_find_best_match<S: Simd, const MLS: u32>(
     ip: u32,
     lazy_skipping: bool,
     offset: &mut u32,
-) -> usize {
+) -> (usize, u32) {
     let cparams = ms.cparams;
     let chain_size = 1u32 << cparams.chain_log;
     let chain_mask = chain_size - 1;
@@ -858,7 +949,9 @@ fn insert_dubt1<S: Simd, const EXT: bool>(
     links.close(bt);
 }
 
-/// `ZSTD_DUBT_findBestMatch`.
+/// `ZSTD_DUBT_findBestMatch` in the context's tree: the longest match and
+/// the comparisons left for an attached dictionary, none once a match
+/// reaches the block's end.
 #[inline(always)]
 fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
     simd: S,
@@ -866,7 +959,7 @@ fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
     ctx: &Ctx<'_>,
     ip: u32,
     off_base: &mut u32,
-) -> usize {
+) -> (usize, u32) {
     let cparams = ms.cparams;
     let hash_log = cparams.hash_log;
     let h = ctx.hash::<MLS>(ip, hash_log);
@@ -935,6 +1028,8 @@ fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
                 *off_base = offset_to_offbase(curr - match_index);
             }
             if match_length == run.len() {
+                // dictMatchState also skips the dictionary's tree.
+                nb_compares = 0;
                 break;
             }
         }
@@ -946,7 +1041,7 @@ fn dubt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
     }
     links.close(bt);
     ms.next_to_update = match_end_idx - 8;
-    best_length
+    (best_length, nb_compares)
 }
 
 /// `ZSTD_BtFindBestMatch`.
@@ -962,7 +1057,31 @@ fn bt_find_best_match<S: Simd, const MLS: u32, const EXT: bool>(
         return 0;
     }
     update_dubt::<MLS>(ms, ctx, ip);
-    dubt_find_best_match::<S, MLS, EXT>(simd, ms, ctx, ip, off_base)
+    dubt_find_best_match::<S, MLS, EXT>(simd, ms, ctx, ip, off_base).0
+}
+
+/// `ZSTD_BtFindBestMatch` in dictMatchState mode: the context's tree, then
+/// the dictionary's with the comparisons left
+/// (`ZSTD_DUBT_findBetterDictMatch`).
+#[fearless_simd_macros::simd]
+fn bt_find_best_match_dms<S: Simd, const MLS: u32>(
+    simd: S,
+    ms: &mut MatchState,
+    ctx: &Ctx<'_>,
+    dict: &DictCtx<'_>,
+    ip: u32,
+    off_base: &mut u32,
+) -> usize {
+    if ip < ms.next_to_update {
+        return 0;
+    }
+    update_dubt::<MLS>(ms, ctx, ip);
+    let (best_length, nb_compares) =
+        dubt_find_best_match::<S, MLS, false>(simd, ms, ctx, ip, off_base);
+    if nb_compares == 0 {
+        return best_length;
+    }
+    dict.better_tree_match::<S, MLS>(simd, ctx, ip, off_base, best_length, nb_compares)
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,7 +1385,8 @@ impl<'t> RowState<'t> {
 /// The first `len` entries of `table` from its first 64-byte boundary, as
 /// the reference places its tables (`ZSTD_cwksp_reserve_aligned64`): a row
 /// of tags or positions then never straddles a cache line, and its vector
-/// load never splits. A table without [`ROW_TABLE_SLACK`] entries to spare
+/// load never splits. A table without
+/// [`ROW_TABLE_SLACK`](super::match_state::ROW_TABLE_SLACK) entries to spare
 /// is used from its start.
 ///
 /// The view's position in the allocation does not change the frames: a
@@ -1274,14 +1394,8 @@ impl<'t> RowState<'t> {
 /// indices were last invalidated, and every older entry, wherever it lies,
 /// is below `lowLimit` and ends the search as a zero would.
 fn aligned_rows<T>(table: &mut [T], len: usize) -> &mut [T] {
-    const ALIGN: usize = 64;
-    let skip = table.as_ptr().addr().wrapping_neg() % ALIGN / size_of::<T>().max(1);
-    if skip < ROW_TABLE_SLACK && skip + len <= table.len() {
-        &mut table[skip..skip + len]
-    } else {
-        let len = len.min(table.len());
-        &mut table[..len]
-    }
+    let range = aligned_range(table, len);
+    &mut table[range]
 }
 
 impl Drop for RowState<'_> {
@@ -1290,7 +1404,8 @@ impl Drop for RowState<'_> {
     }
 }
 
-/// `ZSTD_RowFindBestMatch`.
+/// `ZSTD_RowFindBestMatch` in the context's rows: the longest match and
+/// the attempts left for an attached dictionary.
 #[inline(always)]
 fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     simd: S,
@@ -1299,7 +1414,7 @@ fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     ip: u32,
     lazy_skipping: bool,
     offset: &mut u32,
-) -> usize {
+) -> (usize, usize) {
     let curr = ip;
     let low_limit = state.low_limit(curr);
     let bits = state.bits;
@@ -1373,11 +1488,12 @@ fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     }
 
     let candidates = &state.candidates[..num_matches.min(64)];
-    if ctx.ext {
+    let ml = if ctx.ext {
         best_candidate::<S, true>(simd, ctx, ip, candidates, offset)
     } else {
         best_prefix_candidate(simd, ctx, ip, candidates, offset)
-    }
+    };
+    (ml, state.nb_attempts.saturating_sub(num_matches))
 }
 
 /// [`best_candidate`] without an external dictionary: every candidate is a
@@ -1435,6 +1551,329 @@ fn best_prefix_candidate<S: Simd>(
             };
             word = u32::from_le_bytes(next.try_into().unwrap_or_default());
             hay = next_hay;
+        }
+    }
+    ml
+}
+
+// ---------------------------------------------------------------------------
+// Attached dictionary (dictMatchState).
+
+/// An attached dictionary as the dictMatchState searches read it
+/// (`ms->dictMatchState`): its tables and content, in its own index space.
+/// A dictionary index `d` stands for the context's index `d + index_delta`.
+#[derive(Copy, Clone)]
+struct DictCtx<'a> {
+    /// The dictionary's tables and parameters.
+    ms: &'a MatchState,
+    /// The dictionary's content: index `i` is `src[i - start]`.
+    src: &'a [u8],
+    /// Index of the content's first byte (`dictLowestIndex`, the
+    /// dictionary's `dictLimit`).
+    start: u32,
+    /// Index one past the content (`dictHighLimit`, `dmsSize`).
+    end: u32,
+    /// The dictionary's `lowLimit`, the binary tree's lower bound.
+    low_limit: u32,
+    /// `dictIndexDelta`: the context's prefix start minus [`Self::end`].
+    index_delta: u32,
+    /// The dictionary's tag rows from their first 64-byte boundary, as its
+    /// load wrote them; empty unless its tables are rows.
+    tags: &'a [u8],
+    /// The dictionary's position rows, viewed as [`Self::tags`] is.
+    slots: &'a [u32],
+}
+
+impl<'a> DictCtx<'a> {
+    /// The view of `dms` for a context whose prefix starts at
+    /// `prefix_lowest`.
+    fn new(dms: &DictMatchState<'a>, prefix_lowest: u32) -> Self {
+        let ms = dms.ms;
+        let content = dms.window.prefix;
+        let (start, end) = (content.start(), content.end());
+        let rows_len = 1usize << ms.cparams.hash_log;
+        Self {
+            ms,
+            src: content.slice(start, end),
+            start,
+            end,
+            low_limit: ms.window.low_limit,
+            index_delta: prefix_lowest.wrapping_sub(end),
+            tags: ms
+                .tag_table
+                .get(aligned_range(&ms.tag_table, rows_len))
+                .unwrap_or_default(),
+            slots: ms
+                .hash_table
+                .get(aligned_range(&ms.hash_table, rows_len))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The content from dictionary index `d`; empty outside it.
+    #[inline(always)]
+    fn from(&self, d: u32) -> &'a [u8] {
+        self.src
+            .get(d.wrapping_sub(self.start) as usize..)
+            .unwrap_or_default()
+    }
+
+    /// `ZSTD_count_2segments(ip, dictBase + d, iend, dictEnd, prefixStart)`:
+    /// the common length of `current` (the bytes from a searched position to
+    /// the block end) and the content from index `d`, continuing at the
+    /// prefix's start, `prefix`, when the content ends. An index past the
+    /// content counts nothing, as the reference's pointer arithmetic does
+    /// (a tree walk's known length can carry a candidate there).
+    #[inline(always)]
+    fn count_2segments<S: Simd>(&self, simd: S, current: &[u8], prefix: &[u8], d: u32) -> usize {
+        let Some(content) = self.src.get(d.wrapping_sub(self.start) as usize..) else {
+            return 0;
+        };
+        let n = count::common_run(simd, current, content);
+        if n < content.len() {
+            return n;
+        }
+        n + count::common_run(simd, current.get(n..).unwrap_or_default(), prefix)
+    }
+
+    /// Length of the match of `current`, whose first four bytes are `word`,
+    /// with dictionary index `d` when their first four bytes agree
+    /// (`MEM_read32(match) == MEM_read32(ip)`), `0` otherwise.
+    #[inline(always)]
+    fn candidate_length<S: Simd>(
+        &self,
+        simd: S,
+        ctx: &Ctx<'_>,
+        current: &[u8],
+        word: [u8; 4],
+        d: u32,
+    ) -> usize {
+        if self.from(d).first_chunk::<4>() != Some(&word) {
+            return 0;
+        }
+        let rest = current.get(4..).unwrap_or_default();
+        self.count_2segments(simd, rest, ctx.src, d + 4) + 4
+    }
+
+    /// The repeat offset `offset` at prefix index `curr`, in the prefix or
+    /// in the dictionary (the parser's `isDxS` repcode checks): its length
+    /// when its first four bytes match, `None` otherwise.
+    #[inline(always)]
+    fn repeat<S: Simd>(&self, simd: S, ctx: &Ctx<'_>, curr: u32, offset: u32) -> Option<usize> {
+        let prefix_lowest = ctx.dict_limit();
+        let rep_index = curr.wrapping_sub(offset);
+        // `ZSTD_index_overlap_check`: no four bytes straddle the boundary.
+        if prefix_lowest.wrapping_sub(1).wrapping_sub(rep_index) < 3 {
+            return None;
+        }
+        if rep_index < prefix_lowest {
+            let current = ctx.tail(curr);
+            let word = *current.first_chunk::<4>()?;
+            let d = rep_index.wrapping_sub(self.index_delta);
+            match self.candidate_length(simd, ctx, current, word, d) {
+                0 => None,
+                length => Some(length),
+            }
+        } else if ctx.repeats(curr, offset) {
+            Some(ctx.count(simd, curr + 4, rep_index + 4) + 4)
+        } else {
+            None
+        }
+    }
+
+    /// The dictionary part of `ZSTD_HcFindBestMatch`: walks the
+    /// dictionary's chain for `ip` with the `nb_attempts` left, improving
+    /// on the context's best length `ml`.
+    #[inline(always)]
+    fn chain_match<S: Simd, const MLS: u32>(
+        &self,
+        simd: S,
+        ctx: &Ctx<'_>,
+        ip: u32,
+        mut ml: usize,
+        mut nb_attempts: u32,
+        offset: &mut u32,
+    ) -> usize {
+        let dms = self.ms;
+        let chain_size = 1u32 << dms.cparams.chain_log;
+        let chain_mask = chain_size - 1;
+        let min_chain = self.end.saturating_sub(chain_size);
+        let chain = dms.chain_table.as_slice();
+        let h = ctx.hash::<MLS>(ip, dms.cparams.hash_log);
+        let mut match_index = dms.hash_table.get(h).copied().unwrap_or_default();
+        let current = ctx.tail(ip);
+        let Some(&word) = current.first_chunk::<4>() else {
+            return ml;
+        };
+        while match_index >= self.start && nb_attempts > 0 {
+            let current_ml = self.candidate_length(simd, ctx, current, word, match_index);
+            if current_ml > ml {
+                ml = current_ml;
+                *offset =
+                    offset_to_offbase(ip.wrapping_sub(match_index.wrapping_add(self.index_delta)));
+                if current_ml == current.len() {
+                    break;
+                }
+            }
+            if match_index <= min_chain {
+                break;
+            }
+            match_index = chain
+                .get((match_index & chain_mask) as usize)
+                .copied()
+                .unwrap_or_default();
+            nb_attempts -= 1;
+        }
+        ml
+    }
+
+    /// `ZSTD_DUBT_findBetterDictMatch`: walks the dictionary's sorted tree
+    /// for `ip` with the `nb_compares` left, improving on the context's
+    /// `best_length`. The tree is only read.
+    #[inline(always)]
+    fn better_tree_match<S: Simd, const MLS: u32>(
+        &self,
+        simd: S,
+        ctx: &Ctx<'_>,
+        ip: u32,
+        off_base: &mut u32,
+        mut best_length: usize,
+        mut nb_compares: u32,
+    ) -> usize {
+        let dms = self.ms;
+        let h = ctx.hash::<MLS>(ip, dms.cparams.hash_log);
+        let mut dict_match_index = dms.hash_table.get(h).copied().unwrap_or_default();
+        let (high, low) = (self.end, self.low_limit);
+        let bt = dms.chain_table.as_slice();
+        let bt_mask = (1u32 << (dms.cparams.chain_log - 1)) - 1;
+        let bt_low = if bt_mask >= high.wrapping_sub(low) {
+            low
+        } else {
+            high - bt_mask
+        };
+        let current = ctx.tail(ip);
+        let (mut common_smaller, mut common_larger) = (0usize, 0usize);
+        while nb_compares > 0 && dict_match_index > low {
+            let next = 2 * (dict_match_index & bt_mask) as usize;
+            let known = common_smaller.min(common_larger);
+            let rest = current.get(known..).unwrap_or_default();
+            let match_length =
+                known + self.count_2segments(simd, rest, ctx.src, dict_match_index + known as u32);
+            if match_length > best_length {
+                let match_index = dict_match_index.wrapping_add(self.index_delta);
+                let gain = 4 * (match_length - best_length) as i32;
+                let cost = (highbit32(ip.wrapping_sub(match_index).wrapping_add(1)) as i32)
+                    .wrapping_sub(highbit32(off_base.wrapping_add(1)) as i32);
+                if gain > cost {
+                    best_length = match_length;
+                    *off_base = offset_to_offbase(ip.wrapping_sub(match_index));
+                }
+                if match_length == current.len() {
+                    break;
+                }
+            }
+            if dict_match_index <= bt_low {
+                break;
+            }
+            // `match[matchLength]`: past the content, the match continues
+            // at the prefix's start.
+            let match_end = dict_match_index + match_length as u32;
+            let match_byte = if match_end >= high {
+                ctx.src.get((match_end - high) as usize)
+            } else {
+                self.from(match_end).first()
+            };
+            let lower = matches!(
+                (match_byte, current.get(match_length)),
+                (Some(m), Some(c)) if m < c
+            );
+            if lower {
+                common_smaller = match_length;
+                dict_match_index = bt.get(next + 1).copied().unwrap_or_default();
+            } else {
+                common_larger = match_length;
+                dict_match_index = bt.get(next).copied().unwrap_or_default();
+            }
+            nb_compares -= 1;
+        }
+        best_length
+    }
+}
+
+/// `ZSTD_HcFindBestMatch` in dictMatchState mode.
+#[inline(always)]
+fn hc_find_best_match_dms<S: Simd, const MLS: u32>(
+    simd: S,
+    ms: &mut MatchState,
+    ctx: &Ctx<'_>,
+    dict: &DictCtx<'_>,
+    ip: u32,
+    lazy_skipping: bool,
+    offset: &mut u32,
+) -> usize {
+    let (ml, nb_attempts) = hc_find_best_match::<S, MLS>(simd, ms, ctx, ip, lazy_skipping, offset);
+    dict.chain_match::<S, MLS>(simd, ctx, ip, ml, nb_attempts, offset)
+}
+
+/// `ZSTD_RowFindBestMatch` in dictMatchState mode: the dictionary's rows
+/// are prefetched before the context's are updated, and searched after
+/// with the attempts left, as the reference does.
+#[inline(always)]
+fn row_find_best_match_dms<S: Simd, const MLS: u32, const ROW: usize>(
+    simd: S,
+    state: &mut RowState<'_>,
+    ctx: &Ctx<'_>,
+    dict: &DictCtx<'_>,
+    ip: u32,
+    lazy_skipping: bool,
+    offset: &mut u32,
+) -> usize {
+    // The dictionary's rows are hashed unsalted, over its own row bits and
+    // with the context's row size.
+    let hash = row_hash::<MLS>(ctx, ip, dict.ms.row_hash_log + ROW_HASH_TAG_BITS);
+    row_prefetch(dict.tags, dict.slots, hash, ROW.trailing_zeros());
+    let (mut ml, mut nb_attempts) =
+        row_find_best_match::<S, MLS, ROW>(simd, state, ctx, ip, lazy_skipping, offset);
+
+    let row = (hash >> ROW_HASH_TAG_BITS) as usize;
+    let tags = dict.tags.as_chunks::<ROW>().0;
+    let slots = dict.slots.as_chunks::<ROW>().0;
+    let (Some(tag_row), Some(slot_row)) = (tags.get(row), slots.get(row)) else {
+        return ml;
+    };
+    let head = u32::from(tag_row[0]) & (ROW as u32 - 1);
+    let mut matches = row::match_mask(simd, tag_row, hash as u8, head);
+    let buffer = &mut state.candidates;
+    // Dictionary index `i` is at `window + i`; the pointer only feeds
+    // prefetches.
+    let window = dict.src.as_ptr().wrapping_sub(dict.start as usize);
+    let mut num_matches = 0usize;
+    while matches != 0 && nb_attempts > 0 {
+        let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
+        matches &= matches - 1;
+        let match_index = slot_row[match_pos];
+        if match_index < dict.start {
+            break;
+        }
+        prefetch_l1(window.wrapping_add(match_index as usize));
+        buffer[num_matches & 63] = match_index;
+        num_matches += 1;
+        nb_attempts -= 1;
+    }
+
+    let current = ctx.tail(ip);
+    let Some(&word) = current.first_chunk::<4>() else {
+        return ml;
+    };
+    for &match_index in &buffer[..num_matches.min(64)] {
+        let current_ml = dict.candidate_length(simd, ctx, current, word, match_index);
+        if current_ml > ml {
+            ml = current_ml;
+            *offset =
+                offset_to_offbase(ip.wrapping_sub(match_index.wrapping_add(dict.index_delta)));
+            if current_ml == current.len() {
+                break;
+            }
         }
     }
     ml
@@ -1868,6 +2307,213 @@ fn lazy_ext_generic<S: Simd, M: Search, const DEPTH: u32>(
     (iend - anchor) as usize
 }
 
+/// `ZSTD_compressBlock_lazy_generic` for a prefix with an attached
+/// dictionary (`dictMode == ZSTD_dictMatchState`): repeat offsets and
+/// matches may reach into the dictionary, whose indices sit just below the
+/// prefix's (`dictIndexDelta`), and every search continues in the
+/// dictionary's tables with what the context's left of its budget.
+#[inline(always)]
+fn lazy_dms_generic<S: Simd, M: Search, const DEPTH: u32>(
+    simd: S,
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    block: &BlockInput<'_>,
+    dms: &DictMatchState<'_>,
+) -> usize {
+    let prefix = block.window.prefix;
+    let istart = i64::from(block.start);
+    let iend = i64::from(block.end);
+    let ilimit = if M::ROW {
+        iend - 8 - ROW_HASH_CACHE_SIZE as i64
+    } else {
+        iend - 8
+    };
+    let prefix_lowest_index = ms.window.dict_limit;
+    let prefix_lowest = i64::from(prefix_lowest_index);
+    let ctx = Ctx::new(
+        block,
+        ms.cparams.min_match.clamp(4, 6),
+        ms.cparams.search_log.clamp(4, 6),
+        false,
+    );
+    let dict = DictCtx::new(dms, prefix_lowest_index);
+    let repeat = |curr: i64, offset: u32| dict.repeat(simd, &ctx, curr as u32, offset);
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    let mut ip = istart;
+    let mut anchor = istart;
+    let dict_and_prefix_length = (ip - prefix_lowest) + i64::from(dict.end - dict.start);
+    ip += i64::from(dict_and_prefix_length == 0);
+    let mut lazy_skipping = false;
+    let mut state = M::state(ms, &ctx);
+    M::fill_cache(&mut state, &ctx, ilimit);
+
+    while ip < ilimit {
+        let mut match_length = 0usize;
+        let mut off_base = repcode_to_offbase(1);
+        let mut start = ip + 1;
+        let mut store_now = false;
+
+        if let Some(length) = repeat(ip + 1, offset_1) {
+            match_length = length;
+            if DEPTH == 0 {
+                store_now = true;
+            }
+        }
+
+        if !store_now {
+            let mut found = NO_OFFBASE;
+            let ml2 = M::find_dms(
+                simd,
+                &mut state,
+                &ctx,
+                &dict,
+                ip as u32,
+                lazy_skipping,
+                &mut found,
+            );
+            if ml2 > match_length {
+                match_length = ml2;
+                start = ip;
+                off_base = found;
+            }
+
+            if match_length < 4 {
+                let step = ((ip - anchor) >> SEARCH_STRENGTH) as usize + 1;
+                ip += step as i64;
+                lazy_skipping = step > LAZY_SKIPPING_STEP;
+                continue;
+            }
+
+            if DEPTH >= 1 {
+                while ip < ilimit {
+                    ip += 1;
+                    if let Some(ml_rep) = repeat(ip, offset_1) {
+                        let gain2 = (ml_rep * 3) as i32;
+                        let gain1 = gain(match_length, 3, off_base, 1);
+                        if ml_rep >= 4 && gain2 > gain1 {
+                            match_length = ml_rep;
+                            off_base = repcode_to_offbase(1);
+                            start = ip;
+                        }
+                    }
+                    {
+                        let mut candidate = NO_OFFBASE;
+                        let ml2 = M::find_dms(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            &dict,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
+                        let gain2 = gain(ml2, 4, candidate, 0);
+                        let gain1 = gain(match_length, 4, off_base, 4);
+                        if ml2 >= 4 && gain2 > gain1 {
+                            match_length = ml2;
+                            off_base = candidate;
+                            start = ip;
+                            continue;
+                        }
+                    }
+                    if DEPTH == 2 && ip < ilimit {
+                        ip += 1;
+                        if let Some(ml_rep) = repeat(ip, offset_1) {
+                            let gain2 = (ml_rep * 4) as i32;
+                            let gain1 = gain(match_length, 4, off_base, 1);
+                            if ml_rep >= 4 && gain2 > gain1 {
+                                match_length = ml_rep;
+                                off_base = repcode_to_offbase(1);
+                                start = ip;
+                            }
+                        }
+                        let mut candidate = NO_OFFBASE;
+                        let ml2 = M::find_dms(
+                            simd,
+                            &mut state,
+                            &ctx,
+                            &dict,
+                            ip as u32,
+                            lazy_skipping,
+                            &mut candidate,
+                        );
+                        let gain2 = gain(ml2, 4, candidate, 0);
+                        let gain1 = gain(match_length, 4, off_base, 7);
+                        if ml2 >= 4 && gain2 > gain1 {
+                            match_length = ml2;
+                            off_base = candidate;
+                            start = ip;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Catch up, in the dictionary for a match that starts there.
+            if off_base > 3 {
+                let offset = offbase_to_offset(off_base);
+                let match_index = (start as u32).wrapping_sub(offset);
+                if match_index < prefix_lowest_index {
+                    let mut m = match_index.wrapping_sub(dict.index_delta);
+                    while start > anchor
+                        && m > dict.start
+                        && dict.from(m - 1).first() == Some(&prefix.byte((start - 1) as u32))
+                    {
+                        start -= 1;
+                        m -= 1;
+                        match_length += 1;
+                    }
+                } else {
+                    let mut m = match_index;
+                    while start > anchor
+                        && m > prefix_lowest_index
+                        && prefix.byte((start - 1) as u32) == prefix.byte(m - 1)
+                    {
+                        start -= 1;
+                        m -= 1;
+                        match_length += 1;
+                    }
+                }
+                offset_2 = offset_1;
+                offset_1 = offset;
+            }
+        }
+
+        // _storeSequence:
+        seq_store.store_seq(
+            prefix.slice(anchor as u32, start as u32),
+            off_base,
+            match_length,
+        );
+        ip = start + match_length as i64;
+        anchor = ip;
+        if lazy_skipping {
+            M::fill_cache(&mut state, &ctx, ilimit);
+            lazy_skipping = false;
+        }
+
+        while ip <= ilimit {
+            let Some(ml) = repeat(ip, offset_2) else {
+                break;
+            };
+            core::mem::swap(&mut offset_1, &mut offset_2);
+            seq_store.store_seq_only(0, repcode_to_offbase(1), ml);
+            ip += ml as i64;
+            anchor = ip;
+        }
+    }
+
+    drop(state);
+    ms.lazy_skipping = lazy_skipping;
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+    (iend - anchor) as usize
+}
+
 /// Defines the block compressors of one search and depth: each dispatches
 /// the match state's backend once and runs the parser specialized for it.
 macro_rules! block_compressors {
@@ -1908,18 +2554,115 @@ block_compressors! {
     lazy2_row, lazy2_row_ext => RowHash, 2;
 }
 
+/// Indexes dictionary content up to `target` (`ZSTD_loadDictionaryContent`
+/// for the lazy strategies): the row finder clears its tags and runs
+/// `ZSTD_row_update`, the hash chain `ZSTD_insertAndFindFirstIndex`.
+pub(crate) fn load_dictionary(
+    ms: &mut MatchState,
+    window: &mem::Window<'_>,
+    target: u32,
+    row: bool,
+) {
+    let block = BlockInput {
+        window: *window,
+        start: target,
+        end: window.prefix.end(),
+        backend: ms.backend,
+        dms: None,
+        symbol_costs: None,
+    };
+    if row {
+        ms.tag_table.fill(0);
+        let row_log = ms.cparams.search_log.clamp(4, 6);
+        let ctx = Ctx::new(&block, ms.cparams.min_match.min(6), row_log, false);
+        match (ctx.mls, row_log) {
+            (5, 4) => row_load::<5, 16>(ms, &ctx, target),
+            (5, 5) => row_load::<5, 32>(ms, &ctx, target),
+            (5, _) => row_load::<5, 64>(ms, &ctx, target),
+            (6, 4) => row_load::<6, 16>(ms, &ctx, target),
+            (6, 5) => row_load::<6, 32>(ms, &ctx, target),
+            (6, _) => row_load::<6, 64>(ms, &ctx, target),
+            (_, 4) => row_load::<4, 16>(ms, &ctx, target),
+            (_, 5) => row_load::<4, 32>(ms, &ctx, target),
+            (_, _) => row_load::<4, 64>(ms, &ctx, target),
+        }
+    } else {
+        // `ZSTD_insertAndFindFirstIndex` hashes with the unclamped minimum
+        // match, unlike the searches.
+        let ctx = Ctx::new(&block, ms.cparams.min_match, 0, false);
+        match ctx.mls {
+            5 => insert_and_find_first_index::<5>(ms, &ctx, target, false),
+            6 => insert_and_find_first_index::<6>(ms, &ctx, target, false),
+            7 => insert_and_find_first_index::<7>(ms, &ctx, target, false),
+            _ => insert_and_find_first_index::<4>(ms, &ctx, target, false),
+        };
+    }
+}
+
+/// `ZSTD_row_update` for a dictionary: every position up to `target`,
+/// without the hash cache or the skipping a search's update does.
+fn row_load<const MLS: u32, const ROW: usize>(ms: &mut MatchState, ctx: &Ctx<'_>, target: u32) {
+    let mut state = RowState::new(ms, ctx);
+    let bits = state.bits;
+    let mut rows = Rows::<ROW>::new(state.tags, state.slots);
+    for idx in state.next_to_update..target {
+        rows.insert(ctx.hash::<MLS>(idx, bits) as u32, idx);
+    }
+    state.next_to_update = target;
+}
+
+/// Defines the dictMatchState block compressors of one search and depth
+/// (`ZSTD_compressBlock_*_dictMatchState{,_row}`): each dispatches the
+/// match state's backend once and runs the parser with the block's attached
+/// dictionary. A block without one, which `select_block_compressor` never
+/// routes here, takes the prefix-only compressor `$no_dict`.
+macro_rules! dms_block_compressors {
+    ($($name:ident, $no_dict:ident => $search:ty, $depth:expr;)*) => {$(
+        pub(crate) fn $name(
+            ms: &mut MatchState,
+            seq_store: &mut SeqStore,
+            rep: &mut [u32; 3],
+            block: &BlockInput<'_>,
+        ) -> usize {
+            let Some(dms) = block.dms else {
+                return $no_dict(ms, seq_store, rep, block);
+            };
+            let backend = ms.backend;
+            fearless_simd::dispatch!(backend.0, simd => {
+                lazy_dms_generic::<_, $search, $depth>(simd, ms, seq_store, rep, block, &dms)
+            })
+        }
+    )*};
+}
+
+dms_block_compressors! {
+    greedy_dms, greedy => HashChain, 0;
+    lazy_dms, lazy => HashChain, 1;
+    lazy2_dms, lazy2 => HashChain, 2;
+    btlazy2_dms, btlazy2 => BinaryTree, 2;
+    greedy_row_dms, greedy_row => RowHash, 0;
+    lazy_row_dms, lazy_row => RowHash, 1;
+    lazy2_row_dms, lazy2_row => RowHash, 2;
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    use alloc::boxed::Box;
+
     use super::super::advanced_tests;
-    use super::super::cctx::{Engine, RequestedParams};
-    use super::super::compress_once;
+    use super::super::cctx::{Engine, RequestedParams, compress_bound};
+    use super::super::cdict::{AttachPref, CDict};
+    use super::super::dict_tests;
+    use super::super::match_state::{BlockCompressor, ROW_TABLE_SLACK};
     use super::super::params::{ParamSwitch, Strategy, level_cparams};
     use super::super::stream::{EndOp, Stream};
+    use super::super::{compress_once, compress_once_into};
     use super::*;
     use crate::Backend;
+    use crate::dictionary::DictionaryContent;
     use zstd_ffi::corpus;
     use zstd_ffi::oracle::{self, Directive, Params};
 
@@ -1933,6 +2676,8 @@ mod tests {
             start: 2,
             end: 2 + bytes.len() as u32,
             backend: Backend::default(),
+            dms: None,
+            symbol_costs: None,
         }
     }
 
@@ -2060,12 +2805,17 @@ mod tests {
     /// The reference's parameters for `requested`, row finder switch
     /// included.
     fn oracle_params(requested: &RequestedParams) -> Params {
+        with_row_switch(advanced_tests::oracle_params(requested), requested)
+    }
+
+    /// `params` with the row finder switch of `requested`.
+    fn with_row_switch(params: Params, requested: &RequestedParams) -> Params {
         let row = match requested.use_row_match_finder {
             ParamSwitch::Auto => 0,
             ParamSwitch::Enable => 1,
             ParamSwitch::Disable => 2,
         };
-        advanced_tests::oracle_params(requested).with(zstd_ffi::ZSTD_c_useRowMatchFinder, row)
+        params.with(zstd_ffi::ZSTD_c_useRowMatchFinder, row)
     }
 
     /// Every search specialization: strategies with and without the row
@@ -2184,7 +2934,12 @@ mod tests {
         }
     }
 
-    fn stream(engine: &mut Engine, requested: &RequestedParams, chunks: &[&[u8]]) -> Vec<u8> {
+    fn stream(
+        engine: &mut Engine,
+        requested: &RequestedParams,
+        dict: Option<&CDict>,
+        chunks: &[&[u8]],
+    ) -> Vec<u8> {
         let mut state = Stream::new();
         let mut out = Vec::new();
         let mut buffer = vec![0u8; 1 << 17];
@@ -2197,7 +2952,14 @@ mod tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut buffer[..], &data[in_pos..], op)
+                    .compress(
+                        engine,
+                        requested,
+                        dict,
+                        &mut buffer[..],
+                        &data[in_pos..],
+                        op,
+                    )
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&buffer[..step.produced]);
@@ -2233,8 +2995,365 @@ mod tests {
                 requested.cparams.window_log = 12;
                 let theirs =
                     oracle::compress_stream(&oracle_params(&requested), &steps).expect("oracle");
-                let ours = stream(&mut engine, &requested, &chunks);
+                let ours = stream(&mut engine, &requested, None, &chunks);
                 assert!(ours == theirs, "{backend} request {r}");
+            }
+        }
+    }
+
+    /// Whether frames attaching a dictionary made for `strategy` run this
+    /// module's dictMatchState compressors.
+    fn lazy_family(strategy: Strategy) -> bool {
+        matches!(
+            strategy,
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2
+        )
+    }
+
+    /// Compresses every input with `dict` under `requested` on every
+    /// backend, one reused engine per backend, and compares with the
+    /// reference loading the same dictionary. Checks nothing and returns
+    /// `false` when the dictionary's strategy is not a lazy one: attaching
+    /// it would run another module's finder.
+    fn check_attached(
+        requested: &RequestedParams,
+        dict: &[u8],
+        content: DictionaryContent,
+        inputs: &[Vec<u8>],
+    ) -> bool {
+        let cdict = CDict::new(Box::from(dict), content, requested).expect("prepares");
+        if !lazy_family(cdict.cparams().strategy) {
+            return false;
+        }
+        let params = with_row_switch(dict_tests::dict_params(requested, dict, content), requested);
+        let expected: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|input| oracle::compress2(input, &params).expect("oracle"))
+            .collect();
+        for backend in Backend::available() {
+            let mut engine = Engine::with_backend(backend);
+            for (index, (input, expected)) in inputs.iter().zip(&expected).enumerate() {
+                let mut dst = vec![0u8; compress_bound(input.len()).expect("bound")];
+                let size = compress_once_into(
+                    &mut engine,
+                    requested,
+                    Some(&cdict),
+                    input,
+                    index as u64,
+                    &mut dst,
+                )
+                .expect("compresses");
+                assert!(
+                    dst[..size] == expected[..],
+                    "{backend} input {index} ({} bytes), {requested:?}: {size} vs {} bytes",
+                    input.len(),
+                    expected.len()
+                );
+            }
+        }
+        true
+    }
+
+    /// A raw dictionary: text, then records like the inputs.
+    fn raw_dictionary(records: &[Vec<u8>]) -> Vec<u8> {
+        [corpus::text(20_000, 9), records[..200].concat()].concat()
+    }
+
+    /// Every lazy compression level attaches trained and raw dictionaries
+    /// as the reference does, forced or by the size heuristic (small
+    /// inputs attach, large ones copy).
+    #[test]
+    fn attached_dictionaries_match_the_reference_at_every_lazy_level() {
+        let (trained, records) = dict_tests::trained();
+        let raw = raw_dictionary(&records);
+        let inputs = dict_tests::inputs(&records);
+        let mut checked = 0;
+        for level in 4..=12 {
+            for pref in [AttachPref::ForceAttach, AttachPref::Default] {
+                let requested = dict_tests::request(level, None, pref);
+                for (dict, content) in [
+                    (&trained, DictionaryContent::Auto),
+                    (&raw, DictionaryContent::Auto),
+                    (&trained, DictionaryContent::Raw),
+                ] {
+                    checked += usize::from(check_attached(&requested, dict, content, &inputs));
+                }
+            }
+        }
+        assert!(checked >= 30, "{checked}");
+    }
+
+    /// Every lazy strategy, forced, attaches as the reference does.
+    #[test]
+    fn attached_dictionaries_match_the_reference_for_every_lazy_strategy() {
+        let (trained, records) = dict_tests::trained();
+        let raw = raw_dictionary(&records);
+        let inputs = dict_tests::inputs(&records);
+        for strategy in [
+            Strategy::Greedy,
+            Strategy::Lazy,
+            Strategy::Lazy2,
+            Strategy::BtLazy2,
+        ] {
+            for level in [3, 9, 15] {
+                let requested = dict_tests::request(level, Some(strategy), AttachPref::ForceAttach);
+                assert!(check_attached(
+                    &requested,
+                    &trained,
+                    DictionaryContent::Zstd,
+                    &inputs
+                ));
+                assert!(check_attached(
+                    &requested,
+                    &raw,
+                    DictionaryContent::Raw,
+                    &inputs
+                ));
+            }
+        }
+    }
+
+    /// The hash chain and the row finder, every row size and minimum match
+    /// (3 and 7 clamp to 4 and 6 in the searches, not in the dictionary's
+    /// load), with fewer attempts than a row has slots and with more.
+    #[test]
+    fn attached_dictionaries_match_the_reference_for_every_search_specialization() {
+        let (trained, records) = dict_tests::trained();
+        let inputs = dict_tests::inputs(&records);
+        for strategy in [
+            Strategy::Greedy,
+            Strategy::Lazy,
+            Strategy::Lazy2,
+            Strategy::BtLazy2,
+        ] {
+            for row in [ParamSwitch::Enable, ParamSwitch::Disable] {
+                for (min_match, search_log) in [
+                    (3, 5),
+                    (4, 4),
+                    (5, 5),
+                    (6, 6),
+                    (7, 3),
+                    (4, 7),
+                    (5, 6),
+                    (6, 4),
+                    (6, 5),
+                ] {
+                    let mut requested =
+                        dict_tests::request(6, Some(strategy), AttachPref::ForceAttach);
+                    requested.cparams.min_match = min_match;
+                    requested.cparams.search_log = search_log;
+                    requested.use_row_match_finder = row;
+                    assert!(check_attached(
+                        &requested,
+                        &trained,
+                        DictionaryContent::Auto,
+                        &inputs
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Tables smaller than the dictionary: its chain and tree stop at their
+    /// size, and the context's tables differ in size from the dictionary's
+    /// once the input's size shrinks them.
+    #[test]
+    fn attached_dictionaries_match_the_reference_with_small_tables() {
+        let (trained, records) = dict_tests::trained();
+        let raw = raw_dictionary(&records);
+        let inputs = dict_tests::inputs(&records);
+        for strategy in [Strategy::Greedy, Strategy::Lazy2, Strategy::BtLazy2] {
+            for row in [ParamSwitch::Enable, ParamSwitch::Disable] {
+                for (chain_log, hash_log) in [(8, 10), (10, 8), (12, 14)] {
+                    let mut requested =
+                        dict_tests::request(9, Some(strategy), AttachPref::ForceAttach);
+                    requested.cparams.chain_log = chain_log;
+                    requested.cparams.hash_log = hash_log;
+                    requested.use_row_match_finder = row;
+                    assert!(check_attached(
+                        &requested,
+                        &trained,
+                        DictionaryContent::Auto,
+                        &inputs
+                    ));
+                    assert!(check_attached(
+                        &requested,
+                        &raw,
+                        DictionaryContent::Raw,
+                        &inputs
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The dictMatchState compressors run the prefix-only parsers for a
+    /// block without an attached dictionary.
+    #[test]
+    fn dms_compressors_without_a_dictionary_run_the_prefix_parsers() {
+        let bytes = corpus::text(20_000, 64);
+        let block = prefix_block(&bytes);
+        let pairs: [(BlockCompressor, BlockCompressor, Strategy, ParamSwitch); 7] = [
+            (greedy_dms, greedy, Strategy::Greedy, ParamSwitch::Disable),
+            (lazy_dms, lazy, Strategy::Lazy, ParamSwitch::Disable),
+            (lazy2_dms, lazy2, Strategy::Lazy2, ParamSwitch::Disable),
+            (
+                btlazy2_dms,
+                btlazy2,
+                Strategy::BtLazy2,
+                ParamSwitch::Disable,
+            ),
+            (
+                greedy_row_dms,
+                greedy_row,
+                Strategy::Greedy,
+                ParamSwitch::Enable,
+            ),
+            (lazy_row_dms, lazy_row, Strategy::Lazy, ParamSwitch::Enable),
+            (
+                lazy2_row_dms,
+                lazy2_row,
+                Strategy::Lazy2,
+                ParamSwitch::Enable,
+            ),
+        ];
+        for (dms, plain, strategy, row) in pairs {
+            let mut cparams = level_cparams(7, u64::MAX);
+            cparams.strategy = strategy;
+            let run = |compressor: BlockCompressor| {
+                let mut ms = MatchState::new(cparams, row);
+                let mut seq_store = SeqStore::default();
+                seq_store.reserve(bytes.len(), cparams.min_match);
+                let mut rep = [1, 4, 8];
+                let last = compressor(&mut ms, &mut seq_store, &mut rep, &block);
+                (last, rep, seq_store.sequences, seq_store.literals)
+            };
+            let expected = run(plain);
+            assert!(!expected.2.is_empty(), "{strategy:?}");
+            assert!(run(dms) == expected, "{strategy:?} {row:?}");
+        }
+    }
+
+    /// A forced attachment spanning many blocks, in a window that passes
+    /// the dictionary: the blocks after it run without it.
+    #[test]
+    fn attached_dictionaries_match_the_reference_once_the_window_passes_them() {
+        let (trained, records) = dict_tests::trained();
+        let input = [records.concat(), corpus::text(150_000, 21)].concat();
+        let inputs = [input];
+        for strategy in [
+            Strategy::Greedy,
+            Strategy::Lazy,
+            Strategy::Lazy2,
+            Strategy::BtLazy2,
+        ] {
+            for row in [ParamSwitch::Enable, ParamSwitch::Disable] {
+                for window_log in [17, 20] {
+                    let mut requested =
+                        dict_tests::request(7, Some(strategy), AttachPref::ForceAttach);
+                    requested.cparams.window_log = window_log;
+                    requested.use_row_match_finder = row;
+                    assert!(check_attached(
+                        &requested,
+                        &trained,
+                        DictionaryContent::Auto,
+                        &inputs
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Inputs shorter than a block's search limits, down to nothing.
+    #[test]
+    fn tiny_inputs_attach_dictionaries_like_the_reference() {
+        let (trained, records) = dict_tests::trained();
+        let raw = raw_dictionary(&records);
+        let joined = records[records.len() - 10..].concat();
+        let inputs: Vec<Vec<u8>> = [
+            0usize, 1, 2, 7, 8, 9, 15, 16, 17, 24, 25, 31, 32, 33, 40, 64, 100, 200, 500,
+        ]
+        .iter()
+        .map(|&len| joined[..len].to_vec())
+        .collect();
+        for strategy in [
+            Strategy::Greedy,
+            Strategy::Lazy,
+            Strategy::Lazy2,
+            Strategy::BtLazy2,
+        ] {
+            for row in [ParamSwitch::Enable, ParamSwitch::Disable] {
+                for pref in [AttachPref::ForceAttach, AttachPref::Default] {
+                    let mut requested = dict_tests::request(5, Some(strategy), pref);
+                    requested.use_row_match_finder = row;
+                    assert!(check_attached(
+                        &requested,
+                        &trained,
+                        DictionaryContent::Auto,
+                        &inputs
+                    ));
+                    assert!(check_attached(
+                        &requested,
+                        &raw,
+                        DictionaryContent::Raw,
+                        &inputs
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Streams of unknown size attach the dictionary; every chunking and
+    /// every backend produces the reference's frame, also when a small
+    /// window wraps the stream's buffer.
+    #[test]
+    fn streamed_frames_attach_dictionaries_like_the_reference() {
+        let (trained, records) = dict_tests::trained();
+        let input = [records[..1500].concat(), corpus::mixed(40_000, 31)].concat();
+        let chunkings = [1_000usize, 7_001, 65_536, input.len()];
+        let mut requests = Vec::new();
+        for strategy in [
+            Strategy::Greedy,
+            Strategy::Lazy,
+            Strategy::Lazy2,
+            Strategy::BtLazy2,
+        ] {
+            for row in [ParamSwitch::Enable, ParamSwitch::Disable] {
+                for window_log in [0, 15] {
+                    let mut requested = dict_tests::request(8, Some(strategy), AttachPref::Default);
+                    requested.use_row_match_finder = row;
+                    requested.cparams.window_log = window_log;
+                    requests.push(requested);
+                }
+            }
+        }
+        for requested in &requests {
+            let content = DictionaryContent::Auto;
+            let cdict = CDict::new(Box::from(&trained[..]), content, requested).expect("prepares");
+            let params = with_row_switch(
+                dict_tests::dict_params(requested, &trained, content),
+                requested,
+            );
+            for size in chunkings {
+                let chunks: Vec<&[u8]> = input.chunks(size).collect();
+                let steps: Vec<(&[u8], Directive)> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &data)| {
+                        let op = if n + 1 == chunks.len() {
+                            Directive::End
+                        } else {
+                            Directive::Continue
+                        };
+                        (data, op)
+                    })
+                    .collect();
+                let theirs = oracle::compress_stream(&params, &steps).expect("oracle");
+                for backend in Backend::available() {
+                    let mut engine = Engine::with_backend(backend);
+                    let ours = stream(&mut engine, requested, Some(&cdict), &chunks);
+                    assert!(ours == theirs, "{backend} chunks of {size}, {requested:?}");
+                }
             }
         }
     }

@@ -80,7 +80,11 @@ impl ParallelEncodeError {
         match self {
             Self::BatchFailed(cause) | Self::StreamFailed(cause) => cause.io_kind(),
             Self::Encode(EncodeError::OutputTooSmall { .. }) => io::ErrorKind::WriteZero,
-            Self::Encode(EncodeError::InputSizeMismatch { .. } | EncodeError::Bound(_))
+            Self::Encode(
+                EncodeError::InputSizeMismatch { .. }
+                | EncodeError::Bound(_)
+                | EncodeError::DictionaryMismatch,
+            )
             | Self::InputSizeMismatch { .. } => io::ErrorKind::InvalidInput,
             Self::Encode(EncodeError::InvalidState | EncodeError::Internal)
             | Self::InvalidState

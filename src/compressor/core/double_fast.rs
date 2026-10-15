@@ -6,8 +6,13 @@ use core::cell::Cell;
 use fearless_simd::Simd;
 use fearless_simd_macros::simd;
 
-use super::match_state::{BlockInput, MatchState};
-use super::mem::{count_slices_simd, hash_ptr, hash_word, load32, load64, try_load64};
+use super::cdict::TableLoad;
+use super::fast::{DictBytes, rep_index_ok, tags_match, write_tagged_index};
+use super::match_state::{BlockInput, DictMatchState, MatchState};
+use super::mem::{
+    count_at_simd, count_slices_simd, hash_ptr, hash_word, load32, load64, try_load64,
+};
+use super::params::SHORT_CACHE_TAG_BITS;
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
 use super::window::HASH_READ_SIZE;
 
@@ -25,6 +30,68 @@ pub(crate) fn fill_double_hash_table(ms: &mut MatchState, prefix: &super::mem::M
         let curr = ip as u32;
         ms.chain_table[hash_ptr(prefix, curr, h_bits_s, mls)] = curr;
         ms.hash_table[hash_ptr(prefix, curr, h_bits_l, 8)] = curr;
+        ip += 3;
+    }
+}
+
+/// `ZSTD_fillDoubleHashTableForCCtx`: [`fill_double_hash_table`], and with
+/// [`TableLoad::Full`] also the two positions after each indexed one in the
+/// long table where their slot is still empty.
+pub(crate) fn fill_double_hash_table_for(
+    ms: &mut MatchState,
+    prefix: &super::mem::Mem<'_>,
+    end: u32,
+    dtlm: TableLoad,
+) {
+    if dtlm == TableLoad::Fast {
+        return fill_double_hash_table(ms, prefix, end);
+    }
+    let h_bits_l = ms.cparams.hash_log;
+    let h_bits_s = ms.cparams.chain_log;
+    let mls = ms.cparams.min_match;
+    let iend = i64::from(end) - i64::from(HASH_READ_SIZE);
+    let mut ip = i64::from(ms.next_to_update);
+    while ip + 2 <= iend {
+        let curr = ip as u32;
+        for i in 0..3 {
+            let small = hash_ptr(prefix, curr + i, h_bits_s, mls);
+            let large = hash_ptr(prefix, curr + i, h_bits_l, 8);
+            if i == 0 {
+                ms.chain_table[small] = curr + i;
+            }
+            if i == 0 || ms.hash_table[large] == 0 {
+                ms.hash_table[large] = curr + i;
+            }
+        }
+        ip += 3;
+    }
+}
+
+/// `ZSTD_fillDoubleHashTableForCDict` with `ZSTD_dtlm_full`: both tables
+/// hold tagged indices (`ZSTD_writeTaggedIndex`); every third position
+/// enters both, the ones in between the long table where its slot is empty.
+pub(crate) fn fill_cdict_double_hash_table(
+    ms: &mut MatchState,
+    prefix: &super::mem::Mem<'_>,
+    end: u32,
+) {
+    let h_bits_l = ms.cparams.hash_log + SHORT_CACHE_TAG_BITS;
+    let h_bits_s = ms.cparams.chain_log + SHORT_CACHE_TAG_BITS;
+    let mls = ms.cparams.min_match;
+    let iend = i64::from(end) - i64::from(HASH_READ_SIZE);
+    let mut ip = i64::from(ms.next_to_update);
+    while ip + 2 <= iend {
+        let curr = ip as u32;
+        for i in 0..3 {
+            let small = hash_ptr(prefix, curr + i, h_bits_s, mls);
+            let large = hash_ptr(prefix, curr + i, h_bits_l, 8);
+            if i == 0 {
+                write_tagged_index(&mut ms.chain_table, small, curr + i);
+            }
+            if i == 0 || ms.hash_table[large >> SHORT_CACHE_TAG_BITS] == 0 {
+                write_tagged_index(&mut ms.hash_table, large, curr + i);
+            }
+        }
         ip += 3;
     }
 }
@@ -619,4 +686,419 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
     rep[0] = offset_1;
     rep[1] = offset_2;
     iend - anchor
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState`: selects the variant
+/// compiled for the minimum match length, dispatched once per block.
+///
+/// A block without an attached dictionary is compressed as
+/// [`compress_block`] would.
+pub(crate) fn compress_block_dict_match_state(
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    block: &BlockInput<'_>,
+) -> usize {
+    let Some(dms) = block.dms else {
+        return compress_block(ms, seq_store, rep, block);
+    };
+    fearless_simd::dispatch!(ms.backend.0, simd => match ms.cparams.min_match {
+        5 => compress_block_dms_mls::<_, 5>(simd, ms, seq_store, rep, block, &dms),
+        6 => compress_block_dms_mls::<_, 6>(simd, ms, seq_store, rep, block, &dms),
+        7.. => compress_block_dms_mls::<_, 7>(simd, ms, seq_store, rep, block, &dms),
+        _ => compress_block_dms_mls::<_, 4>(simd, ms, seq_store, rep, block, &dms),
+    })
+}
+
+/// Where the short candidate a `dfast` dictMatchState search settles on
+/// lies.
+enum ShortMatch {
+    /// At this offset of the prefix.
+    Prefix(usize),
+    /// At this dictionary index.
+    Dict(u32),
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState_generic` for one minimum
+/// match length, compiled for one SIMD level.
+///
+/// Positions are offsets into the prefix from its lowest valid index;
+/// candidates below it are read from the dictionary.
+#[simd]
+fn compress_block_dms_mls<S: Simd, const MLS: u32>(
+    simd: S,
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    block: &BlockInput<'_>,
+    dms: &DictMatchState<'_>,
+) -> usize {
+    let cparams = ms.cparams;
+    let h_bits_l = cparams.hash_log;
+    let h_bits_s = cparams.chain_log;
+    // With a dictionary attached this is the context's `dictLimit`.
+    let prefix_lowest_index = ms.lowest_prefix_index(block.end, cparams.window_log);
+    let src = block.window.prefix.slice(prefix_lowest_index, block.end);
+    let istart = (block.start - prefix_lowest_index) as usize;
+    let iend = src.len();
+    let index = |p: usize| p as u32 + prefix_lowest_index;
+    let read32 = |p: usize| load32(src, p);
+    let read64 = |p: usize| load64(src, p);
+    let count = |a: usize, b: usize| count_at_simd(simd, src, a, b);
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    let dict = DictBytes::new(dms, prefix_lowest_index);
+    let dict_long = dms.ms.hash_table.as_slice();
+    let dict_small = dms.ms.chain_table.as_slice();
+    let dict_h_bits_l = dms.ms.cparams.hash_log + SHORT_CACHE_TAG_BITS;
+    let dict_h_bits_s = dms.ms.cparams.chain_log + SHORT_CACHE_TAG_BITS;
+    let dict_and_prefix_length = istart as u32 + dict.bytes.len() as u32;
+
+    // Hashes are below the tables' sizes; masking with `len - 1` changes
+    // nothing and, with the tables known to be non-empty, proves every
+    // index in bounds.
+    assert!(
+        !ms.hash_table.is_empty()
+            && !ms.chain_table.is_empty()
+            && !dict_long.is_empty()
+            && !dict_small.is_empty()
+    );
+    let (mask_l, mask_s) = (ms.hash_table.len() - 1, ms.chain_table.len() - 1);
+    let (dict_mask_l, dict_mask_s) = (dict_long.len() - 1, dict_small.len() - 1);
+    let MatchState {
+        hash_table: hash_long,
+        chain_table: hash_small,
+        ..
+    } = ms;
+    let hash_long = hash_long.as_mut_slice();
+    let hash_small = hash_small.as_mut_slice();
+    let hash_l = |p: usize| hash_word::<8>(load64(src, p), h_bits_l) & mask_l;
+    let hash_s = |p: usize| hash_word::<MLS>(load64(src, p), h_bits_s) & mask_s;
+    let dict_entry_l = |hash_and_tag: usize| {
+        let entry = dict_long[(hash_and_tag >> SHORT_CACHE_TAG_BITS) & dict_mask_l];
+        (
+            entry >> SHORT_CACHE_TAG_BITS,
+            tags_match(entry, hash_and_tag),
+        )
+    };
+    let dict_entry_s = |hash_and_tag: usize| {
+        let entry = dict_small[(hash_and_tag >> SHORT_CACHE_TAG_BITS) & dict_mask_s];
+        (
+            entry >> SHORT_CACHE_TAG_BITS,
+            tags_match(entry, hash_and_tag),
+        )
+    };
+    // Whether the four bytes at the repcode candidate `rep_index`, in the
+    // dictionary or the prefix, are `word`.
+    let rep_matches = |rep_index: u32, word: u32| {
+        if rep_index < prefix_lowest_index {
+            super::mem::matches32(dict.bytes, dict.offset_of_context(rep_index), word)
+        } else {
+            super::mem::matches32(src, rep_index - prefix_lowest_index, word)
+        }
+    };
+    // Forward length at `ip` of the repcode candidate `rep_index`.
+    let rep_count = |ip: usize, rep_index: u32| {
+        if rep_index < prefix_lowest_index {
+            dict.count_2segments(simd, src, ip, dict.offset_of_context(rep_index) as usize)
+        } else {
+            count(ip, (rep_index - prefix_lowest_index) as usize)
+        }
+    };
+    // Backward extension of a match at offset `m` of `history` for the
+    // position `ip`.
+    let catch_up =
+        |ip: &mut usize, m: &mut usize, m_length: &mut usize, anchor: usize, history: &[u8]| {
+            while *ip > anchor && *m > 0 && src[*ip - 1] == history[*m - 1] {
+                *ip -= 1;
+                *m -= 1;
+                *m_length += 1;
+            }
+        };
+    // Offset of the context index `curr` from the dictionary index `m`.
+    let dict_offset = |curr: u32, m: u32| curr.wrapping_sub(m).wrapping_sub(dict.index_delta);
+
+    let mut ip = istart;
+    let mut anchor = istart;
+    ip += usize::from(dict_and_prefix_length == 0);
+
+    // The reference tests `ip < ilimit`, with `ilimit = iend - 8`.
+    'outer: while ip + (HASH_READ_SIZE as usize) < iend {
+        let word = read64(ip);
+        let h2 = hash_word::<8>(word, h_bits_l) & mask_l;
+        let h = hash_word::<MLS>(word, h_bits_s) & mask_s;
+        let (dict_match_index_l, dict_tags_match_l) =
+            dict_entry_l(hash_word::<8>(word, dict_h_bits_l));
+        let (dict_match_index_s, dict_tags_match_s) =
+            dict_entry_s(hash_word::<MLS>(word, dict_h_bits_s));
+        let curr = index(ip);
+        let match_index_l = hash_long[h2];
+        let match_index_s = hash_small[h];
+        let rep_index = (curr + 1).wrapping_sub(offset_1);
+        hash_long[h2] = curr;
+        hash_small[h] = curr;
+
+        let m_length = 'stored: {
+            if rep_index_ok(prefix_lowest_index, rep_index)
+                && rep_matches(rep_index, read32(ip + 1))
+            {
+                let m_length = rep_count(ip + 1 + 4, rep_index + 4) + 4;
+                ip += 1;
+                seq_store.store_seq_from(src, anchor, ip - anchor, repcode_to_offbase(1), m_length);
+                break 'stored m_length;
+            }
+
+            let (offset, m_length) = 'found: {
+                if super::mem::matches64(src, match_index_l.wrapping_sub(prefix_lowest_index), word)
+                {
+                    let mut m = (match_index_l - prefix_lowest_index) as usize;
+                    let mut m_length = count(ip + 8, m + 8) + 8;
+                    let offset = (ip - m) as u32;
+                    catch_up(&mut ip, &mut m, &mut m_length, anchor, src);
+                    break 'found (offset, m_length);
+                } else if dict_tags_match_l {
+                    let m = dict.offset_of(dict_match_index_l);
+                    if dict_match_index_l > dict.start_index
+                        && super::mem::matches64(dict.bytes, m, word)
+                    {
+                        let mut m = m as usize;
+                        let mut m_length = dict.count_2segments(simd, src, ip + 8, m + 8) + 8;
+                        let offset = dict_offset(curr, dict_match_index_l);
+                        catch_up(&mut ip, &mut m, &mut m_length, anchor, dict.bytes);
+                        break 'found (offset, m_length);
+                    }
+                }
+
+                let short = 'short: {
+                    if match_index_s > prefix_lowest_index {
+                        let m = (match_index_s - prefix_lowest_index) as usize;
+                        if super::mem::matches32(src, m as u32, word as u32) {
+                            break 'short ShortMatch::Prefix(m);
+                        }
+                    } else if dict_tags_match_s
+                        && dict_match_index_s > dict.start_index
+                        && super::mem::matches32(
+                            dict.bytes,
+                            dict.offset_of(dict_match_index_s),
+                            word as u32,
+                        )
+                    {
+                        break 'short ShortMatch::Dict(dict_match_index_s);
+                    }
+                    ip += ((ip - anchor) >> SEARCH_STRENGTH) + 1;
+                    continue 'outer;
+                };
+
+                // _search_next_long:
+                let word1 = read64(ip + 1);
+                let hl3 = hash_word::<8>(word1, h_bits_l) & mask_l;
+                let (dict_match_index_l3, dict_tags_match_l3) =
+                    dict_entry_l(hash_word::<8>(word1, dict_h_bits_l));
+                let match_index_l3 = hash_long[hl3];
+                hash_long[hl3] = curr + 1;
+
+                if super::mem::matches64(
+                    src,
+                    match_index_l3.wrapping_sub(prefix_lowest_index),
+                    word1,
+                ) {
+                    let mut m = (match_index_l3 - prefix_lowest_index) as usize;
+                    let mut m_length = count(ip + 9, m + 8) + 8;
+                    ip += 1;
+                    let offset = (ip - m) as u32;
+                    catch_up(&mut ip, &mut m, &mut m_length, anchor, src);
+                    break 'found (offset, m_length);
+                } else if dict_tags_match_l3 {
+                    let m = dict.offset_of(dict_match_index_l3);
+                    if dict_match_index_l3 > dict.start_index
+                        && super::mem::matches64(dict.bytes, m, word1)
+                    {
+                        let mut m = m as usize;
+                        let mut m_length = dict.count_2segments(simd, src, ip + 1 + 8, m + 8) + 8;
+                        ip += 1;
+                        let offset = dict_offset(curr + 1, dict_match_index_l3);
+                        catch_up(&mut ip, &mut m, &mut m_length, anchor, dict.bytes);
+                        break 'found (offset, m_length);
+                    }
+                }
+
+                // No long match at `ip + 1`: extend the short one.
+                match short {
+                    ShortMatch::Dict(dict_match_index) => {
+                        let mut m = dict.offset_of(dict_match_index) as usize;
+                        let mut m_length = dict.count_2segments(simd, src, ip + 4, m + 4) + 4;
+                        let offset = dict_offset(curr, dict_match_index);
+                        catch_up(&mut ip, &mut m, &mut m_length, anchor, dict.bytes);
+                        (offset, m_length)
+                    }
+                    ShortMatch::Prefix(mut m) => {
+                        let mut m_length = count(ip + 4, m + 4) + 4;
+                        let offset = (ip - m) as u32;
+                        catch_up(&mut ip, &mut m, &mut m_length, anchor, src);
+                        (offset, m_length)
+                    }
+                }
+            };
+
+            // _match_found:
+            offset_2 = offset_1;
+            offset_1 = offset;
+            seq_store.store_seq_from(
+                src,
+                anchor,
+                ip - anchor,
+                offset_to_offbase(offset),
+                m_length,
+            );
+            m_length
+        };
+
+        // _match_stored:
+        ip += m_length;
+        anchor = ip;
+
+        if ip + HASH_READ_SIZE as usize <= iend {
+            // Complementary insertion, after the `ilimit` test because the
+            // positions may lie past it.
+            let index_to_insert = curr + 2;
+            let insert_at = (index_to_insert - prefix_lowest_index) as usize;
+            hash_long[hash_l(insert_at)] = index_to_insert;
+            hash_long[hash_l(ip - 2)] = index(ip - 2);
+            hash_small[hash_s(insert_at)] = index_to_insert;
+            hash_small[hash_s(ip - 1)] = index(ip - 1);
+
+            while ip + HASH_READ_SIZE as usize <= iend {
+                let current2 = index(ip);
+                let rep_index2 = current2.wrapping_sub(offset_2);
+                if rep_index_ok(prefix_lowest_index, rep_index2)
+                    && rep_matches(rep_index2, read32(ip))
+                {
+                    let rep_length2 = rep_count(ip + 4, rep_index2 + 4) + 4;
+                    core::mem::swap(&mut offset_1, &mut offset_2);
+                    seq_store.store_seq_only(0, repcode_to_offbase(1), rep_length2);
+                    hash_small[hash_s(ip)] = current2;
+                    hash_long[hash_l(ip)] = current2;
+                    ip += rep_length2;
+                    anchor = ip;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+    iend - anchor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::cdict::AttachPref;
+    use super::super::dict_tests::{inputs, request, trained};
+    use super::super::fast::tests::{
+        check_every_backend, check_stream, many_blocks, raw_dictionary, tiny_inputs,
+    };
+    use super::super::mem::{Mem, Window};
+    use super::super::params::{ParamSwitch, Strategy, level_cparams};
+    use super::*;
+    use crate::Backend;
+    use crate::dictionary::DictionaryContent;
+    use zstd_ffi::corpus;
+
+    #[test]
+    fn dfast_levels_attach_dictionaries_like_the_reference() {
+        let (trained, records) = trained();
+        let raw = raw_dictionary(&records);
+        let inputs = inputs(&records);
+        for level in 2..=4 {
+            for pref in [AttachPref::ForceAttach, AttachPref::Default] {
+                let requested = request(level, None, pref);
+                check_every_backend(&requested, &trained, DictionaryContent::Auto, &inputs);
+                check_every_backend(&requested, &raw, DictionaryContent::Auto, &inputs);
+                check_every_backend(&requested, &trained, DictionaryContent::Raw, &inputs);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_dfast_strategy_attaches_with_every_min_match() {
+        let (trained, records) = trained();
+        let raw = raw_dictionary(&records);
+        let inputs = inputs(&records);
+        for level in [-1, 1, 4] {
+            for min_match in 4..=7 {
+                let mut requested = request(level, Some(Strategy::DFast), AttachPref::ForceAttach);
+                requested.cparams.min_match = min_match;
+                check_every_backend(&requested, &trained, DictionaryContent::Auto, &inputs);
+                check_every_backend(&requested, &raw, DictionaryContent::Raw, &inputs);
+            }
+        }
+    }
+
+    #[test]
+    fn attached_dictionary_survives_and_expires_over_many_blocks() {
+        let (trained, records) = trained();
+        let big = many_blocks(&records);
+        for window_log in [0, 17] {
+            for level in [2, 4] {
+                let mut requested = request(level, None, AttachPref::ForceAttach);
+                requested.cparams.window_log = window_log;
+                check_every_backend(&requested, &trained, DictionaryContent::Auto, &big);
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_inputs_attach_dictionaries_like_the_reference() {
+        let (trained, records) = trained();
+        let tiny = tiny_inputs(&records);
+        for level in [2, 4] {
+            for pref in [AttachPref::ForceAttach, AttachPref::Default] {
+                let requested = request(level, None, pref);
+                check_every_backend(&requested, &trained, DictionaryContent::Auto, &tiny);
+            }
+        }
+    }
+
+    #[test]
+    fn streams_with_an_attached_dictionary_match_the_reference() {
+        let (trained, records) = trained();
+        let input = records[records.len() - 600..].concat();
+        for level in [2, 4] {
+            for chunk in [1_000, 7_001, 1 << 17] {
+                let requested = request(level, None, AttachPref::Default);
+                check_stream(&requested, &trained, DictionaryContent::Auto, &input, chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_dictionary_the_dict_match_state_entry_compresses_as_no_dict() {
+        let input = corpus::text(20_000, 3);
+        let cparams = level_cparams(3, input.len() as u64);
+        let block = BlockInput {
+            window: Window {
+                prefix: Mem::new(&input, 2),
+                ext: Mem::new(&[], 2),
+            },
+            start: 2,
+            end: 2 + input.len() as u32,
+            backend: Backend::default(),
+            dms: None,
+            symbol_costs: None,
+        };
+        let run = |compressor: super::super::match_state::BlockCompressor| {
+            let mut ms = MatchState::new(cparams, ParamSwitch::Disable);
+            let mut seq_store = SeqStore::default();
+            seq_store.reserve(input.len(), cparams.min_match);
+            let mut rep = [1, 4, 8];
+            let literals = compressor(&mut ms, &mut seq_store, &mut rep, &block);
+            (literals, rep, seq_store.sequences, seq_store.literals)
+        };
+        let ours = run(compress_block_dict_match_state);
+        assert!(!ours.2.is_empty());
+        assert_eq!(ours, run(compress_block));
+    }
 }

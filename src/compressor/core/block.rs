@@ -3,6 +3,7 @@
 //! `ZSTD_compressBlock_internal`).
 
 use super::cctx::Engine;
+use super::cdict::CDict;
 use super::double_fast;
 use super::entropy::Tables;
 use super::entropy::literals::{self, LiteralsSettings, min_gain};
@@ -35,47 +36,70 @@ pub(crate) enum Build {
     NoCompress,
 }
 
+/// Where a block's history comes from (`ZSTD_dictMode_e`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DictMode {
+    /// One contiguous prefix (`ZSTD_noDict`).
+    NoDict,
+    /// A prefix and an older segment (`ZSTD_extDict`).
+    ExtDict,
+    /// A prefix and an attached dictionary (`ZSTD_dictMatchState`).
+    DictMatchState,
+}
+
 /// The block compressor for a strategy and window shape
 /// (`ZSTD_selectBlockCompressor`).
 fn select_block_compressor(
     strategy: Strategy,
     row: bool,
-    ext_dict: bool,
+    mode: DictMode,
 ) -> Result<BlockCompressor, CoreError> {
+    use DictMode::{DictMatchState as Dms, ExtDict as Ext, NoDict};
     if row
         && matches!(
             strategy,
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
         )
     {
-        return Ok(match (strategy, ext_dict) {
-            (Strategy::Greedy, false) => lazy::greedy_row,
-            (Strategy::Greedy, true) => lazy::greedy_row_ext,
-            (Strategy::Lazy, false) => lazy::lazy_row,
-            (Strategy::Lazy, true) => lazy::lazy_row_ext,
-            (_, false) => lazy::lazy2_row,
-            (_, true) => lazy::lazy2_row_ext,
+        return Ok(match (strategy, mode) {
+            (Strategy::Greedy, NoDict) => lazy::greedy_row,
+            (Strategy::Greedy, Ext) => lazy::greedy_row_ext,
+            (Strategy::Greedy, Dms) => lazy::greedy_row_dms,
+            (Strategy::Lazy, NoDict) => lazy::lazy_row,
+            (Strategy::Lazy, Ext) => lazy::lazy_row_ext,
+            (Strategy::Lazy, Dms) => lazy::lazy_row_dms,
+            (_, NoDict) => lazy::lazy2_row,
+            (_, Ext) => lazy::lazy2_row_ext,
+            (_, Dms) => lazy::lazy2_row_dms,
         });
     }
-    match (strategy, ext_dict) {
-        (Strategy::Fast, false) => Ok(fast::compress_block),
-        (Strategy::Fast, true) => Ok(fast::compress_block_ext_dict),
-        (Strategy::DFast, false) => Ok(double_fast::compress_block),
-        (Strategy::DFast, true) => Ok(double_fast::compress_block_ext_dict),
-        (Strategy::Greedy, false) => Ok(lazy::greedy),
-        (Strategy::Greedy, true) => Ok(lazy::greedy_ext),
-        (Strategy::Lazy, false) => Ok(lazy::lazy),
-        (Strategy::Lazy, true) => Ok(lazy::lazy_ext),
-        (Strategy::Lazy2, false) => Ok(lazy::lazy2),
-        (Strategy::Lazy2, true) => Ok(lazy::lazy2_ext),
-        (Strategy::BtLazy2, false) => Ok(lazy::btlazy2),
-        (Strategy::BtLazy2, true) => Ok(lazy::btlazy2_ext),
-        (Strategy::BtOpt, false) => Ok(opt::btopt),
-        (Strategy::BtOpt, true) => Ok(opt::btopt_ext),
-        (Strategy::BtUltra, false) => Ok(opt::btultra),
-        (Strategy::BtUltra, true) | (Strategy::BtUltra2, true) => Ok(opt::btultra_ext),
-        (Strategy::BtUltra2, false) => Ok(opt::btultra2),
-    }
+    Ok(match (strategy, mode) {
+        (Strategy::Fast, NoDict) => fast::compress_block,
+        (Strategy::Fast, Ext) => fast::compress_block_ext_dict,
+        (Strategy::Fast, Dms) => fast::compress_block_dict_match_state,
+        (Strategy::DFast, NoDict) => double_fast::compress_block,
+        (Strategy::DFast, Ext) => double_fast::compress_block_ext_dict,
+        (Strategy::DFast, Dms) => double_fast::compress_block_dict_match_state,
+        (Strategy::Greedy, NoDict) => lazy::greedy,
+        (Strategy::Greedy, Ext) => lazy::greedy_ext,
+        (Strategy::Greedy, Dms) => lazy::greedy_dms,
+        (Strategy::Lazy, NoDict) => lazy::lazy,
+        (Strategy::Lazy, Ext) => lazy::lazy_ext,
+        (Strategy::Lazy, Dms) => lazy::lazy_dms,
+        (Strategy::Lazy2, NoDict) => lazy::lazy2,
+        (Strategy::Lazy2, Ext) => lazy::lazy2_ext,
+        (Strategy::Lazy2, Dms) => lazy::lazy2_dms,
+        (Strategy::BtLazy2, NoDict) => lazy::btlazy2,
+        (Strategy::BtLazy2, Ext) => lazy::btlazy2_ext,
+        (Strategy::BtLazy2, Dms) => lazy::btlazy2_dms,
+        (Strategy::BtOpt, NoDict) => opt::btopt,
+        (Strategy::BtOpt, Ext) => opt::btopt_ext,
+        (Strategy::BtOpt, Dms) => opt::btopt_dms,
+        (Strategy::BtUltra, NoDict) => opt::btultra,
+        (Strategy::BtUltra | Strategy::BtUltra2, Ext) => opt::btultra_ext,
+        (Strategy::BtUltra | Strategy::BtUltra2, Dms) => opt::btultra_dms,
+        (Strategy::BtUltra2, NoDict) => opt::btultra2,
+    })
 }
 
 /// Runs the match finder over `[start, end)` (`ZSTD_buildSeqStore`).
@@ -104,16 +128,31 @@ pub(crate) fn build_seq_store(
 
     engine.next.rep = engine.prev.rep;
     let row = engine.applied.use_row_match_finder == ParamSwitch::Enable;
-    let compressor = select_block_compressor(
-        engine.applied.cparams.strategy,
-        row,
-        ms.window.has_ext_dict(),
-    )?;
+    // ZSTD_matchState_dictMode.
+    let dms = if ms.dict_match_state {
+        segments.cdict.map(CDict::match_state)
+    } else {
+        None
+    };
+    let mode = if ms.window.has_ext_dict() {
+        DictMode::ExtDict
+    } else if dms.is_some() {
+        DictMode::DictMatchState
+    } else {
+        DictMode::NoDict
+    };
+    let compressor = select_block_compressor(engine.applied.cparams.strategy, row, mode)?;
     let block = BlockInput {
         window: *view,
         start,
         end,
         backend: engine.backend,
+        dms: if mode == DictMode::DictMatchState {
+            dms
+        } else {
+            None
+        },
+        symbol_costs: Some(&engine.prev.entropy),
     };
     let last_ll_size = if engine.applied.ldm.enable == ParamSwitch::Enable {
         let store = &mut engine.ldm_store;

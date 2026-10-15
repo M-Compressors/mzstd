@@ -95,6 +95,30 @@ pub const ZSTD_c_useRowMatchFinder: ZSTD_cParameter = 1011;
 pub const ZSTD_c_blockSplitterLevel: ZSTD_cParameter = 1017;
 /// `ZSTD_c_splitAfterSequences` (`ZSTD_c_experimentalParam13`).
 pub const ZSTD_c_splitAfterSequences: ZSTD_cParameter = 1010;
+/// `ZSTD_c_forceMaxWindow` (`ZSTD_c_experimentalParam3`).
+pub const ZSTD_c_forceMaxWindow: ZSTD_cParameter = 1000;
+/// `ZSTD_c_forceAttachDict` (`ZSTD_c_experimentalParam4`).
+pub const ZSTD_c_forceAttachDict: ZSTD_cParameter = 1001;
+
+/// `ZSTD_dictContentType_e`.
+pub type ZSTD_dictContentType_e = c_int;
+pub const ZSTD_dct_auto: ZSTD_dictContentType_e = 0;
+pub const ZSTD_dct_rawContent: ZSTD_dictContentType_e = 1;
+pub const ZSTD_dct_fullDict: ZSTD_dictContentType_e = 2;
+
+/// `ZSTD_dictLoadMethod_e`.
+pub type ZSTD_dictLoadMethod_e = c_int;
+pub const ZSTD_dlm_byCopy: ZSTD_dictLoadMethod_e = 0;
+pub const ZSTD_dlm_byRef: ZSTD_dictLoadMethod_e = 1;
+
+/// `ZSTD_dictAttachPref_e`.
+pub const ZSTD_dictDefaultAttach: c_int = 0;
+pub const ZSTD_dictForceAttach: c_int = 1;
+pub const ZSTD_dictForceCopy: c_int = 2;
+pub const ZSTD_dictForceLoad: c_int = 3;
+
+/// `ZSTD_MAGIC_DICTIONARY`.
+pub const ZSTD_MAGIC_DICTIONARY: u32 = 0xEC30_A437;
 
 pub const ZSTD_d_windowLogMax: ZSTD_dParameter = 100;
 
@@ -245,6 +269,39 @@ unsafe extern "C" {
         input: *mut ZSTD_inBuffer,
     ) -> usize;
 
+    pub fn ZSTD_CCtx_loadDictionary_advanced(
+        cctx: *mut ZSTD_CCtx,
+        dict: *const c_void,
+        dictSize: usize,
+        dictLoadMethod: ZSTD_dictLoadMethod_e,
+        dictContentType: ZSTD_dictContentType_e,
+    ) -> usize;
+    pub fn ZSTD_CCtx_refPrefix_advanced(
+        cctx: *mut ZSTD_CCtx,
+        prefix: *const c_void,
+        prefixSize: usize,
+        dictContentType: ZSTD_dictContentType_e,
+    ) -> usize;
+    pub fn ZSTD_DCtx_loadDictionary_advanced(
+        dctx: *mut ZSTD_DCtx,
+        dict: *const c_void,
+        dictSize: usize,
+        dictLoadMethod: ZSTD_dictLoadMethod_e,
+        dictContentType: ZSTD_dictContentType_e,
+    ) -> usize;
+    pub fn ZSTD_getDictID_fromDict(dict: *const c_void, dictSize: usize) -> c_uint;
+    pub fn ZSTD_getDictID_fromFrame(src: *const c_void, srcSize: usize) -> c_uint;
+
+    pub fn ZDICT_trainFromBuffer(
+        dictBuffer: *mut c_void,
+        dictBufferCapacity: usize,
+        samplesBuffer: *const c_void,
+        samplesSizes: *const usize,
+        nbSamples: c_uint,
+    ) -> usize;
+    pub fn ZDICT_isError(errorCode: usize) -> c_uint;
+    pub fn ZDICT_getErrorName(errorCode: usize) -> *const c_char;
+
     pub fn ZSTD_getCParams(
         compressionLevel: c_int,
         estimatedSrcSize: c_ulonglong,
@@ -281,6 +338,24 @@ unsafe extern "C" {
         count: *const c_uint,
         max_symbol_value: c_uint,
         max_nb_bits: c_uint,
+        nb_bits: *mut u8,
+        values: *mut u16,
+    ) -> usize;
+    /// `FSE_readNCount`.
+    pub fn mzstd_shim_fse_read_ncount(
+        normalized: *mut i16,
+        max_symbol_value: *mut c_uint,
+        table_log: *mut c_uint,
+        src: *const c_void,
+        src_size: usize,
+    ) -> usize;
+    /// `HUF_readCTable`, reporting each symbol's code length and value.
+    pub fn mzstd_shim_huf_read_ctable(
+        src: *const c_void,
+        src_size: usize,
+        max_symbol_value: *mut c_uint,
+        has_zero_weights: *mut c_uint,
+        table_log: *mut c_uint,
         nb_bits: *mut u8,
         values: *mut u16,
     ) -> usize;

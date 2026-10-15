@@ -109,3 +109,37 @@ unsigned mzstd_shim_huf_optimal_table_log(unsigned max_table_log, size_t src_siz
     free(workspace);
     return log;
 }
+
+/*
+ * FSE_readNCount: reads a normalized distribution description. Returns the
+ * description's size, or an error code.
+ */
+size_t mzstd_shim_fse_read_ncount(short* normalized, unsigned* max_symbol_value,
+                                  unsigned* table_log, const void* src, size_t src_size)
+{
+    return FSE_readNCount(normalized, max_symbol_value, table_log, src, src_size);
+}
+
+/*
+ * HUF_readCTable: reads a Huffman description and reports each symbol's
+ * code length and value as mzstd_shim_huf_build does. Returns the
+ * description's size, or an error code.
+ */
+size_t mzstd_shim_huf_read_ctable(const void* src, size_t src_size,
+                                  unsigned* max_symbol_value, unsigned* has_zero_weights,
+                                  unsigned* table_log, unsigned char* nb_bits,
+                                  unsigned short* values)
+{
+    HUF_CREATE_STATIC_CTABLE(table, HUF_SYMBOLVALUE_MAX);
+    unsigned s;
+    size_t const size = HUF_readCTable(table, max_symbol_value, src, src_size, has_zero_weights);
+    if (ZSTD_isError(size)) return size;
+    *table_log = (unsigned)(table[0] & 0xFF);
+    for (s = 0; s <= *max_symbol_value; s++) {
+        HUF_CElt const elt = table[s + 1];
+        unsigned const bits = (unsigned)(elt & 0xFF);
+        nb_bits[s] = (unsigned char)bits;
+        values[s] = bits ? (unsigned short)(elt >> (sizeof(HUF_CElt) * 8 - bits)) : 0;
+    }
+    return size;
+}

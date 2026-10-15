@@ -502,6 +502,17 @@ impl CTable {
         self.symbol_tt[usize::from(symbol)] = SymbolTransform::default();
     }
 
+    /// The reference's approximate maximum cost of `symbol` in bits, its
+    /// fractional part rounded up (`FSE_getMaxNbBits`).
+    ///
+    /// Like the reference it reads whatever transform the symbol holds: one
+    /// past the largest symbol of the last build keeps an older table's.
+    pub(crate) fn max_nb_bits(&self, symbol: u32) -> u32 {
+        self.symbol_tt
+            .get(symbol as usize)
+            .map_or(0, |tt| tt.delta_nb_bits.wrapping_add((1 << 16) - 1) >> 16)
+    }
+
     /// Approximate cost of `symbol` in `1/2^accuracy_log` bits
     /// (`FSE_bitCost`).
     pub(crate) fn bit_cost(&self, symbol: u32, accuracy_log: u32) -> u32 {
@@ -839,6 +850,21 @@ mod tests {
         state.encode(&mut writer, 7);
         state.flush(&mut writer);
         assert_eq!(writer.close(), 1);
+    }
+
+    #[test]
+    fn maximum_symbol_costs_round_fractions_up() {
+        // Table log 5: `(deltaNbBits + 0xFFFF) >> 16`, worked by hand. The
+        // reference's bound rounds a whole bit up: 16/32 gives 2, 8/32 and
+        // 5/32 give 3, 2/32 and a low-probability symbol 5, and an absent
+        // one the log plus one.
+        let norm = [16i16, 8, 5, 2, -1, 0];
+        let mut table = CTable::default();
+        table.build(&norm, 5, 5);
+        let costs: alloc::vec::Vec<u32> = (0..6).map(|s| table.max_nb_bits(s)).collect();
+        assert_eq!(costs, [2, 3, 3, 5, 5, 6]);
+        // Past the transforms there is nothing to read.
+        assert_eq!(table.max_nb_bits(MAX_SYMBOLS as u32), 0);
     }
 
     #[test]

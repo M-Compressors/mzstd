@@ -9,6 +9,7 @@
 //! Addresses in different segments never compare as adjacent or overlapping,
 //! exactly as two distinct allocations never do in the reference.
 
+use super::cdict::CDict;
 use super::mem;
 
 /// `ZSTD_WINDOW_START_INDEX`.
@@ -33,6 +34,8 @@ pub(crate) enum Segment {
     Buffer,
     /// Caller memory handed to one compression call.
     Input(u64),
+    /// The bytes of the dictionary the frame is compressed with.
+    Dict,
 }
 
 /// An address: a segment and a byte offset that may lie outside it, as a
@@ -65,9 +68,24 @@ pub(crate) struct Segments<'a> {
     pub(crate) buffer: &'a [u8],
     /// The current call's input, and its identity.
     pub(crate) input: (&'a [u8], u64),
+    /// The dictionary's bytes ([`Segment::Dict`]).
+    pub(crate) dict: &'a [u8],
+    /// The dictionary the frame was begun with, if any; an attached one's
+    /// tables are read from it.
+    pub(crate) cdict: Option<&'a CDict>,
 }
 
 impl<'a> Segments<'a> {
+    /// Segments for a call reading `input`, with the frame's dictionary.
+    pub(crate) fn input(input: &'a [u8], id: u64, cdict: Option<&'a CDict>) -> Self {
+        Self {
+            buffer: &[],
+            input: (input, id),
+            dict: cdict.map_or(&[], CDict::bytes),
+            cdict,
+        }
+    }
+
     fn bytes(&self, segment: Segment) -> &'a [u8] {
         match segment {
             Segment::Initial => b" \0",
@@ -76,6 +94,7 @@ impl<'a> Segments<'a> {
                 assert_eq!(id, self.input.1, "window refers to a released input");
                 self.input.0
             }
+            Segment::Dict => self.dict,
         }
     }
 }
@@ -178,13 +197,15 @@ impl WindowState {
         contiguous
     }
 
-    /// `ZSTD_window_enforceMaxDist`, without dictionaries: raises the limits
-    /// so nothing older than `max_dist` before `block_end` stays reachable.
+    /// `ZSTD_window_enforceMaxDist`: raises the limits so nothing older than
+    /// `max_dist` before `block_end` stays reachable, and then forgets a
+    /// loaded or attached dictionary.
     pub(crate) fn enforce_max_dist(
         &mut self,
         block_end: u32,
         max_dist: u32,
         loaded_dict_end: &mut u32,
+        dict_match_state: &mut bool,
     ) {
         let loaded = *loaded_dict_end;
         if block_end > max_dist.wrapping_add(loaded) {
@@ -196,6 +217,24 @@ impl WindowState {
                 self.dict_limit = self.low_limit;
             }
             *loaded_dict_end = 0;
+            *dict_match_state = false;
+        }
+    }
+
+    /// `ZSTD_checkDictValidity`: a dictionary stays usable for the block
+    /// ending at `block_end` only while the whole block is within
+    /// `max_dist` of its end and the window still starts where it ended.
+    pub(crate) const fn check_dict_validity(
+        &self,
+        block_end: u32,
+        max_dist: u32,
+        loaded_dict_end: &mut u32,
+        dict_match_state: &mut bool,
+    ) {
+        let loaded = *loaded_dict_end;
+        if block_end > loaded.wrapping_add(max_dist) || loaded != self.dict_limit {
+            *loaded_dict_end = 0;
+            *dict_match_state = false;
         }
     }
 
@@ -339,7 +378,9 @@ mod tests {
         let mut window = WindowState::new();
         window.update(Addr::new(Segment::Input(1), 0), 10_000, false);
         let mut loaded = 0;
-        window.enforce_max_dist(window.end_index(), 1024, &mut loaded);
+        let mut attached = true;
+        window.enforce_max_dist(window.end_index(), 1024, &mut loaded, &mut attached);
+        assert!(!attached);
         assert_eq!(window.low_limit, window.end_index() - 1024);
         assert_eq!(window.dict_limit, window.low_limit);
         window.clear();
@@ -372,6 +413,8 @@ mod tests {
         let segments = Segments {
             buffer: &buffer,
             input: (&input, 9),
+            dict: &[],
+            cdict: None,
         };
         let view = window.view(&segments, window.end_index());
         assert_eq!(view.ext.byte(WINDOW_START_INDEX), 0);

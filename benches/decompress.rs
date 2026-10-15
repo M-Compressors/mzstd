@@ -5,9 +5,12 @@
 //! decoders, then decoded into preallocated buffers with
 //! `Decompressor::decompress_to_slice` and `ZSTD_decompressDCtx`, each with a
 //! reused context. A streaming group feeds `DecoderSession` 64 KiB of input
-//! at a time.
+//! at a time. A dictionary group decodes small records compressed with a
+//! trained dictionary, each decoder holding the dictionary already parsed,
+//! and a small-frame group the same records compressed without one.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use mzstd::dictionary::DecodeDictionary;
 use mzstd::{DecodeOperation, DecoderStatus, Decompressor};
 use std::hint::black_box;
 use zstd_ffi::corpus;
@@ -106,9 +109,87 @@ fn streaming(c: &mut Criterion) {
     group.finish();
 }
 
+/// A thousand JSON-like records, each its own frame compressed at level 3
+/// with a dictionary trained on similar records.
+fn dictionary(c: &mut Criterion) {
+    let training = corpus::records(2_000, 1);
+    let samples: Vec<&[u8]> = training.iter().map(Vec::as_slice).collect();
+    let bytes = oracle::train_dictionary(&samples, 16 << 10).expect("trains");
+    let reference = oracle::Dictionary::auto(&bytes);
+    let records = corpus::records(1_000, 2);
+    let params = Params::level(3).with_dictionary(reference.clone());
+    let frames: Vec<Vec<u8>> = records
+        .iter()
+        .map(|record| oracle::compress2(record, &params).expect("reference"))
+        .collect();
+    let total: usize = records.iter().map(Vec::len).sum();
+    let compressed: usize = frames.iter().map(Vec::len).sum();
+    println!("dictionary/records: {total} -> {compressed} bytes in 1000 frames");
+
+    let dictionary = DecodeDictionary::try_from(&bytes[..]).expect("valid");
+    let mut ours = Decompressor::default();
+    let mut theirs = oracle::Decoder::with_dictionary(&reference).expect("loads");
+    let mut output = vec![0u8; 4 << 10];
+    for (record, frame) in records.iter().zip(&frames) {
+        let written = ours
+            .decompress_with_dictionary_to_slice(&dictionary, frame, &mut output)
+            .expect("decodes");
+        assert_eq!(&output[..written], &record[..]);
+        assert_eq!(theirs.decompress_into(frame, &mut output), record.len());
+    }
+    let mut group = c.benchmark_group("decompress-dictionary/records-1000");
+    group.throughput(Throughput::Bytes(total as u64));
+    group.bench_function("mzstd", |b| {
+        b.iter(|| {
+            for frame in &frames {
+                ours.decompress_with_dictionary_to_slice(
+                    &dictionary,
+                    black_box(frame),
+                    &mut output,
+                )
+                .expect("decodes");
+            }
+        });
+    });
+    group.bench_function("zstd", |b| {
+        b.iter(|| {
+            for frame in &frames {
+                theirs.decompress_into(black_box(frame), &mut output);
+            }
+        });
+    });
+    group.finish();
+
+    // The same records without a dictionary: the per-frame cost that the
+    // dictionary does not add.
+    let plain: Vec<Vec<u8>> = records
+        .iter()
+        .map(|record| oracle::compress2(record, &Params::level(3)).expect("reference"))
+        .collect();
+    let mut theirs = oracle::Decoder::new();
+    let mut group = c.benchmark_group("decompress-small/records-1000");
+    group.throughput(Throughput::Bytes(total as u64));
+    group.bench_function("mzstd", |b| {
+        b.iter(|| {
+            for frame in &plain {
+                ours.decompress_to_slice(black_box(frame), &mut output)
+                    .expect("decodes");
+            }
+        });
+    });
+    group.bench_function("zstd", |b| {
+        b.iter(|| {
+            for frame in &plain {
+                theirs.decompress_into(black_box(frame), &mut output);
+            }
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = one_shot, streaming
+    targets = one_shot, streaming, dictionary
 }
 criterion_main!(benches);

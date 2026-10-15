@@ -35,3 +35,40 @@ fn shim_reports_applied_parameters_and_entropy_tables() {
     let table = oracle::huf_build(&[5, 1, 1, 1], 11).unwrap();
     assert_eq!(table.nb_bits[0], 1);
 }
+
+#[test]
+fn trained_dictionaries_round_trip_and_shrink_small_records() {
+    let records = zstd_ffi::corpus::records(2000, 1);
+    let samples: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+    let dictionary = zstd_ffi::oracle::train_dictionary(&samples, 16 << 10).expect("trains");
+    assert_ne!(zstd_ffi::oracle::dict_id_from_dict(&dictionary), 0);
+    let dict = zstd_ffi::oracle::Dictionary::auto(&dictionary);
+    let params = zstd_ffi::oracle::Params::level(3).with_dictionary(dict.clone());
+    let record = &records[1999];
+    let with = zstd_ffi::oracle::compress2(record, &params).expect("compresses");
+    let without =
+        zstd_ffi::oracle::compress2(record, &zstd_ffi::oracle::Params::level(3)).expect("plain");
+    assert!(with.len() < without.len());
+    assert_eq!(
+        zstd_ffi::oracle::dict_id_from_frame(&with),
+        zstd_ffi::oracle::dict_id_from_dict(&dictionary)
+    );
+    let restored = zstd_ffi::oracle::decompress_with_dictionary(&with, record.len(), &dict)
+        .expect("decompresses");
+    assert_eq!(&restored, record);
+    let streamed = zstd_ffi::oracle::decompress_stream_with_dictionary(&with, 3, None, Some(&dict))
+        .expect("streams");
+    assert_eq!(&streamed, record);
+    zstd_ffi::oracle::load_decoder_dictionary(&dict).expect("loads");
+    let truncated = zstd_ffi::oracle::Dictionary::auto(&dictionary[..12]);
+    assert!(zstd_ffi::oracle::load_decoder_dictionary(&truncated).is_err());
+}
+
+#[test]
+fn adjacent_prefixes_shrink_the_input_after_them() {
+    let whole = zstd_ffi::corpus::text(200_000, 3);
+    let params = zstd_ffi::oracle::Params::level(3);
+    let with = zstd_ffi::oracle::compress2_with_prefix(&whole, 100_000, &params).expect("prefix");
+    let without = zstd_ffi::oracle::compress2(&whole[100_000..], &params).expect("plain");
+    assert!(with.len() < without.len());
+}

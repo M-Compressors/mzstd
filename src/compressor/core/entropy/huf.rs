@@ -439,6 +439,17 @@ impl CTable {
         bits >> 3
     }
 
+    /// Code length of `symbol`, `0` past the table's largest symbol
+    /// (`HUF_getNbBitsFromCTable`).
+    pub(crate) fn symbol_nb_bits(&self, symbol: u32) -> u32 {
+        if symbol > self.max_symbol_value {
+            return 0;
+        }
+        self.nb_bits
+            .get(symbol as usize)
+            .map_or(0, |&bits| u32::from(bits))
+    }
+
     /// Whether every present symbol has a code (`HUF_validateCTable`).
     pub(crate) fn validate(&self, count: &[u32], max_symbol_value: u32) -> bool {
         if self.max_symbol_value < max_symbol_value {
@@ -514,17 +525,17 @@ const HUF_CONTAINER_BITS: u32 = 64;
 /// A table's codes packed for encoding (`HUF_CElt`): the code in the top
 /// `nb_bits` bits and the length in the low byte, so one load yields both.
 ///
-/// Only the symbols the table describes are converted; the input holds no
-/// others.
+/// Every symbol is packed; only those the table describes are meaningful.
+#[inline(always)]
 fn packed_codes(table: &CTable) -> [u64; 256] {
     let mut codes = [0u64; 256];
-    let symbols = (table.max_symbol_value as usize).min(255) + 1;
-    let described = table.nb_bits[..symbols].iter().zip(&table.value[..symbols]);
-    for (code, (&nb_bits, &value)) in codes.iter_mut().zip(described) {
+    // Branch-free over the whole alphabet, so the loop vectorizes: a symbol
+    // without a code packs to garbage (its shift wraps), but the input
+    // holds no such symbol and it is never written.
+    for ((code, &nb_bits), &value) in codes.iter_mut().zip(&table.nb_bits).zip(&table.value) {
         let nb_bits = u32::from(nb_bits);
-        if nb_bits != 0 {
-            *code = (u64::from(value) << (HUF_CONTAINER_BITS - nb_bits)) | u64::from(nb_bits);
-        }
+        *code = u64::from(value).wrapping_shl(HUF_CONTAINER_BITS.wrapping_sub(nb_bits))
+            | u64::from(nb_bits);
     }
     codes
 }
@@ -715,8 +726,15 @@ fn compress_1x_packed<S: Simd>(
 ///
 /// Returns `0` when the stream does not fit.
 pub(crate) fn compress_1x(dst: &mut [u8], src: &[u8], table: &CTable, backend: Backend) -> usize {
+    fearless_simd::dispatch!(backend.0, simd => compress_1x_on(simd, dst, src, table))
+}
+
+/// [`compress_1x`] for one SIMD level, packing the codes in its feature
+/// context.
+#[inline(always)]
+fn compress_1x_on<S: Simd>(simd: S, dst: &mut [u8], src: &[u8], table: &CTable) -> usize {
     let codes = packed_codes(table);
-    fearless_simd::dispatch!(backend.0, simd => compress_1x_packed(simd, dst, src, &codes, table.table_log))
+    compress_1x_packed(simd, dst, src, &codes, table.table_log)
 }
 
 /// Encodes `src` as four streams behind a jump table
@@ -1174,6 +1192,24 @@ mod tests {
         assert_eq!(table.nb_bits[0], 1);
         assert_eq!(table.nb_bits[1], 1);
         assert_ne!(table.value[0], table.value[1]);
+    }
+
+    #[test]
+    fn code_lengths_past_the_largest_symbol_are_zero() {
+        let mut table = CTable::default();
+        let mut count = [0u32; 256];
+        count[..3].copy_from_slice(&[4, 2, 1]);
+        table.build(&count, 2, 11).expect("table");
+        for symbol in 0..3 {
+            assert_eq!(
+                table.symbol_nb_bits(symbol),
+                u32::from(table.nb_bits[symbol as usize])
+            );
+            assert_ne!(table.symbol_nb_bits(symbol), 0);
+        }
+        assert_eq!(table.symbol_nb_bits(3), 0);
+        assert_eq!(table.symbol_nb_bits(255), 0);
+        assert_eq!(table.symbol_nb_bits(4096), 0);
     }
 
     #[test]

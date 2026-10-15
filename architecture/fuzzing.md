@@ -52,6 +52,8 @@ the payload, so every target shares one seed corpus.
 | `decompress` | Raw bytes: no panic; anything mzstd accepts, `ZSTD_decompressStream` accepts with the same output; `decompress_to_slice` agrees with `decompress`. |
 | `decode_streaming` | Two piece sizes, then a frame: a session agrees with one-shot decoding and never over-reports progress. |
 | `decode_roundtrip` | Parameter header: frames the reference writes with that configuration decode to the payload, one-shot and in pieces. |
+| `decode_dictionary` | Two-byte dictionary length, a content-type byte (`% 3`: auto, raw, Zstandard), the dictionary, then frames: mzstd accepts the dictionary exactly when `ZSTD_DCtx_loadDictionary_advanced` does; whatever frames it then decodes, `ZSTD_decompressDCtx` with that dictionary decodes to the same output; `decompress_with_dictionary_to_slice` and a session fed pieces agree with one-shot decoding. |
+| `compress_dictionary` | A parameter header, then a two-byte dictionary length, a byte for the content type (`% 3`) and the session's chunk size (`/ 3`), the dictionary and the payload: the dictionary is accepted exactly when the reference accepts it after `ZSTD_CCtx_loadDictionary_advanced`; `compress_with_dictionary` equals `ZSTD_compress2` and a session fed chunks equals `ZSTD_compressStream2`; frames decode with both decoders. |
 
 Decoder targets cap output at 16 MiB, so a few run-length blocks cannot
 exhaust memory. The decoder rejects some inputs the reference accepts (see
@@ -68,10 +70,20 @@ dependencies never enable it.
 `tests/golden-compression` payloads and `lib/zstd.h`, each behind twelve
 parameter headers, and `seeds/frames` from the golden decompression
 fixtures. Campaigns use `seeds/frames` for `decompress`, the committed
-regressions for `decode_streaming`, and `seeds/params` for every other
-target. Seeds and findings are local artifacts and are gitignored. The
-committed `regressions/<target>/` hold boundary inputs (empty, truncated
-header, all-ones header, every override) and minimized findings.
+regressions for `decode_streaming`, `decode_dictionary` and
+`compress_dictionary`, and
+`seeds/params` for every other target. Seeds and findings are local
+artifacts and are gitignored. The committed `regressions/<target>/` hold
+boundary inputs (empty, truncated header, all-ones header, every override)
+and minimized findings. `regressions/decode_dictionary/` holds frames the
+reference wrote with a small trained dictionary and with raw text, the
+trained bytes read as raw content, a frame without a dictionary ID, and the
+rejections: a truncated dictionary, a zero repeat offset and the wrong
+dictionary ID. `regressions/compress_dictionary/` holds payloads with a
+trained dictionary at several levels (also read as raw content, and with a
+12-bit window at level 22), with raw text, an empty dictionary (which must
+behave as none; this seed caught the first encoder mismatch) and the
+rejections: raw bytes as the Zstandard format and a truncated dictionary.
 
 ## Campaigns
 
@@ -90,7 +102,22 @@ call after a frame ending exactly at a full output buffer as "truncated".
 It now records only calls that made progress, and
 `zstd-ffi/tests/oracle_stream_boundary.rs` covers both outcomes.
 
+A 10-minute run of `decode_dictionary` from its committed regressions
+(2026-10-15) found no crashes or hangs: 952 new corpus items, 40% map
+coverage.
+
 ## Known gaps
 
 - No target drives the `std::io` adapters or owned sessions with fuzzed
   input; the integration tests cover them.
+
+The first 10-minute run of `compress_dictionary` (2026-10-15) found two
+classes of crash, both kept as regressions: an empty dictionary with the
+Zstandard content type, which the reference treats as no dictionary (fixed),
+and frames at levels 16-22 with a dictionary whose literal and match length
+tables omit their last symbols, where the reference reads uninitialized
+memory and is not reproducible itself
+([dictionaries](dictionaries.md#known-gaps)); the target now checks byte
+identity only for dictionaries with complete length tables. A second
+10-minute run of `compress_dictionary` and `decode_dictionary` found no
+crashes or hangs (2093 and 922 new corpus items).

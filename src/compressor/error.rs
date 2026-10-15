@@ -52,6 +52,15 @@ pub enum EncodeError {
     /// An internal invariant of the encoder failed.
     #[error("internal encoder failure")]
     Internal,
+    /// The dictionary was prepared for a configuration other than the
+    /// compressor's (frame options aside).
+    ///
+    /// Prepare it with [`DictionaryBuilder::with_config`] for the
+    /// compressor's [`config`](crate::Compressor::config).
+    ///
+    /// [`DictionaryBuilder::with_config`]: crate::dictionary::DictionaryBuilder::with_config
+    #[error("the dictionary was prepared for a different encoder configuration")]
+    DictionaryMismatch,
 }
 
 impl EncodeError {

@@ -1,8 +1,9 @@
 # Encoder core
 
 `compressor::core` is a port of zstd 1.5.7's `lib/compress` restricted to
-what mzstd exposes: no dictionaries, no multithreading, no external sequence
-producers. Its one obligation is byte identity: for the same parameters,
+what mzstd exposes: no multithreading, no external sequence producers.
+Dictionaries (`cdict`, the dictMatchState finders and the window's
+dictionary segment) are described in [dictionaries](dictionaries.md). Its one obligation is byte identity: for the same parameters,
 input and call sequence it writes the bytes the reference writes. Every
 function names its C counterpart in its doc comment, and control flow follows
 the C code closely, including heuristics that look arbitrary, because any
@@ -15,7 +16,9 @@ graph TD
     Mod["core::mod: compress_once_into, compress_once_uninit, compress_once_append"] --> Cctx[cctx: Engine, params, frame chunks]
     Stream[stream: ZSTD_compressStream2] --> Cctx
     Stream --> Output
-    Cctx --> Params[params: levels, bounds, adjust, resolve]
+    Cctx --> Params[params: levels, bounds, adjust, resolve, CParamMode]
+    Cctx --> CDict["cdict: CDict, insert_dictionary, load_dictionary_content"]
+    CDict --> Read["entropy::read: FSE_readNCount, HUF_readCTable"]
     Cctx --> Window[window: Segment, Addr, WindowState]
     Cctx --> Block[block: buildSeqStore, entropy, block emit]
     Cctx --> Output["output: fixed slice, incrementally initialized Vec or zeroed-ahead uninit memory"]
@@ -207,9 +210,11 @@ sequenceDiagram
 ```
 
 - `block::select_block_compressor` is `ZSTD_selectBlockCompressor`: the
-  strategy, whether the row finder is in use, and whether the window has an
-  extDict pick one function pointer, chosen once per block outside the
-  finder's inner loop.
+  strategy, whether the row finder is in use, and the dictionary mode
+  (`DictMode`: noDict, extDict, or dictMatchState while a dictionary is
+  attached; `ZSTD_matchState_dictMode`) pick one function pointer, chosen
+  once per block outside the finder's inner loop. Before each block
+  `check_dict_validity` and `enforce_max_dist` may detach the dictionary.
 - `seq_store` holds sequences in the reference's `SeqDef` form (offBase, a
   16-bit literal length and match length with one "long length" escape).
   `fill_codes(backend)` is one pass, dispatched once per block, that turns
@@ -241,8 +246,9 @@ sequenceDiagram
     `min(pos, end)` and leave `pos` unclamped; `close` reports "does not
     fit" when `pos` passed `end`, the reference's clamp result, while the
     store needs no bounds check.
-  - `huf` packs each code with its length (`HUF_CElt`, built per call for
-    the symbols the table describes) and encodes with the reference's
+  - `huf` packs each code with its length (`HUF_CElt`, built per call,
+    branch-free over the whole alphabet in the backend's feature context;
+    symbols the table does not describe pack to values never read) and encodes with the reference's
     two-container, unrolled loop, whose shape depends on the table log and
     on whether the destination holds the tight bound; every shape writes
     the bits the one-symbol-at-a-time writer writes (tested against it).
@@ -318,13 +324,30 @@ minimum match length, and the extDict variants.
 
 ## Match finders
 
-| Strategy | Finder | Tables | extDict variant |
-| --- | --- | --- | --- |
-| fast | `fast` | hash | yes |
-| dfast | `double_fast` | long hash, short hash | yes |
-| greedy, lazy, lazy2 | `lazy` hash chain, or row finder for windows above 16 KiB | hash, chain or tag rows | yes |
-| btlazy2 | `lazy` with the DUBT binary tree | hash, tree | yes |
-| btopt, btultra, btultra2 | `opt` with the binary tree and price model | hash, tree, hash3, opt arrays | yes |
+| Strategy | Finder | Tables | extDict variant | dictMatchState variant |
+| --- | --- | --- | --- | --- |
+| fast | `fast` | hash | yes | `compress_block_dict_match_state` (tagged dictionary table) |
+| dfast | `double_fast` | long hash, short hash | yes | `compress_block_dict_match_state` (tagged dictionary tables) |
+| greedy, lazy, lazy2 | `lazy` hash chain, or row finder for windows above 16 KiB | hash, chain or tag rows | yes | `greedy_dms` .. `lazy2_row_dms` |
+| btlazy2 | `lazy` with the DUBT binary tree | hash, tree | yes | `btlazy2_dms` (dictionary tree sorted by `ZSTD_updateTree`) |
+| btopt, btultra, btultra2 | `opt` with the binary tree and price model | hash, tree, hash3, opt arrays | yes | `btopt_dms`, `btultra_dms` (also btultra2's) |
+
+The dictMatchState variants run while a dictionary is attached
+([dictionaries](dictionaries.md)): the block's own tables are searched as in
+the noDict variant, then the dictionary's tables, read in place through
+`BlockInput::dms` and translated to window indices by `dictIndexDelta`.
+Each is a separate monomorphization (fast and dfast as separate kernels,
+`lazy_dms_generic` and the optimal parser's `DMS` const parameter), so the
+noDict and extDict code is unchanged; a dms entry reached without a
+dictionary falls back to the noDict compressor. Ported details that differ
+from the noDict kernels: fast's step starts at `targetLength + !targetLength`
+and grows every 256 bytes, a dictionary candidate is tried when the
+context's index is at or below the prefix start, dfast tries the
+dictionary's short table when its short candidate is not strictly inside
+the prefix, the dictionary's tagged tables are hashed with the context's
+minimum match and the dictionary's hash log plus 8, and the lazy parser's
+repeat-offset checks may read the dictionary (`ZSTD_index_overlap_check`)
+without the saved-offset rotation.
 
 `fast` and `dfast` are ported loop for loop but specialized the way the
 reference's templates are:
@@ -514,6 +537,31 @@ flowchart TD
     J --> L[ml, offset]
     K --> L
 ```
+
+With an attached dictionary, `lazy_dms_generic` drives the same searches
+through `Search::find_dms`, which spends the attempts the context's search
+left on the dictionary's tables:
+
+```mermaid
+sequenceDiagram
+    participant P as lazy_dms_generic::<S, M, DEPTH>
+    participant F as M::find_dms
+    participant C as context search (hc / row / DUBT)
+    participant D as DictCtx (dictionary tables, index_delta)
+    P->>P: repeat offsets, reading the dictionary below the prefix
+    P->>F: ip
+    F->>C: search the block's own tables
+    C-->>F: best match, attempts left
+    F->>D: hash chain / row (unsalted, dictionary row bits) / ZSTD_DUBT_findBetterDictMatch
+    D-->>F: better match with the remaining budget
+    F-->>P: length, offset
+```
+
+`DictCtx` is built once per block from `BlockInput::dms`: the dictionary's
+tables (row tables through `aligned_range`), its bytes, bounds and
+`index_delta`. btlazy2 stops searching the dictionary when the context's
+walk reached the block end (the reference zeroes `nbCompares`); the other
+searches always continue into it.
 
 Every backend in `Backend::available()`, including the scalar fallback that
 unit tests add, must produce the reference's bytes. `lazy::tests` checks

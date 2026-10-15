@@ -28,8 +28,9 @@ graph TD
 | --- | --- |
 | `config` | `Level`, `Strategy`, `CompressionParams`, `LdmParams`, `LongDistanceMatching`, `EncoderConfig`, `Parameter`, `ConfigError`, `SizeOverflow`, and validation against the reference's bounds. |
 | `internal` | `requested_params`: the single translation from `EncoderConfig` to the core's `RequestedParams` (the reference's `ZSTD_CCtx_params`). |
-| `encoder` | `Compressor`, `CompressorBuilder` (`with_retention`, `with_backend`), one-shot calls, `start`/`into_session`, retention. The backend (default: the detected SIMD level) is stored in the `Engine` for the match finders. |
-| `session` | `EncoderSession`, `EncoderSessionOwned`, `StreamConfig`, `InputSize`, `Operation`, `EncoderStatus`, `Progress`. |
+| `dictionary` | `DictionaryBuilder`, `PreparedDictionary` (re-exported from `mzstd::dictionary`); see [dictionaries](dictionaries.md). |
+| `encoder` | `Compressor`, `CompressorBuilder` (`with_retention`, `with_backend`), one-shot calls (with and without a dictionary), `start`/`into_session` and their `_with_dictionary` forms, retention. The backend (default: the detected SIMD level) is stored in the `Engine` for the match finders. |
+| `session` | `EncoderSession` (optionally borrowing a dictionary), `EncoderSessionOwned<D = PreparedDictionary>` (optionally owning one; `into_parts`), `StreamConfig`, `InputSize`, `Operation`, `EncoderStatus`, `Progress`. |
 | `error` | `EncodeError` and the mapping from the core's private `CoreError`. |
 | `io` | `EncoderReader`, `EncoderWriter`, `EncoderReaderParts` (re-exported from `mzstd::io`). `EncoderReader::into_parts` returns the source with the bytes read from it that the session had not accepted; `ParallelEncoderReader::into_parts` returns the same type. |
 | `parallel` | See [parallel compression](parallel-compression.md). |
@@ -207,6 +208,7 @@ flowchart LR
     Encode -->|OutputTooSmall| Caller
     Encode -->|InputSizeMismatch| Caller
     Encode -->|InvalidState| Caller
+    Encode -->|DictionaryMismatch| Caller
     Encode -->|Internal| Caller
 ```
 
@@ -214,7 +216,9 @@ flowchart LR
 `EncodeError::Internal` stands for a core failure that valid input cannot
 produce; it exists so such a bug is an error rather than a panic.
 `EncodeError::Bound` reports a `compressBound` overflow for inputs near
-`usize::MAX`.
+`usize::MAX`. `EncodeError::DictionaryMismatch` reports a dictionary
+prepared for another configuration (frame options aside); it is checked
+before the engine is touched.
 
 ## Retention
 
@@ -227,7 +231,7 @@ changes output: a reused engine's frames equal a fresh one's (checked by
 
 ## Known gaps
 
-- No dictionaries, no `targetCBlockSize`, no magicless frames, no external
+- No `targetCBlockSize`, no magicless frames, no external
   sequence producers, and no explicit `ZSTD_c_useRowMatchFinder`,
   `ZSTD_c_blockSplitterLevel` or `ZSTD_c_maxBlockSize` control in the public
   API; the core models them only at their automatic values.

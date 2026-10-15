@@ -1,4 +1,8 @@
+use ::core::fmt;
+
 use thiserror::Error;
+
+use crate::dictionary::DictionaryId;
 
 /// An invalid decoder policy value.
 ///
@@ -133,11 +137,50 @@ pub enum DecodeError {
         /// Bytes regenerated, or a lower bound once it exceeds `declared`.
         decoded: u64,
     },
-    /// The frame needs a dictionary, which this decoder does not support.
-    #[error("frame requires dictionary {id}, and dictionaries are not supported")]
+    /// The frame names a dictionary, and the operation has none.
+    ///
+    /// Decode such frames with the dictionary they were compressed with,
+    /// through the `*_with_dictionary` methods of
+    /// [`Decompressor`](super::Decompressor).
+    #[error("frame requires dictionary {id}, and none was supplied")]
     DictionaryUnsupported {
         /// The frame's `Dictionary_ID`.
         id: u32,
+    },
+    /// The frame names a dictionary ID other than the one the operation's
+    /// dictionary declares.
+    ///
+    /// A frame that names no dictionary decodes with any dictionary. A
+    /// raw-content dictionary declares no ID, so it never matches a frame
+    /// that names one, as in the reference decoder.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DecodeDictionary;
+    /// use mzstd::{DecodeError, Decompressor};
+    /// // A frame naming dictionary 7, with an empty last raw block.
+    /// let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x21, 0x07, 0x00, 0x01, 0x00, 0x00];
+    /// let raw = DecodeDictionary::try_from(&b"raw content"[..])?;
+    /// let error = Decompressor::default()
+    ///     .decompress_with_dictionary(&raw, &frame)
+    ///     .unwrap_err();
+    /// assert!(matches!(
+    ///     error,
+    ///     DecodeError::DictionaryMismatch { expected: None, frame } if u32::from(frame) == 7
+    /// ));
+    /// assert_eq!(
+    ///     error.to_string(),
+    ///     "frame requires dictionary 7, but the dictionary declares no ID"
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[error("frame requires dictionary {frame}, but {}", Supplied(*.expected))]
+    DictionaryMismatch {
+        /// The ID the operation's dictionary declares, if any.
+        expected: Option<DictionaryId>,
+        /// The frame's `Dictionary_ID`.
+        frame: DictionaryId,
     },
     /// The frame's window exceeds the configured limit.
     #[error("frame window of {window_size} bytes exceeds the {limit}-byte limit")]
@@ -167,6 +210,19 @@ pub enum DecodeError {
     InvalidState,
 }
 
+/// Describes the dictionary an operation supplied, for
+/// [`DecodeError::DictionaryMismatch`].
+struct Supplied(Option<DictionaryId>);
+
+impl fmt::Display for Supplied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(id) => write!(formatter, "dictionary {id} was supplied"),
+            None => formatter.write_str("the dictionary declares no ID"),
+        }
+    }
+}
+
 impl From<InvalidDataKind> for DecodeError {
     fn from(kind: InvalidDataKind) -> Self {
         Self::InvalidData { kind }
@@ -185,7 +241,8 @@ impl From<DecodeError> for std::io::Error {
             | DecodeError::TrailingData { .. }
             | DecodeError::ChecksumMismatch { .. }
             | DecodeError::ContentSizeMismatch { .. }
-            | DecodeError::DictionaryUnsupported { .. } => ErrorKind::InvalidData,
+            | DecodeError::DictionaryUnsupported { .. }
+            | DecodeError::DictionaryMismatch { .. } => ErrorKind::InvalidData,
             DecodeError::UnexpectedEndOfInput => ErrorKind::UnexpectedEof,
             DecodeError::OutputTooSmall { .. } | DecodeError::InvalidState => {
                 ErrorKind::InvalidInput
@@ -235,6 +292,27 @@ mod tests {
             DecodeConfigError::WindowLog { log: 40 }.to_string(),
             "window log limit must be 10..=31, got 40"
         );
+        let frame = DictionaryId::new(7).expect("non-zero");
+        let mismatch = DecodeError::DictionaryMismatch {
+            expected: DictionaryId::new(9),
+            frame,
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "frame requires dictionary 7, but dictionary 9 was supplied"
+        );
+        let missing = DecodeError::DictionaryMismatch {
+            expected: None,
+            frame,
+        };
+        assert_eq!(
+            missing.to_string(),
+            "frame requires dictionary 7, but the dictionary declares no ID"
+        );
+        assert_eq!(
+            DecodeError::DictionaryUnsupported { id: 7 }.to_string(),
+            "frame requires dictionary 7, and none was supplied"
+        );
     }
 
     #[cfg(not(feature = "no_std"))]
@@ -266,6 +344,13 @@ mod tests {
             ),
             (
                 DecodeError::DictionaryUnsupported { id: 1 },
+                ErrorKind::InvalidData,
+            ),
+            (
+                DecodeError::DictionaryMismatch {
+                    expected: None,
+                    frame: DictionaryId::new(1).expect("non-zero"),
+                },
                 ErrorKind::InvalidData,
             ),
             (DecodeError::UnexpectedEndOfInput, ErrorKind::UnexpectedEof),

@@ -54,6 +54,8 @@ logs (one byte), `0x80` source size hint (two bytes). The rest, capped at
 | `decompress` | raw input, no header | Arbitrary bytes never panic; whatever mzstd accepts, the reference's streaming decoder accepts with the same output; `decompress_to_slice` agrees with `decompress` |
 | `decode_streaming` | 2: input and output piece sizes, then a frame | A session fed those pieces agrees with one-shot decoding, never over-reports progress, and stops only when `NeedsInput` has consumed its input |
 | `decode_roundtrip` | parameter header | Frames the reference writes with the fuzzed configuration decode to the payload, one-shot and in pieces |
+| `compress_dictionary` | parameter header, then 3: dictionary length (2), content type (`% 3`: auto, raw, Zstandard, `/ 3` the session's chunk size); then the dictionary and the payload | The dictionary is accepted exactly when the reference accepts it; `compress_with_dictionary` equals `ZSTD_compress2` and a session fed chunks equals `ZSTD_compressStream2` after `ZSTD_CCtx_loadDictionary_advanced`; frames decode with both decoders |
+| `decode_dictionary` | 3: dictionary length (2), content type (`% 3`: auto, raw, Zstandard); then the dictionary and frames | mzstd accepts the dictionary exactly when `ZSTD_DCtx_loadDictionary_advanced` does; whatever frames it decodes, the reference's one-shot decoder with that dictionary decodes to the same output; the slice and session paths agree with one-shot decoding |
 
 Decoder targets cap output at 16 MiB, so run-length blocks cannot exhaust
 memory. The decoder is stricter than the reference in documented places (see

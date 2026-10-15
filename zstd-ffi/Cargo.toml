@@ -17,6 +17,8 @@ include = [
     "vendor/zstd/lib/common/**",
     "vendor/zstd/lib/compress/**",
     "vendor/zstd/lib/decompress/**",
+    "vendor/zstd/lib/dictBuilder/**",
+    "vendor/zstd/lib/zdict.h",
     "vendor/zstd/lib/zstd.h",
     "vendor/zstd/lib/zstd_errors.h",
 ]

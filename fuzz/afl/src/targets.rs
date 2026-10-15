@@ -5,6 +5,7 @@ use std::mem::MaybeUninit;
 use mzstd::compressor::parallel::{
     ParallelCompressor, ParallelConfig, ParallelEncoderStatus, SegmentSize, TaskCount,
 };
+use mzstd::dictionary::{DecodeDictionary, DictionaryBuilder, DictionaryContent};
 use mzstd::io::FinishError;
 use mzstd::{Compressor, EncodeError, EncoderStatus, InputSize, Operation, StreamConfig};
 use zstd_ffi::oracle::{self, Directive};
@@ -390,9 +391,13 @@ fn decode_in_pieces(
     input: &[u8],
     chunk: usize,
     out_chunk: usize,
+    dictionary: Option<&DecodeDictionary>,
 ) -> Result<Vec<u8>, mzstd::DecodeError> {
     use mzstd::{DecodeOperation, DecoderStatus};
-    let mut session = decoder.start();
+    let mut session = match dictionary {
+        Some(dictionary) => decoder.start_with_dictionary(dictionary),
+        None => decoder.start(),
+    };
     let mut output = Vec::new();
     let mut buffer = vec![0u8; out_chunk.max(1)];
     let mut position = 0;
@@ -459,6 +464,7 @@ pub fn decode_streaming(data: &[u8]) {
         frame,
         usize::from(chunk),
         usize::from(out_chunk) * 7,
+        None,
     );
     match (one_shot, streamed) {
         (Ok(one_shot), Ok(streamed)) => assert_eq!(one_shot, streamed),
@@ -483,6 +489,188 @@ pub fn decode_roundtrip(data: &[u8]) {
     let mut decoder = bounded_decoder();
     assert_eq!(decoder.decompress(&frame).expect("decodes"), decoded.rest);
     let chunk = 1 + usize::from(data[0]) * 13;
-    let streamed = decode_in_pieces(&mut decoder, &frame, chunk, 1 + usize::from(data[1]) * 29);
+    let streamed = decode_in_pieces(
+        &mut decoder,
+        &frame,
+        chunk,
+        1 + usize::from(data[1]) * 29,
+        None,
+    );
     assert_eq!(streamed.expect("decodes in pieces"), decoded.rest);
+}
+
+/// Decoding with a dictionary. The input is the dictionary's length (two
+/// bytes, little-endian, capped at what follows), a content-type byte
+/// (`value % 3`: auto, raw, Zstandard format), the dictionary, and the
+/// frames.
+///
+/// mzstd accepts the dictionary exactly when
+/// `ZSTD_DCtx_loadDictionary_advanced` does. Whatever frames mzstd then
+/// accepts, the reference's one-shot decoder with the same dictionary
+/// accepts with the same output; `decompress_with_dictionary_to_slice` and
+/// a session fed pieces agree with one-shot decoding.
+pub fn decode_dictionary(data: &[u8]) {
+    let Some((&[low, high, kind], rest)) = data.split_first_chunk::<3>() else {
+        return;
+    };
+    let length = usize::from(u16::from_le_bytes([low, high])).min(rest.len());
+    let (bytes, frames) = rest.split_at(length);
+    let (content, content_type) = match kind % 3 {
+        0 => (DictionaryContent::Auto, zstd_ffi::ZSTD_dct_auto),
+        1 => (DictionaryContent::Raw, zstd_ffi::ZSTD_dct_rawContent),
+        _ => (DictionaryContent::Zstd, zstd_ffi::ZSTD_dct_fullDict),
+    };
+    let reference = oracle::Dictionary {
+        bytes: bytes.to_vec(),
+        content_type,
+    };
+    let theirs = oracle::load_decoder_dictionary(&reference);
+    let ours = DecodeDictionary::new(bytes, content);
+    assert_eq!(ours.is_ok(), theirs.is_ok(), "{ours:?} vs {theirs:?}");
+    let Ok(dictionary) = ours else {
+        return;
+    };
+    let mut decoder = bounded_decoder();
+    let one_shot = decoder.decompress_with_dictionary(&dictionary, frames);
+    let mut slice = vec![0u8; frames.len().saturating_mul(4).min(1 << 16)];
+    let sliced = decoder.decompress_with_dictionary_to_slice(&dictionary, frames, &mut slice);
+    match (&one_shot, &sliced) {
+        (Ok(output), Ok(written)) => assert_eq!(&slice[..*written], &output[..]),
+        (Ok(output), Err(mzstd::DecodeError::OutputTooSmall { .. })) => {
+            assert!(output.len() > slice.len());
+            assert_eq!(slice, output[..slice.len()]);
+        }
+        (Ok(_), Err(error)) => panic!("one-shot accepted, slice failed with {error:?}"),
+        (Err(_), _) => {}
+    }
+    let chunk = 1 + usize::from(kind / 3) * 17;
+    let streamed = decode_in_pieces(
+        &mut decoder,
+        frames,
+        chunk,
+        1 + usize::from(low) * 13,
+        Some(&dictionary),
+    );
+    match (&one_shot, &streamed) {
+        (Ok(one_shot), Ok(streamed)) => assert_eq!(one_shot, streamed),
+        (Err(_), Err(_)) => {}
+        (one_shot, streamed) => panic!("one-shot {one_shot:?}, streamed {streamed:?}"),
+    }
+    if let Ok(output) = one_shot
+        && !frames.is_empty()
+    {
+        let restored = oracle::decompress_with_dictionary(frames, output.len(), &reference)
+            .unwrap_or_else(|error| panic!("accepted what the reference rejects: {error}"));
+        assert_eq!(output, restored);
+    }
+}
+
+/// Compression with a dictionary is byte-identical to the reference after
+/// `ZSTD_CCtx_loadDictionary_advanced`: one-shot against `ZSTD_compress2`,
+/// a session fed pieces against `ZSTD_compressStream2` fed the same pieces;
+/// the dictionary is accepted exactly when the reference accepts it, and
+/// frames decode with both decoders.
+pub fn compress_dictionary(data: &[u8]) {
+    let Some(decoded) = decode_config(data) else {
+        return;
+    };
+    let Some((&[low, high, kind], rest)) = decoded.rest.split_first_chunk::<3>() else {
+        return;
+    };
+    let length = usize::from(u16::from_le_bytes([low, high])).min(rest.len());
+    let (bytes, input) = rest.split_at(length);
+    let (content, content_type) = match kind % 3 {
+        0 => (DictionaryContent::Auto, zstd_ffi::ZSTD_dct_auto),
+        1 => (DictionaryContent::Raw, zstd_ffi::ZSTD_dct_rawContent),
+        _ => (DictionaryContent::Zstd, zstd_ffi::ZSTD_dct_fullDict),
+    };
+    let reference = oracle::Dictionary {
+        bytes: bytes.to_vec(),
+        content_type,
+    };
+    let params = decoded.params.with_dictionary(reference.clone());
+    let theirs = oracle::compress2(input, &params);
+    let ours = DictionaryBuilder::new(bytes)
+        .with_content(content)
+        .with_config(decoded.config)
+        .build();
+    let (dictionary, expected) = match (ours, theirs) {
+        (Ok(dictionary), Ok(expected)) => (dictionary, expected),
+        (Err(_), Err(_)) => return,
+        (ours, theirs) => panic!("{ours:?} vs {theirs:?}"),
+    };
+    let mut encoder = Compressor::new(decoded.config).expect("valid configuration");
+    let frame = encoder
+        .compress_with_dictionary(&dictionary, input)
+        .expect("compression");
+    // The optimal parser seeds its first block from the dictionary's
+    // sequence tables, and the reference reads every literal and match
+    // length symbol's cost from them: past a table's last symbol it reads
+    // uninitialized memory, so its frames are not reproducible then.
+    let deterministic = content == DictionaryContent::Raw || covers_every_length(bytes);
+    if deterministic {
+        assert_eq!(frame, expected, "{:?}", decoded.config);
+    }
+
+    let chunk = 1 + usize::from(kind / 3) * 97;
+    let steps: Vec<(&[u8], Directive)> = input
+        .chunks(chunk)
+        .map(|piece| (piece, Directive::Continue))
+        .collect();
+    let streamed_expected = oracle::compress_stream(&params, &steps).expect("reference stream");
+    let mut session = encoder
+        .start_with_dictionary(&dictionary, StreamConfig::default())
+        .expect("starts");
+    let mut streamed = Vec::new();
+    let mut buffer = vec![0u8; 1 << 17];
+    for piece in input.chunks(chunk) {
+        let mut piece = piece;
+        while !piece.is_empty() {
+            let progress = session
+                .process(piece, &mut buffer, Operation::Continue)
+                .expect("streaming");
+            piece = &piece[progress.consumed..];
+            streamed.extend_from_slice(&buffer[..progress.produced]);
+        }
+    }
+    loop {
+        let progress = session.finish(&mut buffer).expect("ending");
+        streamed.extend_from_slice(&buffer[..progress.produced]);
+        if progress.status == EncoderStatus::Finished {
+            break;
+        }
+    }
+    if deterministic {
+        assert_eq!(streamed, streamed_expected);
+    }
+
+    let restored = oracle::decompress_with_dictionary(&frame, input.len(), &reference)
+        .expect("reference decoding");
+    assert_eq!(restored, input);
+    let ours = bounded_decoder()
+        .decompress_with_dictionary(&dictionary, &frame)
+        .expect("decoding");
+    assert_eq!(ours, input);
+}
+
+/// Whether a Zstandard-format dictionary's literal and match length tables
+/// describe every symbol (true for anything that is not that format).
+fn covers_every_length(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.get(8..) else {
+        return true;
+    };
+    if bytes[..4] != zstd_ffi::ZSTD_MAGIC_DICTIONARY.to_le_bytes() {
+        return true;
+    }
+    let lengths = || -> Option<bool> {
+        let huffman = oracle::huf_read_ctable(rest).ok()?;
+        let rest = rest.get(huffman.size..)?;
+        let offsets = oracle::fse_read_ncount(rest, 31).ok()?;
+        let rest = rest.get(offsets.size..)?;
+        let matches = oracle::fse_read_ncount(rest, 52).ok()?;
+        let rest = rest.get(matches.size..)?;
+        let literals = oracle::fse_read_ncount(rest, 35).ok()?;
+        Some(matches.max_symbol == 52 && literals.max_symbol == 35)
+    };
+    lengths().unwrap_or(true)
 }

@@ -93,3 +93,16 @@ fn decode_streaming() {
 fn decode_roundtrip() {
     replay("decode_roundtrip", mzstd_afl::targets::decode_roundtrip);
 }
+
+#[test]
+fn decode_dictionary() {
+    replay("decode_dictionary", mzstd_afl::targets::decode_dictionary);
+}
+
+#[test]
+fn compress_dictionary() {
+    replay(
+        "compress_dictionary",
+        mzstd_afl::targets::compress_dictionary,
+    );
+}

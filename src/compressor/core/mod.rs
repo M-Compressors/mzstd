@@ -2,6 +2,9 @@
 
 pub(crate) mod block;
 pub(crate) mod cctx;
+pub(crate) mod cdict;
+#[cfg(test)]
+mod dict_tests;
 pub(crate) mod double_fast;
 pub(crate) mod entropy;
 pub(crate) mod error;
@@ -27,16 +30,48 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 
 use cctx::{Engine, RequestedParams};
+use cdict::CDict;
 use error::CoreError;
 use window::{Addr, Segment, Segments};
+
+/// Begins a frame of `pledged` bytes with the dictionary `segments` carry,
+/// if any (`ZSTD_CCtx_init_compressStream2` through
+/// `ZSTD_compressBegin_internal`).
+#[inline(always)]
+pub(crate) fn begin_frame(
+    engine: &mut Engine,
+    requested: &RequestedParams,
+    pledged: u64,
+    segments: &Segments<'_>,
+) -> Result<(), CoreError> {
+    // An empty dictionary is no dictionary (`ZSTD_CCtx_loadDictionary`
+    // with a size of zero clears it).
+    match segments.cdict.filter(|cdict| cdict.content_size() > 0) {
+        None => {
+            engine.begin(requested.resolve(pledged), pledged);
+            Ok(())
+        }
+        Some(cdict) => {
+            let pref = requested.attach_dict_pref;
+            let applied = requested.resolve_for(
+                pledged,
+                cdict.content_size(),
+                cdict.cparam_mode(pref, pledged),
+            );
+            engine.begin_with_dict(applied, pledged, cdict, pref, segments)
+        }
+    }
+}
 
 /// Compresses `input` as one frame into `dst` the way `ZSTD_compress2`
 /// does: the whole input is known up front and read in place, and `dst` is
 /// the reference's destination with its exact capacity.
 #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
+#[inline]
 pub(crate) fn compress_once_into(
     engine: &mut Engine,
     requested: &RequestedParams,
+    dict: Option<&CDict>,
     input: &[u8],
     input_id: u64,
     dst: &mut [u8],
@@ -44,6 +79,7 @@ pub(crate) fn compress_once_into(
     compress_once_to(
         engine,
         requested,
+        dict,
         input,
         input_id,
         &mut output::SliceOutput(dst),
@@ -55,6 +91,7 @@ pub(crate) fn compress_once_into(
 pub(crate) fn compress_once_uninit(
     engine: &mut Engine,
     requested: &RequestedParams,
+    dict: Option<&CDict>,
     input: &[u8],
     input_id: u64,
     dst: &mut [MaybeUninit<u8>],
@@ -62,26 +99,25 @@ pub(crate) fn compress_once_uninit(
     compress_once_to(
         engine,
         requested,
+        dict,
         input,
         input_id,
         &mut output::UninitOutput::from(dst),
     )
 }
 
+#[inline(always)]
 fn compress_once_to<O: output::Output>(
     engine: &mut Engine,
     requested: &RequestedParams,
+    dict: Option<&CDict>,
     input: &[u8],
     input_id: u64,
     dst: &mut O,
 ) -> Result<usize, CoreError> {
     let pledged = input.len() as u64;
-    let applied = requested.resolve(pledged);
-    engine.begin(applied, pledged);
-    let segments = Segments {
-        buffer: &[],
-        input: (input, input_id),
-    };
+    let segments = Segments::input(input, input_id, dict);
+    begin_frame(engine, requested, pledged, &segments)?;
     let src = Addr::new(Segment::Input(input_id), 0);
     engine.compress_end_to(&segments, dst, src, input.len())
 }
@@ -90,6 +126,7 @@ fn compress_once_to<O: output::Output>(
 pub(crate) fn compress_once_append(
     engine: &mut Engine,
     requested: &RequestedParams,
+    dict: Option<&CDict>,
     input: &[u8],
     input_id: u64,
     dst: &mut Vec<u8>,
@@ -99,11 +136,8 @@ pub(crate) fn compress_once_append(
     let limit = start.checked_add(bound).ok_or(CoreError::DstSizeTooSmall)?;
     dst.reserve(bound);
     let pledged = input.len() as u64;
-    engine.begin(requested.resolve(pledged), pledged);
-    let segments = Segments {
-        buffer: &[],
-        input: (input, input_id),
-    };
+    let segments = Segments::input(input, input_id, dict);
+    begin_frame(engine, requested, pledged, &segments)?;
     let src = Addr::new(Segment::Input(input_id), 0);
     engine.compress_end_to(
         &segments,
@@ -127,7 +161,7 @@ pub(crate) fn compress_once(
 ) -> Result<Vec<u8>, CoreError> {
     let capacity = cctx::compress_bound(input.len()).ok_or(CoreError::SrcSizeWrong)?;
     let mut dst = vec![0u8; capacity];
-    let size = compress_once_into(engine, requested, input, input_id, &mut dst)?;
+    let size = compress_once_into(engine, requested, None, input, input_id, &mut dst)?;
     dst.truncate(size);
     Ok(dst)
 }
@@ -208,7 +242,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod advanced_tests {
+pub(crate) mod advanced_tests {
     use super::cctx::{FrameParams, LdmParams, RequestedParams};
     use super::params::{CParamOverrides, ParamSwitch, Strategy};
     use super::*;
@@ -395,6 +429,7 @@ mod advanced_tests {
             let appended_result = compress_once_append(
                 &mut append_engine,
                 &requested,
+                None,
                 input,
                 case as u64,
                 &mut appended,
@@ -449,7 +484,7 @@ mod stream_tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut chunk[..], &data[in_pos..], op)
+                    .compress(engine, requested, None, &mut chunk[..], &data[in_pos..], op)
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&chunk[..step.produced]);
@@ -677,7 +712,7 @@ mod stream_tests {
             let mut in_pos = 0;
             loop {
                 let step = state
-                    .compress(engine, requested, &mut chunk[..], &data[in_pos..], op)
+                    .compress(engine, requested, None, &mut chunk[..], &data[in_pos..], op)
                     .expect("stream");
                 in_pos += step.consumed;
                 out.extend_from_slice(&chunk[..step.produced]);

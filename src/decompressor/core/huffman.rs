@@ -485,7 +485,7 @@ impl HuffmanTable {
     }
 
     /// Decodes `out.len()` literals from one stream or four streams, with
-    /// `simd`'s target features.
+    /// `simd`'s target features. The pair rows are built on first use.
     #[fearless_simd_macros::simd]
     pub(crate) fn decode_streams<S: fearless_simd::Simd>(
         &mut self,
@@ -494,84 +494,154 @@ impl HuffmanTable {
         out: &mut [u8],
         four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
-        if !four_streams {
-            return self.decode_stream(src, out);
-        }
-        let pairs = prefers_pairs(out.len(), src.len());
-        self.decode_four(src, out, pairs)
+        decode_with(self, src, out, four_streams)
     }
 
-    /// Decodes four streams after their jump table, with the pair rows in
-    /// the fast loops when `pairs` is set.
-    #[inline(always)]
-    fn decode_four(
-        &mut self,
+    /// Decodes literals as [`Self::decode_streams`] with a table that may
+    /// not be modified, a dictionary's: its pair rows are used when
+    /// [`Self::build_shared`] built them, and are never built here.
+    #[fearless_simd_macros::simd]
+    pub(crate) fn decode_streams_shared<S: fearless_simd::Simd>(
+        &self,
+        simd: S,
         src: &[u8],
         out: &mut [u8],
-        pairs: bool,
+        four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
-        let invalid = InvalidDataKind::HuffmanStream;
-        let (jump, streams) = src.split_first_chunk::<6>().ok_or(invalid)?;
-        if streams.len() < 4 || out.len() < 6 {
-            return Err(invalid);
-        }
-        let size = |at: usize| usize::from(u16::from_le_bytes([jump[at], jump[at + 1]]));
-        let second = size(0);
-        let third = second + size(2);
-        let fourth = third + size(4);
-        if fourth > streams.len() {
-            return Err(invalid);
-        }
-        let segment = out.len().div_ceil(4);
-        if 3 * segment > out.len() {
-            return Err(invalid);
-        }
-        let starts = [0, second, third, fourth, streams.len()];
-        let segments = [0, segment, 2 * segment, 3 * segment, out.len()];
-        let stream = |index: usize| &streams[starts[index]..starts[index + 1]];
-        let open = |index: usize| BitContainer::new(stream(index)).ok_or(invalid);
-        let mut bits = [open(0)?, open(1)?, open(2)?, open(3)?];
-
-        // The fast loops need every stream to refill a whole word.
-        let mut done = [0usize; 4];
-        if bits.iter().all(BitContainer::can_reload_fast) {
-            let mut sentinels: [Sentinel; 4] = ::core::array::from_fn(|index| {
-                bits[index].reload_fast(stream(index));
-                Sentinel::from_container(bits[index], streams, starts[index])
-            });
-            let mut four = FourStreams {
-                src: streams,
-                starts,
-                out: &mut *out,
-                segments,
-            };
-            done = if pairs {
-                if !self.pairs_valid {
-                    self.build_pairs();
-                }
-                match self.pairs.as_deref() {
-                    Some(pairs) => pair_rounds::<4>(pairs, &mut four, &mut sentinels),
-                    None => [0; 4],
-                }
-            } else {
-                let decoded = if self.log <= 11 {
-                    single_rounds::<5>(&self.rows, &mut four, &mut sentinels)
-                } else {
-                    single_rounds::<4>(&self.rows, &mut four, &mut sentinels)
-                };
-                [decoded; 4]
-            };
-            for ((container, sentinel), &start) in bits.iter_mut().zip(sentinels).zip(&starts) {
-                *container = sentinel.into_container(streams, start);
-            }
-        }
-        let rows = &*self.rows;
-        for (index, (container, decoded)) in bits.into_iter().zip(done).enumerate() {
-            let output = &mut out[segments[index] + decoded..segments[index + 1]];
-            decode_tail(rows, container, stream(index), output)?;
-        }
-        Ok(())
+        decode_with(self, src, out, four_streams)
     }
+
+    /// Builds the pair rows ahead of time, for a table that is then shared.
+    pub(crate) fn build_shared(&mut self) {
+        self.build_pairs();
+    }
+}
+
+/// A table's rows as one decode reaches them: a table the decoder owns
+/// builds its pair rows on first use, a shared one only offers rows built
+/// before it was shared. Both decode the same symbols.
+trait TableAccess {
+    /// The table.
+    fn table(&self) -> &HuffmanTable;
+
+    /// The pair rows of the current tree, if available.
+    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]>;
+}
+
+impl TableAccess for &mut HuffmanTable {
+    #[inline(always)]
+    fn table(&self) -> &HuffmanTable {
+        self
+    }
+
+    #[inline(always)]
+    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]> {
+        if !self.pairs_valid {
+            self.build_pairs();
+        }
+        self.pairs.as_deref()
+    }
+}
+
+impl TableAccess for &HuffmanTable {
+    #[inline(always)]
+    fn table(&self) -> &HuffmanTable {
+        self
+    }
+
+    #[inline(always)]
+    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]> {
+        if self.pairs_valid {
+            self.pairs.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+/// Decodes `out.len()` literals from one stream or four streams.
+#[inline(always)]
+fn decode_with<T: TableAccess>(
+    table: T,
+    src: &[u8],
+    out: &mut [u8],
+    four_streams: bool,
+) -> Result<(), InvalidDataKind> {
+    if !four_streams {
+        return table.table().decode_stream(src, out);
+    }
+    let pairs = prefers_pairs(out.len(), src.len());
+    decode_four(table, src, out, pairs)
+}
+
+/// Decodes four streams after their jump table, with the pair rows in the
+/// fast loops when `pairs` is set.
+#[inline(always)]
+fn decode_four<T: TableAccess>(
+    mut table: T,
+    src: &[u8],
+    out: &mut [u8],
+    pairs: bool,
+) -> Result<(), InvalidDataKind> {
+    let invalid = InvalidDataKind::HuffmanStream;
+    let (jump, streams) = src.split_first_chunk::<6>().ok_or(invalid)?;
+    if streams.len() < 4 || out.len() < 6 {
+        return Err(invalid);
+    }
+    let size = |at: usize| usize::from(u16::from_le_bytes([jump[at], jump[at + 1]]));
+    let second = size(0);
+    let third = second + size(2);
+    let fourth = third + size(4);
+    if fourth > streams.len() {
+        return Err(invalid);
+    }
+    let segment = out.len().div_ceil(4);
+    if 3 * segment > out.len() {
+        return Err(invalid);
+    }
+    let starts = [0, second, third, fourth, streams.len()];
+    let segments = [0, segment, 2 * segment, 3 * segment, out.len()];
+    let stream = |index: usize| &streams[starts[index]..starts[index + 1]];
+    let open = |index: usize| BitContainer::new(stream(index)).ok_or(invalid);
+    let mut bits = [open(0)?, open(1)?, open(2)?, open(3)?];
+
+    // The fast loops need every stream to refill a whole word.
+    let mut done = [0usize; 4];
+    if bits.iter().all(BitContainer::can_reload_fast) {
+        let mut sentinels: [Sentinel; 4] = ::core::array::from_fn(|index| {
+            bits[index].reload_fast(stream(index));
+            Sentinel::from_container(bits[index], streams, starts[index])
+        });
+        let mut four = FourStreams {
+            src: streams,
+            starts,
+            out: &mut *out,
+            segments,
+        };
+        done = if pairs {
+            match table.pairs() {
+                Some(pairs) => pair_rounds::<4>(pairs, &mut four, &mut sentinels),
+                None => [0; 4],
+            }
+        } else {
+            let single = table.table();
+            let decoded = if single.log <= 11 {
+                single_rounds::<5>(&single.rows, &mut four, &mut sentinels)
+            } else {
+                single_rounds::<4>(&single.rows, &mut four, &mut sentinels)
+            };
+            [decoded; 4]
+        };
+        for ((container, sentinel), &start) in bits.iter_mut().zip(sentinels).zip(&starts) {
+            *container = sentinel.into_container(streams, start);
+        }
+    }
+    let rows = &*table.table().rows;
+    for (index, (container, decoded)) in bits.into_iter().zip(done).enumerate() {
+        let output = &mut out[segments[index] + decoded..segments[index + 1]];
+        decode_tail(rows, container, stream(index), output)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -829,8 +899,33 @@ mod tests {
                 let src = encode_four(&table, &symbols);
                 for pairs in [false, true] {
                     let mut out = alloc::vec![0xee; len];
-                    table.decode_four(&src, &mut out, pairs).expect("valid");
+                    decode_four(&mut table, &src, &mut out, pairs).expect("valid");
                     assert_eq!(out, symbols, "log {} len {len} pairs {pairs}", table.log);
+                }
+                // A shared table decodes alike, with or without pair rows.
+                let mut shared = table.clone();
+                shared.pairs_valid = false;
+                for prebuilt in [false, true] {
+                    if prebuilt {
+                        shared.build_shared();
+                    }
+                    for four in [true, false] {
+                        let src = if four {
+                            src.clone()
+                        } else {
+                            encode(&table, &symbols)
+                        };
+                        let mut out = alloc::vec![0xee; len];
+                        shared
+                            .decode_streams_shared(
+                                fearless_simd::Fallback::new(),
+                                &src,
+                                &mut out,
+                                four,
+                            )
+                            .expect("valid");
+                        assert_eq!(out, symbols, "prebuilt {prebuilt} four {four}");
+                    }
                 }
                 let mut out = alloc::vec![0xee; len];
                 table
@@ -858,7 +953,7 @@ mod tests {
             for len in [symbols.len() - 1, symbols.len() + 1] {
                 let mut out = alloc::vec![0; len];
                 assert_eq!(
-                    table.decode_four(&src, &mut out, pairs),
+                    decode_four(&mut table, &src, &mut out, pairs),
                     Err(InvalidDataKind::HuffmanStream),
                     "pairs {pairs} len {len}"
                 );

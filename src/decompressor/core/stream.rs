@@ -9,11 +9,16 @@
 //! there in any pieces. [`Stream::decode_all`] parses straight from a
 //! complete slice and regenerates into the caller's vector, which serves as
 //! the history.
+//!
+//! Every entry point takes the operation's dictionary, if any, as a
+//! [`DictView`]: the decoder keeps no reference to it between calls, and
+//! each frame starts from it.
 
 use alloc::vec::Vec;
 
 use super::block::{BlockHeader, BlockKind};
 use super::copy::WILDCOPY_OVERLENGTH;
+use super::dictionary::DictView;
 use super::frame::{FrameDecoder, FrameHeader, MAGIC_SIZE, header_size};
 use super::history::History;
 use crate::Backend;
@@ -209,12 +214,14 @@ impl Stream {
         self.frame.header().map(|header| header.window_size)
     }
 
-    /// Runs one call of the incremental contract.
+    /// Runs one call of the incremental contract; every call of one
+    /// operation passes the same `dictionary`.
     pub(crate) fn process(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         operation: DecodeOperation,
+        dictionary: Option<DictView<'_>>,
     ) -> Result<DecodeProgress, DecodeFailure> {
         let failure = |error, consumed, produced| DecodeFailure {
             error,
@@ -260,7 +267,7 @@ impl Stream {
         };
         let mut remaining = offered;
         let mut produced = 0;
-        let result = self.run(&mut remaining, output, &mut produced, finish);
+        let result = self.run(&mut remaining, output, &mut produced, finish, dictionary);
         let consumed = offered.len() - remaining.len();
         self.total_in += consumed as u64;
         self.total_out += produced as u64;
@@ -292,6 +299,7 @@ impl Stream {
         output: &mut [u8],
         produced: &mut usize,
         finish: bool,
+        dictionary: Option<DictView<'_>>,
     ) -> Result<DecoderStatus, DecodeError> {
         loop {
             if self.history.pending() > 0 {
@@ -360,7 +368,8 @@ impl Stream {
                     }
                     let header = FrameHeader::parse(&self.scratch)?;
                     self.scratch.clear();
-                    self.frame.begin(header, &self.config.limits())?;
+                    self.frame
+                        .begin(header, &self.config.limits(), dictionary)?;
                     self.history.reset();
                     self.state = State::BlockHeader;
                 }
@@ -383,8 +392,8 @@ impl Stream {
                         &block,
                         &self.scratch,
                         buffer,
-                        start,
-                        0,
+                        0..start,
+                        dictionary,
                     )?;
                     self.history.commit(end);
                     self.decoded += (end - start) as u64;
@@ -428,18 +437,23 @@ impl Stream {
     /// as the history. On error `dst` may hold a partial result past its
     /// original length.
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
-    pub(crate) fn decode_all(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), DecodeError> {
+    pub(crate) fn decode_all(
+        &mut self,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+        dictionary: Option<DictView<'_>>,
+    ) -> Result<(), DecodeError> {
         let start = dst.len();
         // Frames that declare a size are cut at their end, as by
         // `decode_to_slice`, so no slack past the output is zeroed. A frame
         // that overruns its size then fails differently, so any error
         // reruns the input uncut, which defines the results.
-        if self.decode_all_with(src, dst, true).is_ok() {
+        if self.decode_all_with(src, dst, true, dictionary).is_ok() {
             return Ok(());
         }
         dst.truncate(start);
         self.reset(self.config);
-        self.decode_all_with(src, dst, false)
+        self.decode_all_with(src, dst, false, dictionary)
     }
 
     /// One pass of [`Self::decode_all`]; `cut` stops each block at its
@@ -449,6 +463,7 @@ impl Stream {
         src: &[u8],
         dst: &mut Vec<u8>,
         cut: bool,
+        dictionary: Option<DictView<'_>>,
     ) -> Result<(), DecodeError> {
         let mut out = VecOutput {
             buffer: dst,
@@ -457,7 +472,7 @@ impl Stream {
             cut,
         };
         out.filled = out.buffer.len();
-        let result = self.walk(src, &mut out);
+        let result = self.walk(src, &mut out, dictionary);
         let filled = out.filled;
         dst.truncate(filled);
         result
@@ -472,19 +487,29 @@ impl Stream {
     /// Each frame's output is cut to its declared size, so chunked copies
     /// never touch bytes past the output.
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
-    pub(crate) fn decode_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
+    pub(crate) fn decode_to_slice(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        dictionary: Option<DictView<'_>>,
+    ) -> Option<usize> {
         let mut out = SliceOutput {
             buffer: dst,
             filled: 0,
             frame_end: 0,
         };
-        self.walk(src, &mut out).ok()?;
+        self.walk(src, &mut out, dictionary).ok()?;
         Some(out.filled)
     }
 
     /// The one-shot frame grammar over complete input, writing through
-    /// `out`.
-    fn walk<O: Output>(&mut self, src: &[u8], out: &mut O) -> Result<(), DecodeError> {
+    /// `out`; every frame starts from `dictionary`.
+    fn walk<O: Output>(
+        &mut self,
+        src: &[u8],
+        out: &mut O,
+        dictionary: Option<DictView<'_>>,
+    ) -> Result<(), DecodeError> {
         let limits = self.config.limits();
         let base = out.filled();
         let (data, limit) = match limits.max_input_bytes() {
@@ -526,7 +551,7 @@ impl Stream {
                 None => DecodeError::UnexpectedEndOfInput,
             })?;
             let header = FrameHeader::parse(reader.take(header_size(descriptor))?)?;
-            self.frame.begin(header, &limits)?;
+            self.frame.begin(header, &limits, dictionary)?;
             let frame_start = out.filled();
             out.begin_frame(header.content_size, reader.data.len() - reader.position)?;
             loop {
@@ -543,8 +568,8 @@ impl Stream {
                         &block,
                         content,
                         buffer,
-                        start,
-                        frame_start,
+                        frame_start..start,
+                        dictionary,
                     )?
                 };
                 out.commit(end);
@@ -796,6 +821,7 @@ mod tests {
                     ::core::slice::from_ref(byte),
                     &mut out,
                     DecodeOperation::Process,
+                    None,
                 )
                 .expect("valid");
             assert_eq!(progress.consumed, 1);
@@ -803,7 +829,7 @@ mod tests {
             if progress.status == DecoderStatus::NeedsOutput {
                 loop {
                     let progress = stream
-                        .process(&[], &mut out, DecodeOperation::Process)
+                        .process(&[], &mut out, DecodeOperation::Process, None)
                         .expect("valid");
                     decoded.extend_from_slice(&out[..progress.produced]);
                     if progress.status != DecoderStatus::NeedsOutput {
@@ -813,7 +839,7 @@ mod tests {
             }
         }
         let progress = stream
-            .process(&[], &mut [], DecodeOperation::Finish)
+            .process(&[], &mut [], DecodeOperation::Finish, None)
             .expect("valid");
         assert_eq!(progress.status, DecoderStatus::Finished);
         assert_eq!(decoded, b"hello");
@@ -824,7 +850,7 @@ mod tests {
         assert!(stream.is_finished());
         // A finished operation reports no further progress.
         let again = stream
-            .process(&[1, 2], &mut [0; 4], DecodeOperation::Finish)
+            .process(&[1, 2], &mut [0; 4], DecodeOperation::Finish, None)
             .expect("finished");
         assert_eq!((again.consumed, again.produced), (0, 0));
     }
@@ -837,7 +863,7 @@ mod tests {
         let mut stream = stream(FrameMode::Single.into());
         let mut out = [0u8; 16];
         let progress = stream
-            .process(&input, &mut out, DecodeOperation::Process)
+            .process(&input, &mut out, DecodeOperation::Process, None)
             .expect("valid");
         assert_eq!(progress.status, DecoderStatus::Finished);
         assert_eq!(progress.consumed, input.len() - 4);
@@ -849,36 +875,36 @@ mod tests {
         let frame = hello();
         let mut stream = stream(DecoderConfig::DEFAULT);
         stream
-            .process(&frame[..4], &mut [], DecodeOperation::Finish)
+            .process(&frame[..4], &mut [], DecodeOperation::Finish, None)
             .expect_err("truncated");
         let mut stream = self::stream(DecoderConfig::DEFAULT);
         stream
-            .process(&frame[..4], &mut [], DecodeOperation::Process)
+            .process(&frame[..4], &mut [], DecodeOperation::Process, None)
             .expect("accepted");
         let progress = stream
-            .process(&frame[4..], &mut [0; 2], DecodeOperation::Finish)
+            .process(&frame[4..], &mut [0; 2], DecodeOperation::Finish, None)
             .expect("partial");
         assert_eq!(progress.status, DecoderStatus::NeedsOutput);
         let rest = &frame[4 + progress.consumed..];
         let failure = stream
-            .process(&rest[1..], &mut [0; 8], DecodeOperation::Finish)
+            .process(&rest[1..], &mut [0; 8], DecodeOperation::Finish, None)
             .expect_err("changed suffix");
         assert!(matches!(failure.error, DecodeError::InvalidState));
         let failure = stream
-            .process(rest, &mut [0; 8], DecodeOperation::Finish)
+            .process(rest, &mut [0; 8], DecodeOperation::Finish, None)
             .expect_err("failed");
         assert!(matches!(failure.error, DecodeError::InvalidState));
 
         let mut stream = self::stream(DecoderConfig::DEFAULT);
         stream
-            .process(&frame[..4], &mut [], DecodeOperation::Finish)
+            .process(&frame[..4], &mut [], DecodeOperation::Finish, None)
             .expect_err("truncated");
         let mut stream = self::stream(DecoderConfig::DEFAULT);
         stream
-            .process(&frame, &mut [0; 2], DecodeOperation::Finish)
+            .process(&frame, &mut [0; 2], DecodeOperation::Finish, None)
             .expect("partial");
         let failure = stream
-            .process(&[], &mut [0; 8], DecodeOperation::Process)
+            .process(&[], &mut [0; 8], DecodeOperation::Process, None)
             .expect_err("process after finish");
         assert!(matches!(failure.error, DecodeError::InvalidState));
     }
@@ -889,7 +915,7 @@ mod tests {
         let input_limit = DecodeLimits::default().with_max_input_bytes(Some(10));
         let mut stream = stream(input_limit.into());
         let failure = stream
-            .process(&frame, &mut [0; 8], DecodeOperation::Process)
+            .process(&frame, &mut [0; 8], DecodeOperation::Process, None)
             .expect_err("input budget");
         assert!(matches!(
             failure.error,
@@ -900,7 +926,7 @@ mod tests {
         let output_limit = DecodeLimits::default().with_max_output_bytes(Some(4));
         let mut stream = self::stream(output_limit.into());
         let failure = stream
-            .process(&frame, &mut [0; 8], DecodeOperation::Finish)
+            .process(&frame, &mut [0; 8], DecodeOperation::Finish, None)
             .expect_err("output budget");
         assert!(matches!(
             failure.error,
@@ -913,7 +939,7 @@ mod tests {
     fn streaming_rejects_bad_magic_and_oversized_skippable_frames() {
         let mut stream = stream(DecoderConfig::DEFAULT);
         let failure = stream
-            .process(b"nope", &mut [], DecodeOperation::Process)
+            .process(b"nope", &mut [], DecodeOperation::Process, None)
             .expect_err("bad magic");
         assert!(matches!(
             failure.error,
@@ -927,6 +953,7 @@ mod tests {
                 &[0x50, 0x2a, 0x4d, 0x18, 0xf8, 0xff, 0xff, 0xff],
                 &mut [],
                 DecodeOperation::Process,
+                None,
             )
             .expect_err("oversized");
         assert!(matches!(
@@ -938,15 +965,15 @@ mod tests {
         // A skippable frame alone is a complete concatenated operation.
         let mut stream = self::stream(DecoderConfig::DEFAULT);
         let progress = stream
-            .process(&SKIP[..5], &mut [], DecodeOperation::Process)
+            .process(&SKIP[..5], &mut [], DecodeOperation::Process, None)
             .expect("partial");
         assert_eq!(progress.status, DecoderStatus::NeedsInput);
         let progress = stream
-            .process(&SKIP[5..], &mut [], DecodeOperation::Process)
+            .process(&SKIP[5..], &mut [], DecodeOperation::Process, None)
             .expect("partial");
         assert_eq!(progress.status, DecoderStatus::NeedsInput);
         let progress = stream
-            .process(&[], &mut [], DecodeOperation::Finish)
+            .process(&[], &mut [], DecodeOperation::Finish, None)
             .expect("complete");
         assert_eq!(progress.status, DecoderStatus::Finished);
         assert_eq!(stream.frames_decoded(), 0);
@@ -959,36 +986,40 @@ mod tests {
         input.extend_from_slice(&SKIP);
         input.extend_from_slice(&hello());
         let mut out = b">".to_vec();
-        stream.decode_all(&input, &mut out).expect("valid");
+        stream.decode_all(&input, &mut out, None).expect("valid");
         assert_eq!(out, b">hellohello");
 
         let mut single = self::stream(FrameMode::Single.into());
         let mut out = Vec::new();
         assert!(matches!(
-            single.decode_all(&input, &mut out),
+            single.decode_all(&input, &mut out, None),
             Err(DecodeError::TrailingData { offset: 18 })
         ));
         let mut out = Vec::new();
-        single.decode_all(&hello(), &mut out).expect("valid");
+        single.decode_all(&hello(), &mut out, None).expect("valid");
         assert_eq!(out, b"hello");
 
         let mut out = Vec::new();
         assert!(matches!(
-            stream.decode_all(&[], &mut out),
+            stream.decode_all(&[], &mut out, None),
             Err(DecodeError::UnexpectedEndOfInput)
         ));
         assert!(matches!(
-            stream.decode_all(&HELLO[..4], &mut out),
+            stream.decode_all(&HELLO[..4], &mut out, None),
             Err(DecodeError::UnexpectedEndOfInput)
         ));
         assert!(matches!(
-            stream.decode_all(&[0x50, 0x2a, 0x4d, 0x18, 0xf8, 0xff, 0xff, 0xff], &mut out),
+            stream.decode_all(
+                &[0x50, 0x2a, 0x4d, 0x18, 0xf8, 0xff, 0xff, 0xff],
+                &mut out,
+                None
+            ),
             Err(DecodeError::InvalidData {
                 kind: InvalidDataKind::SkippableFrame
             })
         ));
         assert!(matches!(
-            stream.decode_all(b"nope", &mut out),
+            stream.decode_all(b"nope", &mut out, None),
             Err(DecodeError::InvalidData {
                 kind: InvalidDataKind::Magic
             })
@@ -996,7 +1027,7 @@ mod tests {
         let mut bad = hello();
         bad[17] ^= 1;
         assert!(matches!(
-            stream.decode_all(&bad, &mut out),
+            stream.decode_all(&bad, &mut out, None),
             Err(DecodeError::ChecksumMismatch { .. })
         ));
     }
@@ -1034,7 +1065,7 @@ mod tests {
         // A declared frame leaves no slack and no spare capacity.
         let mut out = Vec::new();
         stream(DecoderConfig::DEFAULT)
-            .decode_all(&hello(), &mut out)
+            .decode_all(&hello(), &mut out, None)
             .expect("valid");
         assert_eq!((out.as_slice(), out.capacity()), (&b"hello"[..], 5));
         // An overrun is caught uncut, with the reference's error.
@@ -1043,7 +1074,7 @@ mod tests {
         overrun.extend_from_slice(&[9; 300]);
         let mut out = b">".to_vec();
         assert!(matches!(
-            stream(DecoderConfig::DEFAULT).decode_all(&overrun, &mut out),
+            stream(DecoderConfig::DEFAULT).decode_all(&overrun, &mut out, None),
             Err(DecodeError::ContentSizeMismatch {
                 declared: 256,
                 decoded: 300
@@ -1061,7 +1092,7 @@ mod tests {
             let mut stream = stream(limits.into());
             assert!(
                 matches!(
-                    stream.decode_all(&frame, &mut out),
+                    stream.decode_all(&frame, &mut out, None),
                     Err(DecodeError::InputLimitExceeded { .. })
                 ),
                 "cut {cut}"
@@ -1071,12 +1102,12 @@ mod tests {
         doubled.extend_from_slice(&frame);
         let limits = DecodeLimits::default().with_max_input_bytes(Some(18));
         assert!(matches!(
-            stream(limits.into()).decode_all(&doubled, &mut out),
+            stream(limits.into()).decode_all(&doubled, &mut out, None),
             Err(DecodeError::InputLimitExceeded { limit: 18 })
         ));
         let limits = DecodeLimits::default().with_max_output_bytes(Some(4));
         assert!(matches!(
-            stream(limits.into()).decode_all(&frame, &mut out),
+            stream(limits.into()).decode_all(&frame, &mut out, None),
             Err(DecodeError::OutputLimitExceeded { limit: 4 })
         ));
     }

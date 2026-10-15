@@ -28,7 +28,7 @@ use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::{CONTENT_SIZE_UNKNOWN, Strategy};
 use crate::compressor::core::window::{Addr, Segment, Segments};
 use crate::compressor::error::EncodeError;
-use crate::shared::format::{MAGIC_NUMBER, WINDOW_LOG_ABSOLUTE_MIN};
+use crate::shared::format::{FRAME_HEADER_SIZE_MAX, MAGIC_NUMBER, WINDOW_LOG_ABSOLUTE_MIN};
 use crate::shared::xxhash::Xxh64;
 
 /// Locks `mutex`, ignoring poisoning: only bookkeeping runs under these
@@ -84,7 +84,7 @@ pub(crate) fn compress_serial(
 ) -> Result<Vec<u8>, EncodeError> {
     let bound = compress_bound(input.len()).unwrap_or(0);
     let mut out = vec![0u8; bound];
-    match crate::compressor::core::compress_once_into(engine, requested, input, 1, &mut out) {
+    match crate::compressor::core::compress_once_into(engine, requested, None, input, 1, &mut out) {
         Ok(size) => {
             out.truncate(size);
             Ok(out)
@@ -120,7 +120,8 @@ impl FramePlan {
     }
 
     /// History a segment may reach into: an eighth of the window, or the
-    /// whole window for the ultra strategies.
+    /// whole window for the ultra strategies, whose larger windows pay for
+    /// themselves in ratio.
     pub(crate) fn overlap(&self) -> usize {
         let window = 1usize << self.applied.cparams.window_log;
         if self.applied.cparams.strategy >= Strategy::BtUltra {
@@ -128,6 +129,20 @@ impl FramePlan {
         } else {
             window >> 3
         }
+    }
+
+    /// Whether segments compress their overlap and discard the result
+    /// instead of loading it as a prefix, where that measured faster
+    /// (`benches/parallel.rs` `parallel-corpora`). Lazy and lazy2 skip ahead
+    /// through input that does not match while compressing, but a load
+    /// inserts every position into their row tables (random input took up to
+    /// three times as long); btlazy2 sorts its tree lazily while compressing,
+    /// but a load sorts all of it (text took 9% longer).
+    const fn compresses_overlap(&self) -> bool {
+        matches!(
+            self.applied.cparams.strategy,
+            Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2
+        )
     }
 
     /// The frame header (`ZSTD_writeFrameHeader` without dictionaries).
@@ -174,51 +189,62 @@ impl FramePlan {
     }
 }
 
-/// Compresses one segment.
+/// Compresses one segment and appends its blocks, none of them last, to
+/// `out`.
 ///
 /// `data` holds the overlap followed by the segment; `overlap` is the
-/// overlap's length. Returns the segment's blocks, none of them last.
+/// overlap's length. The overlap is loaded as a prefix: it fills the window
+/// and tables without being compressed, as ZSTDMT primes its jobs; for the
+/// strategies [`FramePlan::compresses_overlap`] names it is compressed into
+/// `out`'s spare room and dropped instead. The
+/// segment's first block refers to nothing the decoder has not seen: its
+/// entropy tables start empty and its repeat offsets match nothing
+/// (`ZSTD_invalidateRepCodes`), while matches into the overlap stay valid
+/// because the decoder holds it as the previous segment's output.
 ///
 /// # Errors
 ///
-/// Whatever the engine reports; with a destination of `compressBound` bytes
-/// it reports nothing for valid input.
+/// Whatever the engine reports; with room for `compressBound` bytes it
+/// reports nothing for valid input. `out` keeps its previous content then.
 #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
 pub(crate) fn compress_segment(
     engine: &mut Engine,
     plan: &FramePlan,
     data: &[u8],
     overlap: usize,
-) -> Result<Vec<u8>, CoreError> {
+    out: &mut Vec<u8>,
+) -> Result<(), CoreError> {
     let mut applied = plan.applied;
     applied.fparams.checksum = false;
     engine.begin(applied, CONTENT_SIZE_UNKNOWN);
-    let segments = Segments {
-        buffer: &[],
-        input: (data, 1),
-    };
-    let segment_len = data.len() - overlap;
-    let mut scratch = vec![0u8; compress_bound(overlap.max(1)).unwrap_or(0) + 32];
-    // Writes the header and compresses the overlap; all of it is discarded.
-    engine.compress_continue(
-        &segments,
-        &mut scratch,
-        Addr::new(Segment::Input(1), 0),
-        overlap,
-        false,
-    )?;
-    engine.prev.entropy.reset();
+    let segments = Segments::input(data, 1, None);
+    let src = Addr::new(Segment::Input(1), overlap as i64);
+    let start = out.len();
+    if plan.compresses_overlap() {
+        // Writes the frame header and the overlap's blocks, then drops them.
+        out.resize(start + compress_bound(overlap).unwrap_or(0) + 32, 0);
+        let result = engine.compress_continue(
+            &segments,
+            &mut out[start..],
+            Addr::new(Segment::Input(1), 0),
+            overlap,
+            false,
+        );
+        out.truncate(start);
+        result?;
+        engine.prev.entropy.reset();
+    } else {
+        engine.load_prefix(&segments, Addr::new(Segment::Input(1), 0), overlap);
+        // Writes the frame header, which is discarded.
+        let mut header = [0u8; FRAME_HEADER_SIZE_MAX];
+        engine.compress_continue(&segments, &mut header, src, 0, false)?;
+    }
     engine.prev.rep = [0; 3];
-    let mut out = vec![0u8; compress_bound(segment_len).unwrap_or(0) + 32];
-    let size = engine.compress_continue(
-        &segments,
-        &mut out,
-        Addr::new(Segment::Input(1), overlap as i64),
-        segment_len,
-        false,
-    )?;
-    out.truncate(size);
-    Ok(out)
+    let segment_len = data.len() - overlap;
+    out.resize(start + compress_bound(segment_len).unwrap_or(0) + 32, 0);
+    let result = engine.compress_continue(&segments, &mut out[start..], src, segment_len, false);
+    out.truncate(start + *result.as_ref().unwrap_or(&0));
+    result.map(|_| ())
 }
 
 #[cfg(test)]
@@ -233,9 +259,7 @@ mod tests {
         while start < input.len() {
             let end = (start + segment).min(input.len());
             let from = start.saturating_sub(plan.overlap());
-            out.extend(
-                compress_segment(&mut engine, plan, &input[from..end], start - from).unwrap(),
-            );
+            compress_segment(&mut engine, plan, &input[from..end], start - from, &mut out).unwrap();
             start = end;
         }
         let mut hasher = Xxh64::new(0);
@@ -262,6 +286,61 @@ mod tests {
                             .expect("decodes");
                     assert_eq!(decoded, input, "level {level}");
                 }
+            }
+        }
+    }
+
+    /// `Engine::load_prefix` is the reference's raw-prefix load: a frame
+    /// whose prefix sits right before its input in memory, loaded with
+    /// `forceWindow`, is byte-identical to `ZSTD_CCtx_refPrefix` with
+    /// `ZSTD_c_forceMaxWindow`, at every level.
+    #[test]
+    fn prefix_loads_match_the_reference() {
+        use crate::compressor::core::cctx::compress_bound;
+        use crate::compressor::core::params::{CParamMode, ParamSwitch};
+        let whole = [
+            corpus::text(150_000, 21),
+            corpus::mixed(250_000, 22),
+            corpus::text(40_000, 23),
+        ]
+        .concat();
+        for level in -5..=22 {
+            for (prefix_len, ldm) in [(150_000, false), (7, false), (390_000, true)] {
+                let mut requested = RequestedParams {
+                    compression_level: level,
+                    ..RequestedParams::default()
+                };
+                if ldm {
+                    requested.ldm.enable = ParamSwitch::Enable;
+                    requested.cparams.window_log = 20;
+                }
+                let input = &whole[prefix_len..];
+                let pledged = input.len() as u64;
+                let mut engine = Engine::new();
+                engine.begin(
+                    requested.resolve_for(pledged, prefix_len as u64, CParamMode::NoAttachDict),
+                    pledged,
+                );
+                let segments = Segments::input(&whole, 3, None);
+                engine.load_prefix(&segments, Addr::new(Segment::Input(3), 0), prefix_len);
+                let mut ours = vec![0u8; compress_bound(input.len()).unwrap()];
+                let size = engine
+                    .compress_end_to(
+                        &segments,
+                        &mut crate::compressor::core::output::SliceOutput(&mut ours),
+                        Addr::new(Segment::Input(3), prefix_len as i64),
+                        input.len(),
+                    )
+                    .expect("compresses");
+                let params = crate::compressor::core::advanced_tests::oracle_params(&requested)
+                    .with(zstd_ffi::ZSTD_c_forceMaxWindow, 1);
+                let theirs = zstd_ffi::oracle::compress2_with_prefix(&whole, prefix_len, &params)
+                    .expect("oracle");
+                assert!(
+                    ours[..size] == theirs[..],
+                    "level {level} prefix {prefix_len} ldm {ldm}: {size} vs {}",
+                    theirs.len()
+                );
             }
         }
     }

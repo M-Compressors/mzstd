@@ -15,6 +15,7 @@
 use alloc::vec::Vec;
 
 use super::cctx::{Engine, RequestedParams, compress_bound};
+use super::cdict::CDict;
 use super::error::CoreError;
 use super::output::{Destination, Output, SliceOutput};
 use super::window::{Addr, Segment, Segments};
@@ -122,16 +123,17 @@ impl Stream {
         &mut self,
         engine: &mut Engine,
         requested: &RequestedParams,
+        dict: Option<&CDict>,
         end_op: EndOp,
         in_size: usize,
-    ) {
+    ) -> Result<(), CoreError> {
         if end_op == EndOp::End {
             self.pledged_src_size_plus_one = in_size as u64 + 1;
         }
         let pledged = self.pledged_src_size_plus_one.wrapping_sub(1);
-        let applied = requested.resolve(pledged);
-        engine.begin(applied, pledged);
-        let window_size = (1u64 << applied.cparams.window_log).min(pledged).max(1) as usize;
+        super::begin_frame(engine, requested, pledged, &Segments::input(&[], 0, dict))?;
+        let window_log = engine.applied.cparams.window_log;
+        let window_size = (1u64 << window_log).min(pledged).max(1) as usize;
         let block_size = engine.block_size_max;
         let in_size = window_size + block_size;
         let out_size = compress_bound(block_size).unwrap_or(0) + 1;
@@ -151,6 +153,7 @@ impl Stream {
         self.out_buff_flushed_size = 0;
         self.stage = Stage::Load;
         self.frame_ended = false;
+        Ok(())
     }
 
     /// One `ZSTD_compressStream2` call: consumes from `input`, writes into
@@ -165,16 +168,29 @@ impl Stream {
         &mut self,
         engine: &mut Engine,
         requested: &RequestedParams,
+        dict: Option<&CDict>,
         output: &mut D,
         input: &[u8],
         end_op: EndOp,
     ) -> Result<StreamStep, CoreError> {
         if self.stage == Stage::Init {
-            self.init(engine, requested, end_op, input.len());
+            let started = self.init(engine, requested, dict, end_op, input.len());
+            if started.is_err() {
+                self.reset_session();
+            }
+            started?;
         }
         let mut consumed = 0;
         let mut produced = 0;
-        let result = self.generic(engine, output, &mut produced, input, &mut consumed, end_op);
+        let result = self.generic(
+            engine,
+            dict,
+            output,
+            &mut produced,
+            input,
+            &mut consumed,
+            end_op,
+        );
         if result.is_err() {
             self.reset_session();
         }
@@ -187,9 +203,14 @@ impl Stream {
     }
 
     /// `ZSTD_compressStream_generic` in buffered mode.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors ZSTD_compressStream_generic's state and buffers"
+    )]
     fn generic<D: Destination + ?Sized>(
         &mut self,
         engine: &mut Engine,
+        dict: Option<&CDict>,
         output: &mut D,
         out_pos: &mut usize,
         input: &[u8],
@@ -214,7 +235,7 @@ impl Stream {
                         // Shortcut: compress straight from the caller's input.
                         let segments = Segments {
                             buffer: &self.in_buff,
-                            input: (input, input_id),
+                            ..Segments::input(input, input_id, dict)
                         };
                         let src = Addr::new(Segment::Input(input_id), ip as i64);
                         let c_size = engine.compress_end_to(
@@ -248,7 +269,7 @@ impl Stream {
                     let last_block = flush_mode == EndOp::End && ip == iend;
                     let segments = Segments {
                         buffer: &self.in_buff,
-                        input: (&[], 0),
+                        ..Segments::input(&[], 0, dict)
                     };
                     let src = Addr::new(Segment::Buffer, self.in_to_compress as i64);
                     let c_size = if direct {

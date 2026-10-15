@@ -2,8 +2,9 @@
 
 The `decompression` feature enables the public `decompressor` module: a
 safe-Rust Zstandard (RFC 8878) decoder with one-shot, incremental and
-`std::io` APIs. The public module owns configuration, decoder ownership,
-sessions, typed errors and the I/O adapters; the private
+`std::io` APIs, with or without a dictionary. The public module owns
+configuration, decoder ownership, sessions, typed errors and the I/O
+adapters; `crate::dictionary` owns the public dictionary types; the private
 `decompressor::core` owns parsing and regeneration. The decoder needs only
 `alloc`; the `io` adapters and the `std::io::Error` conversion exist unless
 `no_std` is enabled. There is no `unsafe` code. Compressed blocks run
@@ -29,9 +30,12 @@ graph TD
     IO --> Finish[crate::finish_error::FinishError]
     API --> Retention[crate::RetentionPolicy]
     API --> Stream
+    API --> Dict["crate::dictionary: DecodeDictionary, DictionaryRef, DictionaryId"]
+    Dict --> DCore
     subgraph core[decompressor::core, private]
         Stream[stream: Stream state machine + decode_all] --> Frame[frame: FrameHeader, FrameDecoder]
         Stream --> History[history: output buffer = window]
+        Frame --> DCore[dictionary: DecoderEntropy, DictView]
         Frame --> Block[block: BlockHeader, BlockDecoder]
         Block --> Literals[literals: LiteralsDecoder, Literals]
         Block --> Sequences[sequences: SequenceTables, execute]
@@ -74,6 +78,24 @@ classDiagram
         +into_session() DecoderSessionOwned
         +reader(R) DecoderReader
         +writer(W) DecoderWriter
+        +decompress_with_dictionary(dict, src) Vec~u8~
+        +decompress_with_dictionary_into(dict, src, Vec) Range
+        +decompress_with_dictionary_to_slice(dict, src, slice) usize
+        +start_with_dictionary(dict) DecoderSession
+        +into_session_with_dictionary(D) DecoderSessionOwned~D~
+        +reader_with_dictionary(R, dict) DecoderReader
+        +writer_with_dictionary(W, dict) DecoderWriter
+    }
+    class DecodeDictionary {
+        +new(bytes, DictionaryContent) Result
+        +try_from(bytes) Result
+        +id() Option~DictionaryId~
+        +content_len() usize
+        +retained_bytes() usize
+    }
+    class DictionaryRef {
+        <<enum, Copy>>
+        Decode(&DecodeDictionary)
     }
     class DecompressorBuilder {
         +with_retention(RetentionPolicy)
@@ -107,7 +129,7 @@ classDiagram
         +frames_decoded() u64
         +window_size() Option~u64~
     }
-    class DecoderSessionOwned {
+    class DecoderSessionOwned~D = DecodeDictionary~ {
         +process / flush / finish
         +reinit()
         +into_decompressor() Decompressor
@@ -117,7 +139,10 @@ classDiagram
     DecoderConfig --> DecodeLimits
     DecompressorBuilder --> Decompressor
     DecoderSession --> Decompressor : borrows
+    DecoderSession --> DictionaryRef : borrows, optional
     DecoderSessionOwned --> Decompressor : owns
+    DecoderSessionOwned --> DecodeDictionary : owns D, optional
+    DictionaryRef --> DecodeDictionary
 ```
 
 - **Construction.** `Decompressor::new`, `Default`, `From<DecoderConfig>`
@@ -151,6 +176,13 @@ classDiagram
 - **I/O.** `reader(R)` and `writer(W)` (module `decompressor::io`) own one
   8 KiB buffer each; a failed `DecoderWriter::finish` returns the writer in
   the crate-wide `io::FinishError`.
+- **Dictionaries.** Every entry point has a `*_with_dictionary` twin taking
+  `impl Into<DictionaryRef>`; see [Dictionaries](#dictionaries).
+  `DecoderSession<'d>` keeps its single lifetime: `start_with_dictionary`
+  borrows the dictionary for `'d` too. `DecoderSessionOwned<D>` owns any
+  `D: AsRef<DecodeDictionary>` (an `Arc` shares one); `D` defaults to
+  `DecodeDictionary`, so `DecoderSessionOwned` without parameters still
+  names the plain owned session.
 
 ## Errors
 
@@ -173,9 +205,15 @@ graph LR
 - The frame and stream layers return `DecodeError` (`#[non_exhaustive]`,
   `thiserror`): `InvalidData { kind }` (with `kind` as its `source`),
   `UnexpectedEndOfInput`, `TrailingData`, `OutputTooSmall`,
-  `ChecksumMismatch`, `ContentSizeMismatch`, `DictionaryUnsupported`,
-  `WindowLimitExceeded`, `InputLimitExceeded`, `OutputLimitExceeded`,
-  `AllocationFailed`, `InvalidState`.
+  `ChecksumMismatch`, `ContentSizeMismatch`, `DictionaryUnsupported` (the
+  frame names a dictionary and the operation has none),
+  `DictionaryMismatch { expected, frame }` (the operation's dictionary
+  declares another ID, or none), `WindowLimitExceeded`,
+  `InputLimitExceeded`, `OutputLimitExceeded`, `AllocationFailed`,
+  `InvalidState`.
+- Building a `DecodeDictionary` returns `crate::dictionary::DictionaryError`:
+  `NotZstdFormat` or `Corrupted`. The core's entropy parser reports an
+  `InvalidDataKind`, which the dictionary layer maps to `Corrupted`.
 - Sessions wrap errors in `DecodeFailure { error, consumed, produced }`,
   the exact progress of the failing call; `From<DecodeFailure>` recovers
   the error. Failures are terminal for the operation; the decoder is
@@ -303,6 +341,99 @@ decodes straight into `dst` when every frame declares a content size that
 fits, and otherwise (or on any error) takes the incremental path, which
 defines its results.
 
+## Dictionaries
+
+A dictionary is parsed once, when a `DecodeDictionary` is built
+(`ZSTD_createDDict_advanced` and `ZSTD_loadEntropy_intoDDict`), and
+borrowed by each operation; the decoder keeps no reference to it between
+calls, so `Stream::process`, `decode_all` and `decode_to_slice` take it as
+an `Option<DictView>` argument on every call.
+
+```mermaid
+flowchart TD
+    Bytes[bytes, DictionaryContent] --> Empty{empty?}
+    Empty -->|yes| RawParts[id 0, no tables]
+    Empty -->|no| Layout{dictionary::layout}
+    Layout -->|Raw, or Auto without magic or under 8 bytes| RawParts
+    Layout -->|Zstd requested, no magic| E1[NotZstdFormat]
+    Layout -->|magic + ID| Load["DecoderEntropy::load (ZSTD_loadDEntropy): Huffman tree, OF / ML / LL FSE tables, 3 repeat offsets"]
+    Load -->|malformed table, log too large, rep 0 or beyond the content after it| E2[Corrupted]
+    Load --> ZParts[id, DecoderEntropy with pair rows prebuilt]
+    RawParts --> Parts[DecodeParts]
+    ZParts --> Parts
+    Parts --> Owned["DecodeDictionary: Box of bytes + DecodeParts"]
+    Owned -->|DictionaryRef::view| View["DictView: content = all bytes, id, Option of entropy"]
+```
+
+- `parse_decode_parts(bytes, content)` (crate-private, in
+  `dictionary::decode`) returns `DecodeParts { id, entropy }` without
+  holding the bytes; `DecodeParts::view(bytes)` pairs them with whatever
+  owns them. `DecodeDictionary` is one such owner; `PreparedDictionary`
+  (with `compression`) is the other, and `DictionaryRef::Prepared` views
+  its bytes the same way.
+- As in the reference's `ZSTD_DDict`, **all** of a dictionary's bytes are
+  history, the Zstandard format's magic number, ID and tables included;
+  encoders only reference the content after the tables.
+- The Huffman table's pair rows are built when the dictionary is parsed, so
+  decoding reads the shared table without modifying it
+  (`HuffmanTable::decode_streams_shared`).
+
+### Frame start
+
+```mermaid
+sequenceDiagram
+    participant S as Stream / walk
+    participant F as FrameDecoder::begin
+    participant B as BlockDecoder::reset
+    participant D as FrameDecoder::decode_block
+    participant Q as SequenceTables::execute
+    S->>F: header, limits, Option of DictView
+    alt frame names ID f, no dictionary
+        F-->>S: DictionaryUnsupported
+    else frame names ID f, dictionary declares another or none
+        F-->>S: DictionaryMismatch
+    end
+    F->>B: Option of DecoderEntropy
+    B->>B: literals tree = Dictionary or Missing; LL/OF/ML slots = Dictionary or Empty
+    B->>B: repeat offsets = dictionary's or 1, 4, 8
+    loop each compressed block
+        S->>D: content, out, history range, same DictView
+        D->>D: dictionary content reachable iff frame output so far < window
+        D->>Q: BlockContext: history start, window, dictionary content, entropy
+        Q->>Q: Repeat / treeless modes read the dictionary's tables until the frame replaces them
+        Q->>Q: offsets past the frame's output take execute_exactly, which copies from the dictionary's tail
+    end
+```
+
+- **IDs** follow `ZSTD_decodeFrameHeader`: a frame without a dictionary ID
+  decodes with any dictionary or without one; a frame with ID `f` needs a
+  dictionary declaring `f`. Raw content declares no ID.
+- **Entropy** follows `ZSTD_copyDDictParameters`: a Zstandard-format
+  dictionary sets the reference's `litEntropy` and `fseEntropy`, so the
+  frame's first treeless literals block and its first repeat-mode sequence
+  tables use the dictionary's tables (`TreeSource::Dictionary`,
+  `SlotContent::Dictionary`), and its repeat offsets start at the
+  dictionary's. A block that describes its own tables replaces them for
+  the rest of the frame. Raw dictionaries leave the frame-start state of a
+  frame without a dictionary.
+- **History.** The dictionary's content is a separate segment before the
+  frame's first byte (the reference's `extDict`): it is never copied into
+  the output or the streaming history. A block may reach into it while the
+  frame's output before the block is below the frame's window, and only
+  when the executor's history starts at the frame's first byte; an offset
+  may then reach `output + dictionary length` bytes back, whatever the
+  window, as `oLitEnd - virtualStart` bounds it in the reference. The
+  reference encoder references a dictionary only from blocks that end
+  within one window of it (`ZSTD_checkDictValidity`), and the first window
+  is never compacted out of the streaming history, so every frame it writes
+  decodes. Past the first window, offsets are bounded by the window as
+  without a dictionary.
+- **Hot loop.** The fast path's offset test is unchanged; a sequence that
+  fails it calls the cold `execute_exactly`, which is where the
+  dictionary's reach and the two-segment copy live. Frames without a
+  dictionary execute the same instructions as before (see
+  [decoder fast paths](decoder-performance.md#dictionaries)).
+
 ## Block regeneration
 
 ```mermaid
@@ -363,8 +494,9 @@ Invariants each layer relies on:
   `Repeated_Offset1 - 1` for a zero literal length) follow the reference
   exactly; a zero offset is `Offset`.
 - **Frames.** The reserved descriptor bit must be clear; a non-zero
-  dictionary ID is `DictionaryUnsupported`; the window must be within the
-  limit (single-segment frames: the content size). The regenerated size
+  dictionary ID must match the operation's dictionary; the window must be
+  within the limit (single-segment frames: the content size). The
+  regenerated size
   may never exceed a declared content size and must equal it after the
   last block; the checksum is the low 32 bits of XXH64 with seed 0.
 
@@ -396,12 +528,24 @@ reference's, with these deliberate exceptions:
   `2^27 + 1` bytes.
 - **Huffman depth.** Trees of 12 bits are accepted, as by the reference,
   although RFC 8878 caps literal codes at 11 bits.
+- **Dictionary reach.** A dictionary's content is reachable only from
+  blocks that start within the frame's first window. The reference's
+  one-shot decoder lets any offset reach it, and its streaming decoder until
+  its ring buffer first wraps, which is never before the end of the first
+  window. Reference encoders never reference a dictionary later.
+- **Dictionary acceptance** matches `ZSTD_DCtx_loadDictionary_advanced`
+  exactly: empty bytes are no dictionary, raw content is never rejected,
+  and Zstandard-format bytes are rejected where `ZSTD_loadDEntropy` rejects
+  them. `DictionaryContent::Zstd` on bytes without the magic number is
+  `NotZstdFormat`, where the reference reports `dictionary_corrupted`.
 
 ## Known gaps
 
-- **Dictionaries** are not supported: frames with a non-zero dictionary ID
-  fail with `DictionaryUnsupported`, and there is no API to supply raw or
-  trained dictionaries.
+- **Dictionaries.** Only one dictionary per operation: there is no
+  selection among several by frame ID (`ZSTD_d_refMultipleDDicts`), and
+  `DecodeDictionary` always copies its bytes (no `ZSTD_dlm_byRef`). A
+  `PreparedDictionary` decodes through `DictionaryRef::Prepared`, which
+  views its own bytes with the `DecodeParts` it parsed when it was built.
 - **Speed.** Text at levels 1-3 decodes about 1.1x slower than the
   reference; see [decoder fast paths](decoder-performance.md#known-gaps).
 - **Memory.** The streaming history can reach twice the window plus

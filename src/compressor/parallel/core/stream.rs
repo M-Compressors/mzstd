@@ -174,8 +174,9 @@ impl StreamTask {
             // Segments size their own buffers, so an error is a core bug
             // reported rather than a panic.
             Work::Fragment { plan, overlap } => {
-                match compress_segment(&mut engine, plan, &self.data, *overlap) {
-                    Ok(blocks) => Ok(blocks),
+                let mut blocks = Vec::new();
+                match compress_segment(&mut engine, plan, &self.data, *overlap, &mut blocks) {
+                    Ok(()) => Ok(blocks),
                     Err(error) => Err(EncodeError::from_core(error, 0, None)),
                 }
             }
@@ -543,7 +544,9 @@ impl Stream {
             self.push_inline(self.plan.header());
         }
         let keep = self.plan.overlap().min(self.filling.len());
-        let next = self.filling[self.filling.len() - keep..].to_vec();
+        // The next segment's buffer is allocated once, at its full size.
+        let mut next = Vec::with_capacity(keep + self.segment_size);
+        next.extend_from_slice(&self.filling[self.filling.len() - keep..]);
         let data = mem::replace(&mut self.filling, next);
         let overlap = mem::replace(&mut self.history, keep);
         self.queue(

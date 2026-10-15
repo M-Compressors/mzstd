@@ -7,12 +7,15 @@
 //! [`DecoderSession`] (borrowing the decoder) or [`DecoderSessionOwned`]
 //! (owning it), and with `std` through the `io` adapters.
 //!
-//! Every Zstandard frame feature is supported except dictionaries: frames
-//! of raw, RLE and compressed blocks, Huffman-coded literals in one or four
-//! streams, predefined, RLE, FSE-compressed and repeated sequence tables,
-//! repeat offsets, content sizes and content checksums, which are always
-//! verified. Skippable frames are skipped. A frame that names a dictionary
-//! fails with [`DecodeError::DictionaryUnsupported`].
+//! Every Zstandard frame feature is supported: frames of raw, RLE and
+//! compressed blocks, Huffman-coded literals in one or four streams,
+//! predefined, RLE, FSE-compressed and repeated sequence tables, repeat
+//! offsets, content sizes and content checksums, which are always verified,
+//! and dictionaries, raw or in the Zstandard format
+//! ([`crate::dictionary::DecodeDictionary`]), through the
+//! `*_with_dictionary` methods. Skippable frames are skipped. A frame that
+//! names a dictionary fails with [`DecodeError::DictionaryUnsupported`]
+//! without one and with [`DecodeError::DictionaryMismatch`] with another.
 //!
 //! # Examples
 //!
@@ -53,6 +56,9 @@ mod session;
 #[cfg(not(feature = "no_std"))]
 pub mod io;
 
+#[cfg(test)]
+pub(crate) use self::core::test_dictionary;
+pub(crate) use self::core::{DecoderEntropy, DictView};
 pub use config::{DecodeLimits, DecoderConfig, FrameMode};
 pub use decoder::{Decompressor, DecompressorBuilder};
 pub use error::{DecodeConfigError, DecodeError, InvalidDataKind};

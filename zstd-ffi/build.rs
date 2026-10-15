@@ -42,7 +42,7 @@ fn main() {
     let output_directory = env::var("OUT_DIR").expect("OUT_DIR is not set");
 
     let mut sources = Vec::new();
-    for directory in ["common", "compress", "decompress"] {
+    for directory in ["common", "compress", "decompress", "dictBuilder"] {
         sources.extend(c_sources(&format!("{LIB}/{directory}")));
     }
     let mut library = cc::Build::new();

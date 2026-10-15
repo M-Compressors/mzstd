@@ -7,7 +7,9 @@ use core::ops::Range;
 
 use super::config::{ConfigError, EncoderConfig, SizeOverflow};
 use super::core::cctx::{Engine, RequestedParams, compress_bound};
+use super::core::cdict::CDict;
 use super::core::stream::Stream;
+use super::dictionary::PreparedDictionary;
 use super::error::EncodeError;
 use super::internal::requested_params;
 use super::session::{EncoderSession, EncoderSessionOwned, StreamConfig};
@@ -236,6 +238,29 @@ impl Compressor {
         src: &[u8],
         dst: &mut Vec<u8>,
     ) -> Result<Range<usize>, EncodeError> {
+        self.compress_into_with(None, src, dst)
+    }
+
+    /// The dictionary's tables, when it serves this compressor's
+    /// configuration.
+    fn dictionary_tables<'d>(
+        &self,
+        dictionary: Option<&'d PreparedDictionary>,
+    ) -> Result<Option<&'d CDict>, EncodeError> {
+        match dictionary {
+            None => Ok(None),
+            Some(dictionary) if dictionary.serves(&self.requested) => Ok(Some(&dictionary.cdict)),
+            Some(_) => Err(EncodeError::DictionaryMismatch),
+        }
+    }
+
+    fn compress_into_with(
+        &mut self,
+        dictionary: Option<&PreparedDictionary>,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Result<Range<usize>, EncodeError> {
+        let cdict = self.dictionary_tables(dictionary)?;
         let bound = Self::max_compressed_size(src.len())?;
         let start = dst.len();
         let limit = start.checked_add(bound).ok_or(SizeOverflow)?;
@@ -243,13 +268,14 @@ impl Compressor {
             // A single block needs its full bound anyway. Keep the direct
             // slice path here, without another call for empty/tiny frames.
             dst.resize(limit, 0);
-            self.compress_to_slice(src, &mut dst[start..])
+            self.compress_to_slice_with(cdict, src, &mut dst[start..])
         } else {
             self.stream.reset_session();
             let id = self.next_id();
             let result = super::core::compress_once_append(
                 &mut self.engine,
                 &self.requested,
+                cdict,
                 src,
                 id,
                 dst,
@@ -291,10 +317,19 @@ impl Compressor {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn compress_to_slice(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, EncodeError> {
+        self.compress_to_slice_with(None, src, dst)
+    }
+
+    fn compress_to_slice_with(
+        &mut self,
+        cdict: Option<&CDict>,
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize, EncodeError> {
         self.stream.reset_session();
         let id = self.next_id();
         let result =
-            super::core::compress_once_into(&mut self.engine, &self.requested, src, id, dst)
+            super::core::compress_once_into(&mut self.engine, &self.requested, cdict, src, id, dst)
                 .map_err(|error| EncodeError::from_core(error, dst.len(), Some(src.len() as u64)));
         self.apply_retention();
         result
@@ -329,12 +364,27 @@ impl Compressor {
         src: &[u8],
         dst: &mut [MaybeUninit<u8>],
     ) -> Result<usize, EncodeError> {
+        self.compress_to_uninit_with(None, src, dst)
+    }
+
+    fn compress_to_uninit_with(
+        &mut self,
+        cdict: Option<&CDict>,
+        src: &[u8],
+        dst: &mut [MaybeUninit<u8>],
+    ) -> Result<usize, EncodeError> {
         self.stream.reset_session();
         let id = self.next_id();
         let capacity = dst.len();
-        let result =
-            super::core::compress_once_uninit(&mut self.engine, &self.requested, src, id, dst)
-                .map_err(|error| EncodeError::from_core(error, capacity, Some(src.len() as u64)));
+        let result = super::core::compress_once_uninit(
+            &mut self.engine,
+            &self.requested,
+            cdict,
+            src,
+            id,
+            dst,
+        )
+        .map_err(|error| EncodeError::from_core(error, capacity, Some(src.len() as u64)));
         self.apply_retention();
         result
     }
@@ -378,6 +428,211 @@ impl Compressor {
     pub fn into_session(mut self, stream: StreamConfig) -> EncoderSessionOwned {
         self.begin_stream(stream);
         EncoderSessionOwned::new(self, stream)
+    }
+
+    /// Compresses `src` with `dictionary` into a new vector.
+    ///
+    /// The frame names the dictionary's ID, when it has one; decoders need
+    /// the same dictionary.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::DictionaryMismatch`] when the dictionary was prepared
+    /// for a different configuration; otherwise as [`Self::compress`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::Compressor;
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"the quick brown fox jumps over the lazy dog").build()?;
+    /// let mut encoder = Compressor::default();
+    /// let payload = b"the quick brown fox jumps over the lazy dog";
+    /// assert!(
+    ///     encoder.compress_with_dictionary(&dictionary, payload)?.len()
+    ///         < encoder.compress(payload)?.len()
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn compress_with_dictionary(
+        &mut self,
+        dictionary: &PreparedDictionary,
+        src: &[u8],
+    ) -> Result<Vec<u8>, EncodeError> {
+        let mut out = Vec::new();
+        self.compress_into_with(Some(dictionary), src, &mut out)?;
+        Ok(out)
+    }
+
+    /// Appends the frame for `src`, compressed with `dictionary`, to `dst`
+    /// and returns where it landed; `dst` is left as it was on failure.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compress_with_dictionary`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::Compressor;
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"a common prefix").build()?;
+    /// let mut out = b"header".to_vec();
+    /// let range = Compressor::default().compress_with_dictionary_into(&dictionary, b"a common prefix", &mut out)?;
+    /// assert_eq!(range, 6..out.len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn compress_with_dictionary_into(
+        &mut self,
+        dictionary: &PreparedDictionary,
+        src: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Result<Range<usize>, EncodeError> {
+        self.compress_into_with(Some(dictionary), src, dst)
+    }
+
+    /// Writes the frame for `src`, compressed with `dictionary`, into `dst`
+    /// and returns its size.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compress_to_slice`] and
+    /// [`Self::compress_with_dictionary`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::Compressor;
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"a common prefix").build()?;
+    /// let mut encoder = Compressor::default();
+    /// let mut buffer = [0u8; 64];
+    /// let written = encoder.compress_with_dictionary_to_slice(&dictionary, b"a common prefix", &mut buffer)?;
+    /// assert_eq!(&buffer[..written], encoder.compress_with_dictionary(&dictionary, b"a common prefix")?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn compress_with_dictionary_to_slice(
+        &mut self,
+        dictionary: &PreparedDictionary,
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        let cdict = self.dictionary_tables(Some(dictionary))?;
+        self.compress_to_slice_with(cdict, src, dst)
+    }
+
+    /// Writes the frame for `src`, compressed with `dictionary`, into
+    /// uninitialized memory; see [`Self::compress_to_uninit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compress_with_dictionary_to_slice`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::Compressor;
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"a common prefix").build()?;
+    /// let mut out: Vec<u8> = Vec::with_capacity(64);
+    /// let written = Compressor::default().compress_with_dictionary_to_uninit(
+    ///     &dictionary,
+    ///     b"a common prefix",
+    ///     out.spare_capacity_mut(),
+    /// )?;
+    /// // SAFETY: the first `written` bytes were initialized.
+    /// unsafe { out.set_len(written) };
+    /// assert!(written > 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn compress_with_dictionary_to_uninit(
+        &mut self,
+        dictionary: &PreparedDictionary,
+        src: &[u8],
+        dst: &mut [MaybeUninit<u8>],
+    ) -> Result<usize, EncodeError> {
+        let cdict = self.dictionary_tables(Some(dictionary))?;
+        self.compress_to_uninit_with(cdict, src, dst)
+    }
+
+    /// Starts an incremental frame compressed with `dictionary`, borrowing
+    /// this compressor and the dictionary.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::DictionaryMismatch`] when the dictionary was prepared
+    /// for a different configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::{Compressor, EncoderStatus, Operation};
+    ///
+    /// let dictionary = DictionaryBuilder::new(b"a common prefix").build()?;
+    /// let mut encoder = Compressor::default();
+    /// let mut session = encoder.start_with_dictionary(&dictionary, Default::default())?;
+    /// let mut out = [0u8; 64];
+    /// let progress = session.process(b"a common prefix", &mut out, Operation::End)?;
+    /// assert_eq!(progress.status, EncoderStatus::Finished);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn start_with_dictionary<'c>(
+        &'c mut self,
+        dictionary: &'c PreparedDictionary,
+        stream: StreamConfig,
+    ) -> Result<EncoderSession<'c>, EncodeError> {
+        self.dictionary_tables(Some(dictionary))?;
+        self.begin_stream(stream);
+        Ok(EncoderSession::with_dictionary(
+            self,
+            Some(dictionary),
+            stream,
+        ))
+    }
+
+    /// Starts an incremental frame compressed with `dictionary` that owns
+    /// this compressor and the dictionary.
+    ///
+    /// Pass an `Arc<PreparedDictionary>` to share one dictionary between
+    /// sessions.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start_with_dictionary`]; the compressor is dropped with the
+    /// error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use mzstd::dictionary::DictionaryBuilder;
+    /// use mzstd::{Compressor, EncoderStatus, Operation};
+    ///
+    /// let dictionary = Arc::new(DictionaryBuilder::new(b"a common prefix").build()?);
+    /// let mut session =
+    ///     Compressor::default().into_session_with_dictionary(Arc::clone(&dictionary), Default::default())?;
+    /// let mut out = [0u8; 64];
+    /// let progress = session.process(b"a common prefix", &mut out, Operation::End)?;
+    /// assert_eq!(progress.status, EncoderStatus::Finished);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn into_session_with_dictionary<D: AsRef<PreparedDictionary>>(
+        mut self,
+        dictionary: D,
+        stream: StreamConfig,
+    ) -> Result<EncoderSessionOwned<D>, EncodeError> {
+        self.dictionary_tables(Some(dictionary.as_ref()))?;
+        self.begin_stream(stream);
+        Ok(EncoderSessionOwned::with_dictionary(
+            self,
+            Some(dictionary),
+            stream,
+        ))
     }
 
     pub(crate) fn begin_stream(&mut self, stream: StreamConfig) {

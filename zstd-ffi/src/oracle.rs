@@ -88,6 +88,19 @@ impl CCtx {
             // SAFETY: `self.0` is a live context.
             check(unsafe { ZSTD_CCtx_setPledgedSrcSize(self.0, size) })?;
         }
+        if let Some(dictionary) = &params.dictionary {
+            // SAFETY: `self.0` is a live context; the dictionary is copied
+            // (`ZSTD_dlm_byCopy`), so it need not outlive the call.
+            check(unsafe {
+                ZSTD_CCtx_loadDictionary_advanced(
+                    self.0,
+                    dictionary.bytes.as_ptr().cast(),
+                    dictionary.bytes.len(),
+                    ZSTD_dlm_byCopy,
+                    dictionary.content_type,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -165,6 +178,27 @@ impl Decoder {
         Self(dctx)
     }
 
+    /// A context with `dictionary` loaded for every later frame
+    /// (`ZSTD_DCtx_loadDictionary_advanced`, by copy).
+    ///
+    /// # Errors
+    ///
+    /// Returns the reference's error name when it rejects the dictionary.
+    pub fn with_dictionary(dictionary: &Dictionary) -> Result<Self, String> {
+        let decoder = Self::new();
+        // SAFETY: the context is live; the dictionary is copied.
+        check(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(
+                decoder.0,
+                dictionary.bytes.as_ptr().cast(),
+                dictionary.bytes.len(),
+                ZSTD_dlm_byCopy,
+                dictionary.content_type,
+            )
+        })?;
+        Ok(decoder)
+    }
+
     /// `ZSTD_decompressDCtx` into `output`, returning the content size.
     ///
     /// # Panics
@@ -200,6 +234,26 @@ impl Drop for Decoder {
     }
 }
 
+/// A dictionary handed to `ZSTD_CCtx_loadDictionary_advanced` or
+/// `ZSTD_DCtx_loadDictionary_advanced`, by copy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Dictionary {
+    /// The dictionary as the caller holds it.
+    pub bytes: Vec<u8>,
+    /// `ZSTD_dct_auto`, `ZSTD_dct_rawContent` or `ZSTD_dct_fullDict`.
+    pub content_type: ZSTD_dictContentType_e,
+}
+
+impl Dictionary {
+    /// `bytes`, recognized by their magic number (`ZSTD_dct_auto`).
+    pub fn auto(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            content_type: ZSTD_dct_auto,
+        }
+    }
+}
+
 /// Advanced parameters applied, in order, to a fresh compression context.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Params {
@@ -207,6 +261,8 @@ pub struct Params {
     pub values: Vec<(ZSTD_cParameter, i32)>,
     /// `ZSTD_CCtx_setPledgedSrcSize`, when set.
     pub pledged: Option<u64>,
+    /// `ZSTD_CCtx_loadDictionary_advanced` after the parameters, when set.
+    pub dictionary: Option<Dictionary>,
 }
 
 impl Params {
@@ -228,6 +284,156 @@ impl Params {
         self.pledged = Some(size);
         self
     }
+
+    /// Loads `dictionary` into the context after the parameters.
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Dictionary) -> Self {
+        self.dictionary = Some(dictionary);
+        self
+    }
+}
+
+/// `ZSTD_compress2` of `whole[prefix_len..]` with `whole[..prefix_len]`
+/// referenced as a raw-content prefix (`ZSTD_CCtx_refPrefix_advanced`).
+///
+/// The prefix and the input are adjacent in memory, so the reference sees one
+/// contiguous window, as a ZSTDMT job does with the overlap before it.
+///
+/// # Errors
+///
+/// As [`compress2`].
+///
+/// # Panics
+///
+/// Panics when `prefix_len` exceeds `whole.len()`.
+pub fn compress2_with_prefix(
+    whole: &[u8],
+    prefix_len: usize,
+    params: &Params,
+) -> Result<Vec<u8>, String> {
+    let (prefix, input) = whole.split_at(prefix_len);
+    let mut cctx = CCtx::new();
+    cctx.configure(params)?;
+    // SAFETY: the context is live and the prefix outlives the compression
+    // below, which is the only one it is referenced for.
+    check(unsafe {
+        ZSTD_CCtx_refPrefix_advanced(
+            cctx.0,
+            prefix.as_ptr().cast(),
+            prefix.len(),
+            ZSTD_dct_rawContent,
+        )
+    })?;
+    let mut output = vec![0u8; compress_bound(input.len())];
+    // SAFETY: both buffers are valid for the lengths passed and do not
+    // overlap; the context is live.
+    let written = check(unsafe {
+        ZSTD_compress2(
+            cctx.0,
+            output.as_mut_ptr().cast(),
+            output.len(),
+            input.as_ptr().cast(),
+            input.len(),
+        )
+    })?;
+    output.truncate(written);
+    Ok(output)
+}
+
+/// Decompresses every frame of `input` with `dictionary` loaded
+/// (`ZSTD_DCtx_loadDictionary_advanced`), into at most `capacity` bytes.
+///
+/// # Errors
+///
+/// Returns the reference's error name for malformed input, a dictionary it
+/// rejects or one that does not match the frame, and output beyond
+/// `capacity`.
+pub fn decompress_with_dictionary(
+    input: &[u8],
+    capacity: usize,
+    dictionary: &Dictionary,
+) -> Result<Vec<u8>, String> {
+    let decoder = Decoder::new();
+    // SAFETY: the context is live; the dictionary is copied.
+    check(unsafe {
+        ZSTD_DCtx_loadDictionary_advanced(
+            decoder.0,
+            dictionary.bytes.as_ptr().cast(),
+            dictionary.bytes.len(),
+            ZSTD_dlm_byCopy,
+            dictionary.content_type,
+        )
+    })?;
+    let mut output = vec![0u8; capacity];
+    // SAFETY: both buffers are valid for the lengths passed and do not
+    // overlap; the context is live.
+    let written = check(unsafe {
+        ZSTD_decompressDCtx(
+            decoder.0,
+            output.as_mut_ptr().cast(),
+            output.len(),
+            input.as_ptr().cast(),
+            input.len(),
+        )
+    })?;
+    output.truncate(written);
+    Ok(output)
+}
+
+/// Whether the reference accepts `dictionary` for decoding:
+/// `ZSTD_DCtx_loadDictionary_advanced`, which builds a `ZSTD_DDict` and
+/// fails when its entropy tables or repeat offsets are malformed.
+///
+/// # Errors
+///
+/// Returns the reference's error name when it rejects the dictionary.
+pub fn load_decoder_dictionary(dictionary: &Dictionary) -> Result<(), String> {
+    Decoder::with_dictionary(dictionary).map(drop)
+}
+
+/// `ZDICT_trainFromBuffer` over `samples`, into at most `capacity` bytes.
+///
+/// # Errors
+///
+/// Returns ZDICT's error name, for instance when the samples are too few or
+/// too small to train on.
+pub fn train_dictionary(samples: &[&[u8]], capacity: usize) -> Result<Vec<u8>, String> {
+    let joined: Vec<u8> = samples.concat();
+    let sizes: Vec<usize> = samples.iter().map(|sample| sample.len()).collect();
+    let mut dictionary = vec![0u8; capacity];
+    // SAFETY: the buffers are valid for the lengths passed, and the sample
+    // sizes sum to the joined buffer's length.
+    let size = unsafe {
+        ZDICT_trainFromBuffer(
+            dictionary.as_mut_ptr().cast(),
+            dictionary.len(),
+            joined.as_ptr().cast(),
+            sizes.as_ptr(),
+            sizes.len() as core::ffi::c_uint,
+        )
+    };
+    // SAFETY: both only inspect the integer or return a static string.
+    if unsafe { ZDICT_isError(size) } != 0 {
+        let name = unsafe { CStr::from_ptr(ZDICT_getErrorName(size)) };
+        return Err(String::from(
+            name.to_str().unwrap_or("non-UTF-8 error name"),
+        ));
+    }
+    dictionary.truncate(size);
+    Ok(dictionary)
+}
+
+/// `ZSTD_getDictID_fromDict`: the ID a dictionary declares, `0` for raw
+/// content.
+pub fn dict_id_from_dict(dictionary: &[u8]) -> u32 {
+    // SAFETY: the buffer is valid for the length passed.
+    unsafe { ZSTD_getDictID_fromDict(dictionary.as_ptr().cast(), dictionary.len()) }
+}
+
+/// `ZSTD_getDictID_fromFrame`: the ID a frame header names, `0` when none.
+pub fn dict_id_from_frame(frame: &[u8]) -> u32 {
+    // SAFETY: the buffer is valid for the length passed.
+    unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr().cast(), frame.len()) }
 }
 
 /// `ZSTD_compress2` with `params`.
@@ -420,6 +626,21 @@ pub fn decompress_stream(
     chunk: usize,
     window_log_max: Option<i32>,
 ) -> Result<Vec<u8>, String> {
+    decompress_stream_with_dictionary(input, chunk, window_log_max, None)
+}
+
+/// [`decompress_stream`] with `dictionary` loaded into the context first.
+///
+/// # Errors
+///
+/// As [`decompress_stream`], plus a dictionary the reference rejects or one
+/// that does not match a frame.
+pub fn decompress_stream_with_dictionary(
+    input: &[u8],
+    chunk: usize,
+    window_log_max: Option<i32>,
+    dictionary: Option<&Dictionary>,
+) -> Result<Vec<u8>, String> {
     // SAFETY: allocation only; a null result is checked.
     let dctx = unsafe { ZSTD_createDCtx() };
     assert!(!dctx.is_null(), "ZSTD_createDCtx failed");
@@ -434,6 +655,18 @@ pub fn decompress_stream(
     if let Some(log) = window_log_max {
         // SAFETY: the context is live.
         check(unsafe { ZSTD_DCtx_setParameter(guard.0, ZSTD_d_windowLogMax, log) })?;
+    }
+    if let Some(dictionary) = dictionary {
+        // SAFETY: the context is live; the dictionary is copied.
+        check(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(
+                guard.0,
+                dictionary.bytes.as_ptr().cast(),
+                dictionary.bytes.len(),
+                ZSTD_dlm_byCopy,
+                dictionary.content_type,
+            )
+        })?;
     }
     let mut decompressed = Vec::new();
     let mut buffer = vec![0u8; 1 << 17];
@@ -572,4 +805,96 @@ pub fn huf_optimal_table_log(
             flags,
         )
     }
+}
+
+/// A distribution `FSE_readNCount` read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NCount {
+    /// Probabilities of symbols `0..=max_symbol`.
+    pub counts: Vec<i16>,
+    /// Largest symbol described.
+    pub max_symbol: u32,
+    /// Accuracy log.
+    pub table_log: u32,
+    /// Bytes the description occupies.
+    pub size: usize,
+}
+
+/// `FSE_readNCount` for symbols up to `max_symbol` (at most 255).
+///
+/// # Errors
+///
+/// Returns the reference's error name for a malformed description.
+pub fn fse_read_ncount(src: &[u8], max_symbol: u32) -> Result<NCount, String> {
+    let mut counts = vec![0i16; 256];
+    let mut max = max_symbol;
+    let mut log = 0;
+    // SAFETY: `counts` holds 256 entries, enough for any maximum symbol up
+    // to 255; `src` is valid for its length.
+    let size = check(unsafe {
+        mzstd_shim_fse_read_ncount(
+            counts.as_mut_ptr(),
+            &mut max,
+            &mut log,
+            src.as_ptr().cast(),
+            src.len(),
+        )
+    })?;
+    counts.truncate(max as usize + 1);
+    Ok(NCount {
+        counts,
+        max_symbol: max,
+        table_log: log,
+        size,
+    })
+}
+
+/// A Huffman table `HUF_readCTable` read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadHufTable {
+    /// Bytes the description occupies.
+    pub size: usize,
+    /// Whether some described symbol has weight zero.
+    pub has_zero_weights: bool,
+    /// Table log.
+    pub table_log: u32,
+    /// Code length per symbol up to the largest described.
+    pub nb_bits: Vec<u8>,
+    /// Code per symbol up to the largest described.
+    pub values: Vec<u16>,
+}
+
+/// `HUF_readCTable` with a maximum symbol of 255.
+///
+/// # Errors
+///
+/// Returns the reference's error name for a malformed description.
+pub fn huf_read_ctable(src: &[u8]) -> Result<ReadHufTable, String> {
+    let mut max = 255;
+    let mut zero = 0;
+    let mut log = 0;
+    let mut nb_bits = vec![0u8; 256];
+    let mut values = vec![0u16; 256];
+    // SAFETY: both arrays hold 256 entries, one per possible symbol; `src`
+    // is valid for its length.
+    let size = check(unsafe {
+        mzstd_shim_huf_read_ctable(
+            src.as_ptr().cast(),
+            src.len(),
+            &mut max,
+            &mut zero,
+            &mut log,
+            nb_bits.as_mut_ptr(),
+            values.as_mut_ptr(),
+        )
+    })?;
+    nb_bits.truncate(max as usize + 1);
+    values.truncate(max as usize + 1);
+    Ok(ReadHufTable {
+        size,
+        has_zero_weights: zero != 0,
+        table_log: log,
+        nb_bits,
+        values,
+    })
 }

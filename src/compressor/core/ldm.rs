@@ -269,6 +269,41 @@ impl LdmState {
         self.loaded_dict_end = 0;
     }
 
+    /// Loads `bytes`, which start at index `start` of the LDM window, into
+    /// the hash table (`ZSTD_ldm_fillHashTable`), and marks them a loaded
+    /// dictionary ending at `loaded_dict_end`.
+    pub(crate) fn fill_hash_table(
+        &mut self,
+        bytes: &[u8],
+        start: u32,
+        loaded_dict_end: u32,
+        params: &LdmParams,
+    ) {
+        self.loaded_dict_end = loaded_dict_end;
+        let min_match_length = params.min_match_length as usize;
+        let h_bits = params.hash_log - params.bucket_size_log;
+        let mut gear = Gear::new(params);
+        let mut splits = [0u32; BATCH_SIZE];
+        let mut ip = 0;
+        while ip < bytes.len() {
+            let (hashed, found) = gear.feed(&bytes[ip..], &mut splits);
+            for &split in &splits[..found] {
+                let split_end = ip + split as usize;
+                if split_end >= min_match_length {
+                    let split_start = split_end - min_match_length;
+                    let hash = xxh64(&bytes[split_start..split_end]);
+                    let entry = Entry {
+                        offset: start + split_start as u32,
+                        checksum: (hash >> 32) as u32,
+                    };
+                    let bucket = (hash & ((1u64 << h_bits) - 1)) as usize;
+                    self.insert_entry(bucket, entry, params.bucket_size_log);
+                }
+            }
+            ip += hashed;
+        }
+    }
+
     /// Bytes held by the hash table and bucket offsets.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.hash_table.capacity() * core::mem::size_of::<Entry>() + self.bucket_offsets.capacity()
@@ -460,8 +495,12 @@ impl LdmState {
                 start -= correction;
                 end -= correction;
             }
-            self.window
-                .enforce_max_dist(chunk_end, max_dist, &mut self.loaded_dict_end);
+            self.window.enforce_max_dist(
+                chunk_end,
+                max_dist,
+                &mut self.loaded_dict_end,
+                &mut false,
+            );
             let Ok(new_leftover) = dispatch!(backend.0, simd => {
                 self.generate_internal(simd, segments, store, params, chunk_start, chunk_end)
             }) else {
@@ -532,7 +571,7 @@ pub(crate) fn block_compress(
             window: block.window,
             start: ip,
             end: ip + sequence.lit_length,
-            backend: block.backend,
+            ..*block
         };
         let new_lit_length = compressor(ms, seq_store, rep, &sub) as u32;
         ip += sequence.lit_length;
@@ -551,8 +590,7 @@ pub(crate) fn block_compress(
     let tail = BlockInput {
         window: block.window,
         start: ip,
-        end: block.end,
-        backend: block.backend,
+        ..*block
     };
     compressor(ms, seq_store, rep, &tail)
 }

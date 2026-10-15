@@ -7,6 +7,11 @@
 //! executes every sequence as soon as it is decoded: literals are copied to
 //! the output, followed by a match copied from the frame's history.
 //!
+//! Matches may reach before the frame into a dictionary's content, which is
+//! kept apart from the output, as the reference's `extDict` segment: such
+//! sequences take the cold exact path, so frames without a dictionary run
+//! the same loop as before.
+//!
 //! The loop is the reference's `ZSTD_decompressSequences_body`: each table
 //! row carries its baseline and extra-bit count ([`SeqRow`]), the container
 //! is refilled once per sequence and once more in the middle when the
@@ -24,6 +29,7 @@ use super::copy::{
     INDEX_LIMIT, MatchCopy, WILDCOPY_OVERLENGTH, exact_match, idx, wildcopy_literals,
     wildcopy_match,
 };
+use super::dictionary::DecoderEntropy;
 use super::fse::{SEQ_TABLE_LOG_MAX, SEQ_TABLE_SIZE, SeqRow, SeqTable, read_distribution, seq_row};
 use super::literals::{Literals, encoding_type};
 use crate::decompressor::{DecodeLimits, InvalidDataKind};
@@ -139,15 +145,23 @@ const MATCH_LENGTHS: SymbolKind = SymbolKind {
     extra_bits: &ML_BITS,
 };
 
-/// Where the history a block may reference starts, and its limits.
+/// Where the history a block may reference starts, its limits, and the
+/// dictionary the frame inherits.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockContext {
+pub(crate) struct BlockContext<'a> {
     /// Index in the output of the frame's first retained byte.
     pub(crate) history_start: usize,
     /// The frame's window size: the largest permitted offset.
     pub(crate) window: u64,
     /// Largest regenerated block size.
     pub(crate) block_max: usize,
+    /// Dictionary content that precedes the frame's first byte, which is
+    /// then at `history_start`; empty when the block may not reference
+    /// one. Offsets reaching into it are not limited by the window.
+    pub(crate) dictionary: &'a [u8],
+    /// The dictionary's entropy tables, which repeat modes use until the
+    /// frame replaces them.
+    pub(crate) entropy: Option<&'a DecoderEntropy>,
 }
 
 /// What a [`TableSlot`] currently holds.
@@ -160,6 +174,9 @@ enum SlotContent {
     Predefined,
     /// An RLE or a described distribution.
     Custom,
+    /// The dictionary's table, inherited at the frame start; the slot's
+    /// own table is not used.
+    Dictionary,
 }
 
 /// One symbol type's table, allocated on first use and rebuilt in place.
@@ -207,16 +224,7 @@ impl TableSlot {
                 Ok(1)
             }
             EncodingType::Compressed => {
-                let (distribution, used) = read_distribution(src, kind.max_symbol)?;
-                if distribution.table_log > kind.max_log {
-                    return Err(InvalidDataKind::FseTable);
-                }
-                self.table_mut().fill(
-                    distribution.counts(),
-                    distribution.table_log,
-                    kind.bases,
-                    kind.extra_bits,
-                );
+                let used = fill_described(self.table_mut(), kind, src)?;
                 self.content = SlotContent::Custom;
                 Ok(used)
             }
@@ -229,10 +237,12 @@ impl TableSlot {
         }
     }
 
-    /// The table `Repeat_Mode` and execution use, if any.
-    fn get(&self) -> Option<&SeqTable> {
+    /// The table `Repeat_Mode` and execution use, if any; `dictionary` is
+    /// the dictionary's table of the same symbol type.
+    fn get<'a>(&'a self, dictionary: Option<&'a SeqTable>) -> Option<&'a SeqTable> {
         match self.content {
             SlotContent::Empty => None,
+            SlotContent::Dictionary => dictionary,
             SlotContent::Predefined | SlotContent::Custom => self.table.as_deref(),
         }
     }
@@ -243,6 +253,55 @@ impl TableSlot {
             .as_ref()
             .map_or(0, |table| table.retained_bytes())
     }
+}
+
+/// Rebuilds `table` from the FSE table description at the start of `src`,
+/// returning the description's size: `FSE_readNCount` and the accuracy
+/// limit of `ZSTD_buildSeqTable` and `ZSTD_loadDEntropy`.
+fn fill_described(
+    table: &mut SeqTable,
+    kind: SymbolKind,
+    src: &[u8],
+) -> Result<usize, InvalidDataKind> {
+    let (distribution, used) = read_distribution(src, kind.max_symbol)?;
+    if distribution.table_log > kind.max_log {
+        return Err(InvalidDataKind::FseTable);
+    }
+    table.fill(
+        distribution.counts(),
+        distribution.table_log,
+        kind.bases,
+        kind.extra_bits,
+    );
+    Ok(used)
+}
+
+/// The three sequence symbol types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SymbolType {
+    /// Literal lengths.
+    LiteralLengths,
+    /// Offset codes.
+    Offsets,
+    /// Match lengths.
+    MatchLengths,
+}
+
+/// Reads the FSE table description of `symbol` at the start of `src`, as
+/// a Zstandard-format dictionary stores it, returning the table and the
+/// description's size.
+pub(crate) fn read_table(
+    symbol: SymbolType,
+    src: &[u8],
+) -> Result<(SeqTable, usize), InvalidDataKind> {
+    let kind = match symbol {
+        SymbolType::LiteralLengths => LITERAL_LENGTHS,
+        SymbolType::Offsets => OFFSETS,
+        SymbolType::MatchLengths => MATCH_LENGTHS,
+    };
+    let mut table = SeqTable::default();
+    let used = fill_described(&mut table, kind, src)?;
+    Ok((table, used))
 }
 
 /// The decoding tables `Repeat_Mode` refers to, per frame.
@@ -367,6 +426,9 @@ struct Executor<'a, 'b> {
     lp: usize,
     block_limit: usize,
     window: usize,
+    /// Dictionary content before the output's first byte, read only by the
+    /// cold path.
+    dictionary: &'b [u8],
 }
 
 impl Executor<'_, '_> {
@@ -394,7 +456,19 @@ impl Executor<'_, '_> {
         if match_end + WILDCOPY_OVERLENGTH <= self.out.len() {
             // Within the block's maximum, with room for the overlength.
             if offset > lit_end || offset > self.window {
-                return Err(InvalidDataKind::Offset.into());
+                // Into a dictionary, past the window with one, or invalid.
+                execute_exactly(
+                    self.out,
+                    self.lits,
+                    [op, lit_end, match_end],
+                    [lp, lit_stop],
+                    offset,
+                    [self.block_limit, self.window],
+                    self.dictionary,
+                )?;
+                self.op = match_end;
+                self.lp = lit_stop;
+                return Ok(());
             }
             wildcopy_literals(self.out, op, self.lits, lp, literal_length);
             if offset >= 32 {
@@ -426,6 +500,7 @@ impl Executor<'_, '_> {
                 [lp, lit_stop],
                 offset,
                 [self.block_limit, self.window],
+                self.dictionary,
             )?;
         }
         self.op = match_end;
@@ -435,11 +510,17 @@ impl Executor<'_, '_> {
 }
 
 /// Executes a sequence that ends too close to the end of the output for
-/// chunked copies, or past the block's maximum: the reference's
-/// `ZSTD_execSequenceEnd`. Out of line and cold, so the main loop keeps its
-/// registers. `ends` are the sequence's start, literal end and match end in
-/// the output; `lit_range` its literals; `limits` the block's end and the
-/// window.
+/// chunked copies, past the block's maximum, or whose match leaves the
+/// frame's output or window: the reference's `ZSTD_execSequenceEnd` and
+/// the `extDict` branch of `ZSTD_execSequence`. Out of line and cold, so
+/// the main loop keeps its registers. `ends` are the sequence's start,
+/// literal end and match end in the output; `lit_range` its literals;
+/// `limits` the block's end and the window.
+///
+/// With `dictionary` content before the output's first byte, an offset may
+/// reach `dictionary.len()` bytes before it, whatever the window, as
+/// `oLitEnd - virtualStart` bounds it in the reference; a match starting
+/// there continues into the output.
 #[cold]
 #[inline(never)]
 fn execute_exactly(
@@ -449,20 +530,39 @@ fn execute_exactly(
     lit_range: [usize; 2],
     offset: usize,
     limits: [usize; 2],
+    dictionary: &[u8],
 ) -> Result<(), BlockError> {
     let [op, lit_end, match_end] = ends;
     let [block_limit, window] = limits;
     if match_end > block_limit {
         return Err(InvalidDataKind::BlockSize.into());
     }
-    if offset > lit_end || offset > window {
+    let reach = if dictionary.is_empty() {
+        lit_end.min(window)
+    } else {
+        lit_end + dictionary.len()
+    };
+    if offset > reach {
         return Err(InvalidDataKind::Offset.into());
     }
     if match_end > out.len() {
         return Err(BlockError::OutputFull);
     }
     out[op..lit_end].copy_from_slice(&lits[lit_range[0]..lit_range[1]]);
-    exact_match(out, lit_end, offset, match_end - lit_end);
+    let mut start = lit_end;
+    if offset > lit_end {
+        // The match starts `before` bytes before the output, in the
+        // dictionary, and continues from the output's first byte.
+        let before = offset - lit_end;
+        let from = &dictionary[dictionary.len() - before..];
+        let count = from.len().min(match_end - lit_end);
+        out[lit_end..lit_end + count].copy_from_slice(&from[..count]);
+        start += count;
+        if start == match_end {
+            return Ok(());
+        }
+    }
+    exact_match(out, start, offset, match_end - start);
     Ok(())
 }
 
@@ -474,14 +574,21 @@ impl SequenceTables {
             + self.match_lengths.retained_bytes()
     }
 
-    /// Forgets every table at a frame start, keeping their allocations.
-    pub(crate) fn reset(&mut self) {
+    /// Forgets every table at a frame start, keeping their allocations;
+    /// with `dictionary_tables`, repeat modes reuse the dictionary's tables
+    /// until the frame replaces them (the reference's `fseEntropy`).
+    pub(crate) fn reset(&mut self, dictionary_tables: bool) {
+        let content = if dictionary_tables {
+            SlotContent::Dictionary
+        } else {
+            SlotContent::Empty
+        };
         for slot in [
             &mut self.literal_lengths,
             &mut self.offsets,
             &mut self.match_lengths,
         ] {
-            slot.content = SlotContent::Empty;
+            slot.content = content;
         }
     }
 
@@ -557,13 +664,30 @@ impl SequenceTables {
         // the copies' index masks rely on.
         let window = usize::try_from(context.window).unwrap_or(usize::MAX);
         let base = context.history_start.max(op.saturating_sub(window));
+        // The dictionary precedes the history's first byte, so it is out of
+        // reach once the window starts after it.
+        let dictionary = if base == context.history_start {
+            context.dictionary
+        } else {
+            &[]
+        };
         let cut_end = out.len().min(base.saturating_add(INDEX_LIMIT));
         let out = &mut out[base..cut_end];
         let op = op - base;
         let missing = InvalidDataKind::SequencesSection;
-        let ll_table = self.literal_lengths.get().ok_or(missing)?;
-        let of_table = self.offsets.get().ok_or(missing)?;
-        let ml_table = self.match_lengths.get().ok_or(missing)?;
+        let entropy = context.entropy;
+        let ll_table = self
+            .literal_lengths
+            .get(entropy.map(|tables| &tables.literal_lengths))
+            .ok_or(missing)?;
+        let of_table = self
+            .offsets
+            .get(entropy.map(|tables| &tables.offsets))
+            .ok_or(missing)?;
+        let ml_table = self
+            .match_lengths
+            .get(entropy.map(|tables| &tables.match_lengths))
+            .ok_or(missing)?;
         let bits = BitContainer::new(stream).ok_or(InvalidDataKind::SequenceStream)?;
         let mut decoder = SequenceDecoder {
             bits,
@@ -594,6 +718,7 @@ impl SequenceTables {
             lp: 0,
             block_limit,
             window,
+            dictionary,
         };
         // The last sequence leaves the states alone; peeling it keeps that
         // test out of the loop. Callers handle empty sections themselves.
@@ -638,7 +763,7 @@ mod tests {
         literals: &[u8],
         reps: &mut [u32; REP_NUM],
         out: &mut Vec<u8>,
-        context: BlockContext,
+        context: BlockContext<'_>,
     ) -> Result<(), InvalidDataKind> {
         let start = out.len();
         let mut bytes = literals.to_vec();
@@ -681,10 +806,12 @@ mod tests {
         }
     }
 
-    const CONTEXT: BlockContext = BlockContext {
+    const CONTEXT: BlockContext<'static> = BlockContext {
         history_start: 0,
         window: 1 << 20,
         block_max: 1 << 17,
+        dictionary: &[],
+        entropy: None,
     };
 
     #[test]
@@ -958,9 +1085,159 @@ mod tests {
     }
 
     #[test]
+    fn matches_reach_into_the_dictionary_before_the_output() {
+        let dictionary = b"0123456789";
+        let context = BlockContext {
+            dictionary,
+            ..CONTEXT
+        };
+        // Literal length 1, match length 5, offset code 3 with extra bits
+        // 0b011: offset 8, seven bytes into the dictionary.
+        let tables = rle_tables(1, 3, 2);
+        let stream = backward_stream(&[(3, 3)]);
+        let mut reps = REP_START;
+        let mut out = Vec::new();
+        run(&tables, 1, &stream, b"z", &mut reps, &mut out, context).expect("valid");
+        assert_eq!(out, b"z34567");
+        // Match length 10 at offset 3, from two bytes before the output:
+        // "89", then on into the output's own bytes.
+        let tables = rle_tables(1, 2, 7);
+        let mut out = Vec::new();
+        run(
+            &tables,
+            1,
+            &backward_stream(&[(2, 2)]),
+            b"z",
+            &mut reps,
+            &mut out,
+            context,
+        )
+        .expect("valid");
+        assert_eq!(out, b"z89z89z89z8");
+        // A match entirely inside the dictionary.
+        let mut out = Vec::new();
+        let tables = rle_tables(0, 3, 0);
+        run(&tables, 1, &stream, b"", &mut reps, &mut out, context).expect("valid");
+        assert_eq!(out, b"234");
+        // Offset 12 reaches before the dictionary; 11 is its first byte.
+        let tables = rle_tables(1, 3, 0);
+        let mut out = Vec::new();
+        assert_eq!(
+            run(
+                &tables,
+                1,
+                &backward_stream(&[(7, 3)]),
+                b"z",
+                &mut reps,
+                &mut out,
+                context
+            ),
+            Err(InvalidDataKind::Offset)
+        );
+        run(
+            &tables,
+            1,
+            &backward_stream(&[(6, 3)]),
+            b"z",
+            &mut reps,
+            &mut out,
+            context,
+        )
+        .expect("valid");
+        assert_eq!(out, b"z012");
+        // With a dictionary, offsets inside the output may pass the window:
+        // literal length 3 and offset 10 in a 9-byte window.
+        let wide = BlockContext {
+            window: 9,
+            ..context
+        };
+        let tables = rle_tables(3, 3, 0);
+        let mut out = b"abcdefgh".to_vec();
+        run(
+            &tables,
+            1,
+            &backward_stream(&[(5, 3)]),
+            b"xyz",
+            &mut reps,
+            &mut out,
+            wide,
+        )
+        .expect("valid");
+        assert_eq!(out, b"abcdefghxyzbcd");
+        // Once the window cuts the history short, the dictionary is out of
+        // reach and the window limits offsets again.
+        let narrow = BlockContext {
+            window: 1,
+            ..context
+        };
+        let tables = rle_tables(0, 2, 0);
+        assert_eq!(
+            run(
+                &tables,
+                1,
+                &backward_stream(&[(3, 2)]),
+                b"",
+                &mut reps,
+                &mut b"abcdefgh".to_vec(),
+                narrow,
+            ),
+            Err(InvalidDataKind::Offset)
+        );
+    }
+
+    #[test]
+    fn dictionary_tables_serve_repeat_modes_until_replaced() {
+        let bytes = crate::decompressor::core::test_dictionary([1, 2, 3], b"0123456789");
+        let (entropy, _) = crate::decompressor::core::DecoderEntropy::load(&bytes).expect("valid");
+        let mut tables = SequenceTables::default();
+        tables.reset(true);
+        assert_eq!(tables.read_header(&[1, 0xfc]), Ok((1, 2)));
+        let context = BlockContext {
+            entropy: Some(&entropy),
+            ..CONTEXT
+        };
+        // Fifteen zero state bits; every symbol is code 0: literal length
+        // 0, repeat offset 2 (as the literal length is zero), match length
+        // 3, all from the history.
+        let mut reps = entropy.reps;
+        let mut out = b"abcdef".to_vec();
+        run(&tables, 1, &[0x00, 0x80], b"", &mut reps, &mut out, context).expect("valid");
+        assert_eq!(out, b"abcdefefe");
+        assert_eq!(reps, [2, 1, 3]);
+        // Without the dictionary's tables there is nothing to execute.
+        assert_eq!(
+            run(&tables, 1, &[0x00, 0x80], b"", &mut reps, &mut out, CONTEXT),
+            Err(InvalidDataKind::SequencesSection)
+        );
+        // A described table replaces the dictionary's.
+        assert_eq!(tables.read_header(&[1, 0x00]), Ok((1, 2)));
+        assert!(tables.literal_lengths.get(None).is_some());
+    }
+
+    #[test]
+    fn dictionary_tables_read_like_block_tables() {
+        // Accuracy log 5 with all states on symbol 0 (see the dictionary
+        // tests), then a log above each type's limit.
+        let single = [0xf0, 0x03];
+        for symbol in [
+            SymbolType::LiteralLengths,
+            SymbolType::Offsets,
+            SymbolType::MatchLengths,
+        ] {
+            let (table, used) = read_table(symbol, &single).expect("valid");
+            assert_eq!((table.log(), used), (5, 2));
+        }
+        // Log 9 (nibble 4) is beyond the offsets' limit of 8.
+        assert_eq!(
+            read_table(SymbolType::Offsets, &[0x04, 0, 0, 0]).map(|_| ()),
+            Err(InvalidDataKind::FseTable)
+        );
+    }
+
+    #[test]
     fn reset_forgets_repeat_tables() {
         let mut tables = rle_tables(0, 0, 0);
-        tables.reset();
+        tables.reset(false);
         assert_eq!(
             tables.read_header(&[1, 0xfc]),
             Err(InvalidDataKind::SequencesSection)

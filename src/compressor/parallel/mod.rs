@@ -399,8 +399,14 @@ impl ScopedParallelTask<'_> {
                     let start = s * segment;
                     let end = (start + segment).min(input.len());
                     let from = start.saturating_sub(overlap);
-                    match compress_segment(&mut engine, plan, &input[from..end], start - from) {
-                        Ok(bytes) => out.extend_from_slice(&bytes),
+                    match compress_segment(
+                        &mut engine,
+                        plan,
+                        &input[from..end],
+                        start - from,
+                        &mut out,
+                    ) {
+                        Ok(()) => {}
                         Err(error) => {
                             result = Err(EncodeError::from_core(error, 0, None));
                             break;
@@ -511,7 +517,9 @@ impl<'a> ScopedParallelBatch<'a> {
             parts.iter().for_each(|part| out.extend_from_slice(part));
             return Ok(());
         }
-        out.extend_from_slice(&self.plan.header());
+        let header = self.plan.header();
+        out.reserve(header.len() + parts.iter().map(Vec::len).sum::<usize>() + 7);
+        out.extend_from_slice(&header);
         parts.iter().for_each(|part| out.extend_from_slice(part));
         let mut hasher = Xxh64::new(0);
         if self.plan.applied.fparams.checksum {

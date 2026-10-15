@@ -12,14 +12,16 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
   one-shot calls match `ZSTD_compress2`, and sessions match
   `ZSTD_compressStream2` driven with the same chunks, output capacities and
   flushes. This holds for levels -131072 to 22, the explicit compression
-  parameters, long distance matching, checksums, content sizes, pledged sizes
-  and size hints.
+  parameters, long distance matching, checksums, content sizes, pledged sizes,
+  size hints and dictionaries (raw or Zstandard-format, as
+  `ZSTD_CCtx_loadDictionary` loads them).
 - **Independent decoder** written from the format specification. It decodes
-  every frame zstd writes apart from dictionary frames, with bounded window,
+  every frame zstd writes, with or without a dictionary, with bounded window,
   input and output limits.
 - **Parallel compression** with tasks you run on your own executor. Frames
   are valid Zstandard frames and are identical for any task count, but they
-  are not byte-identical to zstd's multithreaded mode.
+  are not byte-identical to zstd's multithreaded mode. Segments are primed
+  with the input before them the way zstd's multithreaded mode primes a job.
 - **No `unsafe`, no dependencies on zstd.** It runs with `no_std` + `alloc`,
   and there is a C ABI in `mzstd-ffi`.
 
@@ -55,6 +57,25 @@ let mut encoder = Compressor::new(config)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Dictionaries make small inputs compress well. Prepare one for the
+configuration you compress with; the same dictionary decodes its frames:
+
+```rust
+use mzstd::dictionary::DictionaryBuilder;
+use mzstd::{Compressor, Decompressor, EncoderConfig};
+
+let config = EncoderConfig::default();
+// Raw content here; a trained Zstandard-format dictionary works the same way.
+let dictionary = DictionaryBuilder::new(br#"{"user":"alice","city":"Oslo","tags":["a","b"]}"#)
+    .with_config(config)
+    .build()?;
+let record = br#"{"user":"alice","city":"Oslo","tags":["b"]}"#;
+let frame = Compressor::new(config)?.compress_with_dictionary(&dictionary, record)?;
+let restored = Decompressor::default().decompress_with_dictionary(&dictionary, &frame)?;
+assert_eq!(restored, record);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Choose your API
 
 Compression and decompression expose the same core I/O shapes. Pick the shape that
@@ -72,6 +93,7 @@ either for a whole input at once or for input that arrives in chunks. It require
 | Push input through `std::io::Write` | `Compressor::writer` | `Decompressor::writer` |
 | Drive input/output incrementally | `start` → `EncoderSession` | `start` → `DecoderSession` |
 | Same, with the session owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
+| Any of the above with a dictionary | `compress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` | `decompress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` |
 | Split one known input across your threads | `ParallelCompressor::prepare_slice` → `ScopedParallelBatch` | — |
 | Stream chunked input across your threads | `ParallelCompressor::start` → `ParallelEncoderSession` + `ParallelTaskQueue` | — |
 | Same, with the session owning the compressor | `ParallelCompressor::into_session` → `ParallelEncoderSessionOwned` | — |

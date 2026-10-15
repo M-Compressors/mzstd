@@ -10,6 +10,7 @@ pub(crate) mod fse;
 pub(crate) mod hist;
 pub(crate) mod huf;
 pub(crate) mod literals;
+pub(crate) mod read;
 pub(crate) mod sequences;
 
 /// How a previous sequence table may be reused (`FSE_repeat`).

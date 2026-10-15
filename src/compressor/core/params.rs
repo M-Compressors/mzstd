@@ -422,22 +422,77 @@ pub(crate) const fn resolve_max_block_size(max_block_size: usize) -> usize {
     }
 }
 
-/// Shrinks parameters to fit a known source (`ZSTD_adjustCParams_internal`,
-/// without dictionaries).
-///
-/// `src_size` is [`CONTENT_SIZE_UNKNOWN`] when not known; `0` means an
-/// empty source.
-pub(crate) fn adjust_cparams(
+/// How a dictionary's size enters parameter selection (`ZSTD_CParamMode_e`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum CParamMode {
+    /// No dictionary, or nothing known about how it is used
+    /// (`ZSTD_cpm_unknown`).
+    Unknown,
+    /// A dictionary is attached by reference; its tables have their own
+    /// parameters, so only the source counts (`ZSTD_cpm_attachDict`).
+    AttachDict,
+    /// Parameters for a dictionary's own tables (`ZSTD_cpm_createCDict`).
+    CreateCDict,
+    /// A dictionary is copied into the context's tables
+    /// (`ZSTD_cpm_noAttachDict`).
+    NoAttachDict,
+}
+
+/// `ZSTD_SHORT_CACHE_TAG_BITS`.
+pub(crate) const SHORT_CACHE_TAG_BITS: u32 = 8;
+
+/// Whether a dictionary's fast and dfast tables carry tags in their low bits
+/// (`ZSTD_CDictIndicesAreTagged`).
+pub(crate) const fn cdict_indices_are_tagged(cparams: &CParams) -> bool {
+    matches!(cparams.strategy, Strategy::Fast | Strategy::DFast)
+}
+
+/// `ZSTD_dictAndWindowLog`.
+fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
+    const MAX_WINDOW_SIZE: u64 = 1 << WINDOWLOG_MAX;
+    if dict_size == 0 {
+        return window_log;
+    }
+    let window_size = 1u64 << window_log;
+    let dict_and_window_size = dict_size + window_size;
+    if window_size >= dict_size + src_size {
+        window_log
+    } else if dict_and_window_size >= MAX_WINDOW_SIZE {
+        WINDOWLOG_MAX
+    } else {
+        highbit32((dict_and_window_size - 1) as u32) + 1
+    }
+}
+
+/// Shrinks parameters to fit a source of `src_size` bytes and a dictionary
+/// of `dict_size` used as `mode` says (`ZSTD_adjustCParams_internal`).
+// Always inlined: callers without a dictionary pass constants that fold
+// the dictionary branches away.
+#[inline(always)]
+pub(crate) fn adjust_cparams_for(
     mut cpar: CParams,
-    src_size: u64,
+    mut src_size: u64,
+    mut dict_size: u64,
+    mode: CParamMode,
     use_row_match_finder: ParamSwitch,
 ) -> CParams {
+    const MIN_SRC_SIZE: u64 = 513;
     const MAX_WINDOW_RESIZE: u64 = 1 << (WINDOWLOG_MAX - 1);
     debug_assert!(cpar.is_valid());
 
+    match mode {
+        CParamMode::Unknown | CParamMode::NoAttachDict => {}
+        CParamMode::CreateCDict => {
+            if dict_size != 0 && src_size == CONTENT_SIZE_UNKNOWN {
+                src_size = MIN_SRC_SIZE;
+            }
+        }
+        CParamMode::AttachDict => dict_size = 0,
+    }
+
     // Resize the window for small inputs, to use less memory.
-    if src_size <= MAX_WINDOW_RESIZE {
-        let t_size = src_size as u32;
+    if src_size <= MAX_WINDOW_RESIZE && dict_size <= MAX_WINDOW_RESIZE {
+        let t_size = (src_size + dict_size) as u32;
         let hash_size_min = 1u32 << HASHLOG_MIN;
         let src_log = if t_size < hash_size_min {
             HASHLOG_MIN
@@ -449,7 +504,7 @@ pub(crate) fn adjust_cparams(
         }
     }
     if src_size != CONTENT_SIZE_UNKNOWN {
-        let dict_and_window_log = cpar.window_log;
+        let dict_and_window_log = dict_and_window_log(cpar.window_log, src_size, dict_size);
         let cycle = cycle_log(cpar.chain_log, cpar.strategy);
         if cpar.hash_log > dict_and_window_log + 1 {
             cpar.hash_log = dict_and_window_log + 1;
@@ -460,6 +515,17 @@ pub(crate) fn adjust_cparams(
     }
     if cpar.window_log < crate::shared::format::WINDOW_LOG_ABSOLUTE_MIN {
         cpar.window_log = crate::shared::format::WINDOW_LOG_ABSOLUTE_MIN;
+    }
+
+    // Tagged dictionary tables leave 24 bits per index.
+    if mode == CParamMode::CreateCDict && cdict_indices_are_tagged(&cpar) {
+        let max_short_cache_hash_log = 32 - SHORT_CACHE_TAG_BITS;
+        if cpar.hash_log > max_short_cache_hash_log {
+            cpar.hash_log = max_short_cache_hash_log;
+        }
+        if cpar.chain_log > max_short_cache_hash_log {
+            cpar.chain_log = max_short_cache_hash_log;
+        }
     }
 
     let use_row_match_finder = if matches!(use_row_match_finder, ParamSwitch::Auto) {
@@ -479,10 +545,41 @@ pub(crate) fn adjust_cparams(
 }
 
 /// Level-table parameters for a source size hint (`ZSTD_getCParams_internal`
-/// without dictionaries).
+/// without a dictionary).
+#[cfg(test)]
 pub(crate) fn level_cparams(level: i32, src_size_hint: u64) -> CParams {
+    level_cparams_for(level, src_size_hint, 0, CParamMode::Unknown)
+}
+
+/// The size that selects a level table row (`ZSTD_getCParamRowSize`).
+const fn cparam_row_size(src_size_hint: u64, dict_size: u64, mode: CParamMode) -> u64 {
+    let dict_size = if matches!(mode, CParamMode::AttachDict) {
+        0
+    } else {
+        dict_size
+    };
+    let unknown = src_size_hint == CONTENT_SIZE_UNKNOWN;
+    let added_size = if unknown && dict_size > 0 { 500 } else { 0 };
+    if unknown && dict_size == 0 {
+        CONTENT_SIZE_UNKNOWN
+    } else {
+        src_size_hint
+            .wrapping_add(dict_size)
+            .wrapping_add(added_size)
+    }
+}
+
+/// Level-table parameters for a source size hint and a dictionary of
+/// `dict_size` bytes used as `mode` says (`ZSTD_getCParams_internal`).
+#[inline(always)]
+pub(crate) fn level_cparams_for(
+    level: i32,
+    src_size_hint: u64,
+    dict_size: u64,
+    mode: CParamMode,
+) -> CParams {
     const KB: u64 = 1 << 10;
-    let r_size = src_size_hint;
+    let r_size = cparam_row_size(src_size_hint, dict_size, mode);
     let table_id = usize::from(r_size <= 256 * KB)
         + usize::from(r_size <= 128 * KB)
         + usize::from(r_size <= 16 * KB);
@@ -496,7 +593,7 @@ pub(crate) fn level_cparams(level: i32, src_size_hint: u64) -> CParams {
         let clamped = level.max(MIN_CLEVEL);
         cparams.target_length = clamped.unsigned_abs();
     }
-    adjust_cparams(cparams, src_size_hint, ParamSwitch::Auto)
+    adjust_cparams_for(cparams, src_size_hint, dict_size, mode, ParamSwitch::Auto)
 }
 
 #[cfg(test)]

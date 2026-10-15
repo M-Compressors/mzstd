@@ -12,17 +12,19 @@ many bytes a comparison covers per step.
 
 ```mermaid
 graph TD
-    Block["block::build_seq_store"] -->|"BlockInput { window, start, end, backend }"| Entry["btopt / btopt_ext / btultra / btultra_ext / btultra2"]
+    Block["block::build_seq_store"] -->|"BlockInput { window, start, end, backend, dms, symbol_costs }"| Entry["btopt / btopt_ext / btopt_dms / btultra / btultra_ext / btultra_dms / btultra2"]
     Block -->|"generate_sequences(.., backend)"| Ldm["ldm::LdmState"]
-    Entry -->|"dispatch!(backend) once per block"| Parser["opt_generic::&lt;S, OPT_LEVEL, EXT&gt; (#[simd])"]
+    Entry -->|"dispatch!(backend) once per block"| Parser["opt_generic::&lt;S, OPT_LEVEL, EXT, DMS&gt; (#[simd])"]
     Parser --> Split["Finder::split(ms): Finder + OptState"]
     Split --> Find["find_matches: match on mls"]
-    Find --> Gam["get_all_matches::&lt;S, EXT, MLS&gt; (#[simd] entry)"]
+    Find --> Gam["get_all_matches::&lt;S, EXT, DMS, MLS&gt; (#[simd] entry)"]
     Gam --> Update["update_tree (out of line) -> insert_bt1"]
     Gam --> Search["insert_bt_and_get_all_matches"]
     Update --> Walk["TreeWalk::run"]
     Search --> Walk
     Walk --> Ctx["Ctx::extend"]
+    Search -->|"DMS, comparisons left"| Dict["search_dictionary: attached dictionary's tree (read only)"]
+    Dict --> Count2["Ctx::count_dictionary -> opt_count::count_2segments"]
     Ctx --> Count["opt_count::count_ordered: first word inline / count_2segments"]
     Count --> Run["count_ordered_run (out of line, unlikely)"]
     Run --> Tail["opt_count::count_tail (#[simd] entry): words, native vectors, words"]
@@ -35,8 +37,9 @@ graph TD
 reaches the parser through `BlockInput::backend` and the LDM through an
 argument of `generate_sequences`. Each strategy entry dispatches once per
 block; `opt_generic` is monomorphized over the SIMD token, the optimization
-level (0 for btopt, 2 for the ultra strategies) and whether the window has
-an external dictionary, which are the reference's template parameters.
+level (0 for btopt, 2 for the ultra strategies), whether the window has
+an external dictionary and whether a dictionary is attached, which are the
+reference's template parameters.
 `find_matches` picks the `get_all_matches` instance for the block's minimum
 match length (`ZSTD_selectBtGetAllMatches`); the branch resolves the same
 way for every position of a block. `get_all_matches` and `count_tail` are
@@ -216,6 +219,81 @@ from `opt_count` (both segments). Its backward length is a byte loop, as in
 the reference. The rolling hash is a serial dependency chain (each step
 shifts the previous state), so it stays scalar.
 
+## Dictionaries
+
+### Attached dictionaries (dictMatchState)
+
+`btopt_dms` and `btultra_dms` (`ZSTD_compressBlock_{btopt,btultra}_dictMatchState`;
+btultra2 has no variant of its own and uses `btultra_dms`, as the reference's
+selection table does) run `opt_generic::<S, OPT_LEVEL, false, true>`. The
+`DMS` const parameter is the reference's `dictMode == ZSTD_dictMatchState`
+template argument: the noDict (`EXT = false, DMS = false`) and extDict
+(`EXT = true, DMS = false`) instances compile exactly the branches they had
+before. A `*_dms` entry called without `BlockInput::dms` runs the plain
+noDict parser, which is what `ZSTD_matchState_dictMode` selects then.
+
+`Ctx::with_dictionary` derives the dictionary's constants once per block
+into `DictSearch` (`dmsHashLog`, `dmsBtMask`, `dmsLowLimit`, `dmsHighLimit`,
+`dmsBtLow`, its hash table, its tree cut to `2 << dmsBtLog` cells and its
+bytes). Dictionary index `i` is window index `i + dmsIndexDelta`, with
+`dmsIndexDelta = windowLow - dmsHighLimit`: the dictionary ends just below
+the window's low limit, where the attach left the working window.
+
+```mermaid
+sequenceDiagram
+    participant G as get_all_matches::<S, false, true, MLS>
+    participant U as update_tree::<S, false, MLS>
+    participant I as insert_bt_and_get_all_matches
+    participant W as TreeWalk::run
+    participant D as search_dictionary
+    G->>U: insert skipped positions (noDict insertion)
+    G->>I: search ip
+    I->>I: repeat offsets: prefix, else dictionary_repeat_length (dms bytes, then prefix start)
+    I->>I: 3-byte hash candidate (prefix only; dictionaries have no 3-byte table)
+    I->>W: block's own tree
+    W-->>I: best length, matchEndIdx, comparisons left (0 after a stop)
+    alt comparisons left
+        I->>D: dictionary's tree with the remaining budget
+        D-->>I: more matches, matchEndIdx
+    end
+    I-->>G: matches, nextToUpdate = matchEndIdx - 8
+```
+
+The dictionary's tree is only read: candidates are compared through
+`Ctx::count_dictionary` (`ZSTD_count_2segments(ip, dmsBase + i, iend,
+dmsEnd, prefixStart)`; a candidate whose known common bytes already run past
+the dictionary's end counts nothing more, as the reference's does), and the
+walk follows the smaller/larger child by the candidate's next byte, read in
+the dictionary or, past its end, at window index `i + length +
+dmsIndexDelta` in the prefix.
+
+### Statistics from dictionary entropy tables
+
+`OptState::rescale_freqs(src, opt_level, symbol_costs)` takes the block's
+inherited entropy tables (`BlockInput::symbol_costs`, the reference's
+`ms->opt.symbolCosts = &prevCBlock->entropy`). On a frame's first block
+(`litLengthSum == 0`) it seeds the frequencies from them when their Huffman
+table is `Repeat::Valid`, which only a Zstandard-format dictionary covering
+all 256 bytes produces; this applies to attached, copied and loaded
+dictionaries alike.
+
+```mermaid
+flowchart TD
+    R["rescale_freqs"] --> F{"litLengthSum == 0?"}
+    F -- no --> S["scale_stats: downscale running statistics"]
+    F -- yes --> V{"symbol_costs Huffman table Valid?"}
+    V -- yes --> D["seed_from_dictionary: literal 2^(11 - HUF bits), sequence codes 2^(10 - FSE max bits), 1 for a zero cost; prices dynamic even for blocks of 8 bytes or less"]
+    V -- no --> N["seed_without_dictionary: literal histogram of src, fixed sequence frequencies; predefined prices for blocks of 8 bytes or less"]
+    S --> B["set_base_prices, rebuild_tables"]
+    D --> B
+    N --> B
+```
+
+The bit costs come from `huf::CTable::symbol_nb_bits`
+(`HUF_getNbBitsFromCTable`) and `fse::CTable::max_nb_bits`
+(`FSE_getMaxNbBits`). Shifts wrap their count modulo 32, as the unchecked C
+shift does on common targets, so a malformed table cannot panic.
+
 ## Invariants
 
 - Every byte the parser emits is the reference's. The SIMD level, the price
@@ -250,3 +328,9 @@ shifts the previous state), so it stays scalar.
   about 4K of the roughly 80K instructions per call.
 - The gear hash is scalar. A vector version would have to rebuild the
   rolling state from the last 64 bytes in every lane.
+- Dictionaries: `FSE_getMaxNbBits` reads every symbol up to `MaxLL`/`MaxML`, also past a
+  dictionary table's largest symbol. The reference reads uninitialized
+  workspace there; this port reads whatever an earlier build left in the
+  table (zero for a fresh one). Trained dictionaries cover every symbol, so
+  only hand-made dictionaries with short litlength or matchlength tables
+  can differ.
