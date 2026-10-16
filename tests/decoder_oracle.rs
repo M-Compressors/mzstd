@@ -215,25 +215,25 @@ fn concatenated_and_skippable_frames_match_the_reference() {
         expected
     );
 
-    // Single mode stops after the first Zstandard frame.
+    // Single mode stops after the first frame, here the leading skippable
+    // one, and the next member is the first Zstandard frame.
     let mut single = Decompressor::new(FrameMode::Single.into());
-    match single.decompress(&input) {
-        Err(DecodeError::TrailingData { offset }) => {
-            assert_eq!(
-                offset as usize,
-                16 + compress(&first, &params(3, true, true)).len()
-            );
-        }
-        other => panic!("expected trailing data, got {other:?}"),
-    }
+    assert!(matches!(
+        single.decompress(&input),
+        Err(DecodeError::TrailingData { offset: 16 })
+    ));
     let mut session = single.start();
     let mut output = vec![0u8; first.len() + 10];
     let progress = session
-        .process(&input, &mut output, mzstd::DecodeOperation::Process)
+        .process(&input[16..], &mut output, mzstd::DecodeOperation::Process)
         .expect("single frame");
     assert_eq!(progress.status, mzstd::DecoderStatus::Finished);
     assert_eq!(&output[..progress.produced], first);
     assert_eq!(session.frames_decoded(), 1);
+    let members = single_members(&input).expect("decodes");
+    assert_eq!(members, reference_members(&input));
+    let outputs: Vec<u8> = members.into_iter().flat_map(|(output, _)| output).collect();
+    assert_eq!(outputs, expected);
 }
 
 #[test]
@@ -320,5 +320,93 @@ fn reference_frames_decode_across_every_level() {
         let frame = stream_unknown_size(&params, &input);
         let decoded = decode_fixed(&mut decoder, &frame, 1 << 17, 1 << 17).expect("long window");
         assert_eq!(decoded, input, "level {level} long {long}");
+    }
+}
+
+/// Decodes `input` as consecutive single-frame members, each through a
+/// fresh `FrameMode::Single` session fed everything that is left, as a
+/// multi-member reader does. Returns each member's output and length.
+fn single_members(input: &[u8]) -> Result<Vec<(Vec<u8>, usize)>, DecodeError> {
+    let mut decoder = Decompressor::new(FrameMode::Single.into());
+    let mut members = Vec::new();
+    let mut rest = input;
+    while !rest.is_empty() {
+        let mut session = decoder.start();
+        let mut output = Vec::new();
+        let mut buffer = vec![0u8; 4096];
+        let mut consumed = 0;
+        loop {
+            let progress = session
+                .process(
+                    &rest[consumed..],
+                    &mut buffer,
+                    mzstd::DecodeOperation::Finish,
+                )
+                .map_err(mzstd::DecodeFailure::into_error)?;
+            consumed += progress.consumed;
+            output.extend_from_slice(&buffer[..progress.produced]);
+            if progress.status == mzstd::DecoderStatus::Finished {
+                break;
+            }
+        }
+        rest = &rest[consumed..];
+        members.push((output, consumed));
+    }
+    Ok(members)
+}
+
+/// The reference's members of `input`: `ZSTD_decompressStream` until it
+/// reports a frame complete, repeated on what is left.
+fn reference_members(input: &[u8]) -> Vec<(Vec<u8>, usize)> {
+    let mut members = Vec::new();
+    let mut rest = input;
+    while !rest.is_empty() {
+        let member = oracle::decompress_first_frame(rest, None).expect("the reference decodes");
+        rest = &rest[member.1..];
+        members.push(member);
+    }
+    members
+}
+
+#[test]
+fn single_mode_ends_a_member_after_a_skippable_frame_like_the_reference() {
+    let frame = compress(&text(5_000, 61), &params(3, true, true));
+    let meta = skippable(2, b"metadata");
+    let empty = skippable(15, b"");
+    for input in [
+        meta.clone(),
+        [&frame[..], &meta].concat(),
+        [&meta[..], &frame].concat(),
+        [&meta[..], &empty, &frame, &meta, &frame].concat(),
+    ] {
+        let expected = reference_members(&input);
+        assert_eq!(single_members(&input).expect("decodes"), expected);
+    }
+}
+
+#[test]
+fn single_mode_one_shots_treat_a_skippable_frame_as_the_frame() {
+    let frame = compress(b"payload", &params(1, false, true));
+    let meta = skippable(0, b"meta");
+    let mut single = Decompressor::new(FrameMode::Single.into());
+    // A stream of only a skippable frame is complete and empty.
+    assert_eq!(single.decompress(&meta).expect("complete"), b"");
+    assert_eq!(
+        single
+            .decompress_to_slice(&meta, &mut [0; 4])
+            .expect("complete"),
+        0
+    );
+    // A frame after it is trailing data.
+    let input = [&meta[..], &frame].concat();
+    for result in [
+        single.decompress(&input).map(|output| output.len()),
+        single.decompress_to_slice(&input, &mut [0; 64]),
+        single.decompress_to_uninit(&input, &mut [std::mem::MaybeUninit::uninit(); 64]),
+    ] {
+        assert!(
+            matches!(result, Err(DecodeError::TrailingData { offset }) if offset == meta.len() as u64),
+            "{result:?}"
+        );
     }
 }

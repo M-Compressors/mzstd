@@ -481,6 +481,7 @@ pub fn decompress(data: &[u8]) {
         }
         _ => panic!("slice {sliced:?} vs uninit {uninitialized:?}"),
     }
+    single_frame_matches_the_reference(data);
     if let Ok(output) = ours
         && !data.is_empty()
     {
@@ -488,6 +489,34 @@ pub fn decompress(data: &[u8]) {
             .unwrap_or_else(|error| panic!("accepted what the reference rejects: {error}"));
         assert_eq!(output, reference);
     }
+}
+
+/// A `FrameMode::Single` session decodes the first frame, Zstandard or
+/// skippable, exactly as a `ZSTD_decompressStream` member does, and stops
+/// where the reference stops.
+fn single_frame_matches_the_reference(data: &[u8]) {
+    use mzstd::{DecodeOperation, DecoderStatus};
+    let mut decoder = bounded_decoder();
+    decoder.reconfigure(decoder.config().with_frame_mode(mzstd::FrameMode::Single));
+    let mut session = decoder.start();
+    let mut output = Vec::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut consumed = 0;
+    loop {
+        let Ok(progress) = session.process(&data[consumed..], &mut buffer, DecodeOperation::Finish)
+        else {
+            return;
+        };
+        consumed += progress.consumed;
+        output.extend_from_slice(&buffer[..progress.produced]);
+        if progress.status == DecoderStatus::Finished {
+            break;
+        }
+    }
+    let (reference, reference_consumed) = oracle::decompress_first_frame(data, Some(31))
+        .unwrap_or_else(|error| panic!("accepted a frame the reference rejects: {error}"));
+    assert_eq!(consumed, reference_consumed);
+    assert_eq!(output, reference);
 }
 
 /// A session fed arbitrary input and output pieces agrees with one-shot

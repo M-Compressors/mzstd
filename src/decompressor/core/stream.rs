@@ -384,7 +384,7 @@ impl Stream {
                         return Ok(DecoderStatus::NeedsInput);
                     }
                     self.complete_frames += 1;
-                    self.state = State::Magic;
+                    self.state = self.after_frame();
                 }
                 State::FrameHeader => {
                     if !fill(&mut self.scratch, input, 1) {
@@ -455,6 +455,13 @@ impl Stream {
     fn end_frame(&mut self) -> State {
         self.frames += 1;
         self.complete_frames += 1;
+        self.after_frame()
+    }
+
+    /// What follows a completed frame of either kind: a single-frame
+    /// operation ends after a skippable frame too, as a
+    /// `ZSTD_decompressStream` member does.
+    const fn after_frame(&self) -> State {
         match self.config.frame_mode() {
             FrameMode::Single => State::Done,
             FrameMode::Concatenated => State::Magic,
@@ -589,6 +596,9 @@ impl Stream {
                 }
                 reader.take(size as usize)?;
                 complete_frames += 1;
+                if self.config.frame_mode() == FrameMode::Single {
+                    return single_end(&reader, src);
+                }
                 continue;
             }
             if magic != MAGIC_NUMBER {
@@ -636,15 +646,21 @@ impl Stream {
             }
             complete_frames += 1;
             if self.config.frame_mode() == FrameMode::Single {
-                if reader.position < src.len() {
-                    return Err(DecodeError::TrailingData {
-                        offset: reader.position as u64,
-                    });
-                }
-                return Ok(());
+                return single_end(&reader, src);
             }
         }
     }
+}
+
+/// The end of a single-frame one-shot operation whose frame ended at
+/// `reader`'s position in `src`: anything after it is trailing data.
+const fn single_end(reader: &SliceReader<'_>, src: &[u8]) -> Result<(), DecodeError> {
+    if reader.position < src.len() {
+        return Err(DecodeError::TrailingData {
+            offset: reader.position as u64,
+        });
+    }
+    Ok(())
 }
 
 /// Where the one-shot driver writes: a buffer whose prefix up to
@@ -990,8 +1006,7 @@ mod tests {
 
     #[test]
     fn single_mode_stops_after_the_first_frame() {
-        let mut input = SKIP.to_vec();
-        input.extend_from_slice(&hello());
+        let mut input = hello();
         input.extend_from_slice(b"tail");
         let mut stream = stream(FrameMode::Single.into());
         let mut out = [0u8; 16];
@@ -1001,6 +1016,25 @@ mod tests {
         assert_eq!(progress.status, DecoderStatus::Finished);
         assert_eq!(progress.consumed, input.len() - 4);
         assert_eq!(&out[..progress.produced], b"hello");
+        assert_eq!(stream.frames_decoded(), 1);
+    }
+
+    #[test]
+    fn single_mode_stops_after_a_skippable_frame() {
+        let mut input = SKIP.to_vec();
+        input.extend_from_slice(&hello());
+        let mut stream = stream(FrameMode::Single.into());
+        let mut out = [0u8; 16];
+        let progress = stream
+            .process(&input, &mut out, DecodeOperation::Process, None)
+            .expect("valid");
+        assert_eq!(progress.status, DecoderStatus::Finished);
+        assert_eq!((progress.consumed, progress.produced), (SKIP.len(), 0));
+        assert_eq!(stream.frames_decoded(), 0);
+        assert!(matches!(
+            stream.decode_all(&input, &mut Vec::new(), None),
+            Err(DecodeError::TrailingData { offset: 9 })
+        ));
     }
 
     #[test]

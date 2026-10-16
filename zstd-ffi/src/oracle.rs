@@ -706,6 +706,61 @@ pub fn decompress_stream_with_dictionary(
     Ok(decompressed)
 }
 
+/// Decodes the first frame of `input`, Zstandard or skippable, the way a
+/// single-member `ZSTD_decompressStream` loop does: it stops at the first
+/// call that reports a frame complete (returns 0). Returns that frame's
+/// output and the input it consumed, with the decoder's window limited to
+/// `window_log_max` bits.
+///
+/// # Errors
+///
+/// Returns the reference's error name for malformed input or an exceeded
+/// window limit, or "truncated input" when `input` ends inside the frame.
+pub fn decompress_first_frame(
+    input: &[u8],
+    window_log_max: Option<i32>,
+) -> Result<(Vec<u8>, usize), String> {
+    // SAFETY: allocation only; a null result is checked.
+    let dctx = unsafe { ZSTD_createDCtx() };
+    assert!(!dctx.is_null(), "ZSTD_createDCtx failed");
+    struct Guard(*mut ZSTD_DCtx);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: created by `ZSTD_createDCtx`, freed once.
+            unsafe { ZSTD_freeDCtx(self.0) };
+        }
+    }
+    let guard = Guard(dctx);
+    if let Some(log) = window_log_max {
+        // SAFETY: the context is live.
+        check(unsafe { ZSTD_DCtx_setParameter(guard.0, ZSTD_d_windowLogMax, log) })?;
+    }
+    let mut decompressed = Vec::new();
+    let mut buffer = vec![0u8; 1 << 17];
+    let mut source = ZSTD_inBuffer {
+        src: input.as_ptr().cast(),
+        size: input.len(),
+        pos: 0,
+    };
+    loop {
+        let mut output = ZSTD_outBuffer {
+            dst: buffer.as_mut_ptr().cast(),
+            size: buffer.len(),
+            pos: 0,
+        };
+        // SAFETY: the buffers describe live, non-overlapping memory of the
+        // stated sizes, and the context is live.
+        let hint = check(unsafe { ZSTD_decompressStream(guard.0, &mut output, &mut source) })?;
+        decompressed.extend_from_slice(&buffer[..output.pos]);
+        if hint == 0 {
+            return Ok((decompressed, source.pos));
+        }
+        if source.pos == source.size && output.pos < output.size {
+            return Err(String::from("truncated input"));
+        }
+    }
+}
+
 /// `ZSTD_getCParams`.
 pub fn get_cparams(
     level: i32,

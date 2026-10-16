@@ -285,8 +285,9 @@ impl Decompressor {
     ///
     /// In [`FrameMode::Concatenated`](super::FrameMode::Concatenated) the
     /// input must consist of whole frames, at least one; in
-    /// [`FrameMode::Single`](super::FrameMode::Single) of one Zstandard
-    /// frame after any skippable frames, and nothing else.
+    /// [`FrameMode::Single`](super::FrameMode::Single) of exactly one
+    /// frame, which may be a skippable one (decoding to nothing), and
+    /// nothing else.
     ///
     /// # Errors
     ///

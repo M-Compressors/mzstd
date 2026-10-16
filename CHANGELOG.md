@@ -33,6 +33,19 @@
   2.93 µs instead of 3.84 µs and 1 MiB of text 0-2.5% faster. The
   large-literal corpus is 2-4% slower, and a 64-byte frame takes 30 ns
   instead of 25 ns at level -5 and 1.5-3% longer at other levels.
+- **Fix `FrameMode::Single` with skippable frames.** A single-frame
+  operation skipped skippable frames and kept waiting for a Zstandard frame,
+  unlike `ZSTD_decompressStream`, which reports a frame complete after
+  either kind. A trailing skippable frame, or a stream made only of
+  skippable frames, failed with `UnexpectedEndOfInput` although zstd reads
+  it, and a skippable frame followed by a Zstandard frame decoded both in
+  one member where zstd stops after the skippable one. `Single` now ends
+  after exactly one frame of either kind: a skippable frame finishes the
+  operation with no output and leaves what follows unconsumed (one-shot
+  calls report it as `TrailingData`). Sessions, one-shots and the `io`
+  adapters change alike; `FrameMode::Concatenated` is unchanged. Regression
+  tests compare member-by-member decoding with the reference through the
+  new `zstd_ffi::oracle::decompress_first_frame`.
 - **`0` restores a compression parameter's default.** Every numeric
   `with_*` setter of `CompressionParams` and `LdmParams` stores `0` as
   unset, as `ZSTD_CCtx_setParameter(.., 0)` does. The last value given now

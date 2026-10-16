@@ -151,7 +151,8 @@ impl DecoderSession<'_> {
     /// [`DecoderStatus::Finished`].
     ///
     /// In [`super::FrameMode::Single`] the session finishes right after its
-    /// frame and leaves any later input unconsumed. In
+    /// first frame, Zstandard or skippable, and leaves any later input
+    /// unconsumed. In
     /// [`super::FrameMode::Concatenated`] a frame boundary reports
     /// `NeedsInput` until `Finish` confirms that the input ends there. A
     /// finished session reports zero progress and `Finished` again.

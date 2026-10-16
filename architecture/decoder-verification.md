@@ -46,7 +46,10 @@ graph TD
   logs 10, 12 and 17 on 1.2 MB force history compaction and 1 KiB blocks.
   Concatenated frames with skippable frames, `Single` mode, and window
   limits (including a header patched to a `2^28` window) are compared with
-  the reference's streaming limit. A release-only matrix covers every level
+  the reference's streaming limit. `Single` mode is also split into
+  members, one session each, and compared with `ZSTD_decompressStream` run
+  until it reports a frame complete (`oracle::decompress_first_frame`):
+  leading, trailing and lone skippable frames each form a member. A release-only matrix covers every level
   from -7 to 22 on 3 MB corpora and 20 MB inputs with long-distance matching
   and `2^27` windows.
 - **`decoder_golden`** decodes the reference's golden vectors one-shot and

@@ -42,12 +42,18 @@ fn invalid(kind: InvalidDataKind) -> impl Fn(&DecodeError) -> bool {
 }
 
 #[test]
-fn single_mode_skips_leading_skippable_frames_and_rejects_trailing_bytes() {
+fn single_mode_decodes_one_frame_of_either_kind_and_rejects_trailing_bytes() {
     let frame = raw_frame(b"one", Some(3), None);
-    let mut input = skippable(3, b"meta");
-    input.extend_from_slice(&frame);
+    let mut input = frame.clone();
     let mut decoder = Decompressor::new(FrameMode::Single.into());
     assert_eq!(decoder.decompress(&input).expect("one frame"), b"one");
+    // A skippable frame is the frame, as for `ZSTD_decompressStream`: the
+    // Zstandard frame after it is trailing data.
+    let meta = skippable(3, b"meta");
+    assert!(matches!(
+        decoder.decompress(&[&meta[..], &frame].concat()),
+        Err(DecodeError::TrailingData { offset }) if offset == meta.len() as u64
+    ));
     input.push(0);
     assert!(matches!(
         decoder.decompress(&input),
@@ -57,12 +63,14 @@ fn single_mode_skips_leading_skippable_frames_and_rejects_trailing_bytes() {
         decoder.decompress_to_slice(&input, &mut [0; 8]),
         Err(DecodeError::TrailingData { .. })
     ));
-    // Skippable frames alone are no Zstandard frame.
-    assert!(matches!(
-        decoder.decompress(&skippable(0, b"x")),
-        Err(DecodeError::UnexpectedEndOfInput)
-    ));
-    // Concatenated mode accepts them as a complete, empty operation.
+    // A skippable frame alone is a complete, empty operation, in both
+    // modes.
+    assert!(
+        decoder
+            .decompress(&skippable(0, b"x"))
+            .expect("skippable")
+            .is_empty()
+    );
     let mut decoder = Decompressor::default();
     assert!(
         decoder

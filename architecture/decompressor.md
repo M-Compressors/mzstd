@@ -158,9 +158,14 @@ classDiagram
   - `FrameMode::Concatenated` (default) decodes every frame until the input
     ends, as `ZSTD_decompress` does; at least one frame (Zstandard or
     skippable) is required.
-  - `FrameMode::Single` decodes one Zstandard frame, after any skippable
-    frames, and stops: sessions leave the rest unconsumed, one-shot calls
-    report `TrailingData`.
+  - `FrameMode::Single` decodes exactly one frame, Zstandard or
+    skippable, and stops: sessions leave the rest unconsumed, one-shot calls
+    report `TrailingData`. A skippable frame ends the operation with no
+    output, as `ZSTD_decompressStream` reports a frame complete (returns 0)
+    after either kind; a reader of single-frame members therefore sees a
+    trailing skippable frame, or a stream of only skippable frames, as
+    complete empty members, and a skippable frame before a Zstandard frame
+    as its own member.
 - **`DecodeLimits`**: the window limit (default `2^27`, the reference's
   `ZSTD_WINDOWLOG_LIMIT_DEFAULT`; `10..=31`) and optional input and output
   byte budgets over a whole operation.
@@ -244,7 +249,8 @@ stateDiagram-v2
     Magic --> Finished: Finish, no input left, >= 1 frame (Concatenated)
     Magic --> Failed: other magic
     SkippableSize --> Skipping: size <= u32::MAX - 8
-    Skipping --> Magic: payload skipped
+    Skipping --> Magic: payload skipped (Concatenated)
+    Skipping --> Done: payload skipped (Single)
     FrameHeader --> BlockHeader: header parsed and within limits
     BlockHeader --> BlockContent: type and size valid
     BlockContent --> BlockHeader: block regenerated, not last
