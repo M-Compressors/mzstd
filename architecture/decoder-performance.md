@@ -235,6 +235,9 @@ flowchart LR
     ToSlice[decompress_to_slice] --> Direct{decode_to_slice: every frame declares a size that fits?}
     Direct -->|yes| Slice[SliceOutput: frame cut at its declared end]
     Direct -->|no, or any error| Session[incremental session over History]
+    ToUninit[decompress_to_uninit] --> DirectU{decode_to_uninit: same test}
+    DirectU -->|yes| Uninit[UninitOutput: BorrowedBuf zeroed one block ahead, cut at the declared end]
+    DirectU -->|no, or any error| SessionU[process_uninit over History]
     Into[decompress / decompress_into] --> Cut[decode_all: VecOutput, declared frames cut at their end]
     Cut -->|any error| Uncut[reset, rerun with VecOutput uncut: defines the error]
     Process[DecoderSession::process] --> History[History: prepare / commit]
@@ -279,6 +282,11 @@ flowchart TD
   capacity. Compressed blocks still need initialized room, which costs one
   zeroing pass over the output; safe Rust cannot hand the decoder
   uninitialized memory.
+- `UninitOutput` is `SliceOutput` over a `BorrowedBuf`: `reserve` zeroes
+  the prefix only up to a block plus the overlength ahead (cut at the
+  frame's end), and `place` writes raw and RLE blocks once, over the zeroed
+  bytes and then appended. See
+  [uninitialized output](decoder-uninit-output.md).
 - `decompress_to_slice` tries the direct path and, when a frame has no
   content size, does not fit, or anything fails, reruns the whole input
   through the incremental session, which defines the method's results and

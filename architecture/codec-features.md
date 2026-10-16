@@ -12,6 +12,8 @@ flowchart TD
     C --> FS[fearless_simd + fearless_simd_macros]
     Dc --> FS
     C --> BR["branches (prefetch feature): safe cache prefetch hints"]
+    C --> BB["borrowed-buf: zeroed-ahead uninitialized output"]
+    Dc --> BB
     Std --> TS[thiserror/std]
     Std --> BRS[branches/std]
     Std --> FSS[fearless_simd/std: runtime level detection]
@@ -25,7 +27,7 @@ flowchart TD
 | Feature | Effect |
 | --- | --- |
 | `compression` | `mzstd::compressor` and its root re-exports. Pulls in `branches` (with only its `prefetch` feature, plus `std` under `std`) for the row match finder's safe `prefetch_read_data` hints: inline assembly inside that crate on x86 with SSE and on aarch64, a no-op elsewhere, so mzstd itself stays `forbid(unsafe_code)`. |
-| `decompression` | `mzstd::decompressor` and its root re-exports, and `mzstd::dictionary::{DecodeDictionary, DictionaryRef}`. |
+| `decompression` | `mzstd::decompressor` and its root re-exports, and `mzstd::dictionary::{DecodeDictionary, DictionaryRef}`. Pulls in `borrowed-buf`, through which `decompress_to_uninit` zeroes its destination just ahead of the decoder without `unsafe`. |
 | `std` | `std::error::Error` for every error type, plus, unless `no_std` is also set, `mzstd::io` (reader and writer adapters, `FinishError`) and `compressor::parallel`. |
 | `no_std` | `#![no_std]` with `alloc`; it wins over `std`, so `--all-features` builds the alloc-only crate. One-shot calls, sessions, owned sessions and retention remain. `Backend::default()` is then the compile-time baseline level instead of the detected one. |
 | `hotpath`, `hotpath-cpu`, `hotpath-alloc` | Turn on the `hotpath::measure` anchors at stage boundaries (one-shot compression, frame chunks, sequence building, entropy coding, LDM, parallel segments, and the decoder's frame, block, literal, Huffman and sequence stages). Ignored with `no_std`. |

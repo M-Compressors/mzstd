@@ -7,7 +7,6 @@
 //! [`FfiError`] onto the public status code.
 
 use crate::MzstdResult;
-use borrowed_buf::BorrowedBuf;
 use mzstd::{
     Compressor, ConfigError, DecodeError, DecodeLimits, DecoderConfig, Decompressor, EncodeError,
     EncoderConfig, Level,
@@ -309,8 +308,9 @@ pub(crate) fn compress(
 /// does.
 ///
 /// An empty `src` decodes to nothing, and every window the format allows is
-/// accepted, since `dst` already bounds the output. `dst` is zeroed first,
-/// because the decoder writes into initialized memory.
+/// accepted, since `dst` already bounds the output. `dst` stays
+/// uninitialized memory throughout: on success nothing past the result is
+/// written.
 ///
 /// # Errors
 ///
@@ -321,8 +321,7 @@ pub(crate) fn decompress(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<usiz
         return Ok(0);
     }
     let mut decoder = Decompressor::from(DecoderConfig::DEFAULT.with_limits(LIMITS));
-    let mut zeroed = BorrowedBuf::<u8>::from(dst);
-    Ok(decoder.decompress_to_slice(src, zeroed.unfilled().ensure_init())?)
+    Ok(decoder.decompress_to_uninit(src, dst)?)
 }
 
 /// Decoder limits of the C ABI: the widest window the format allows, and no

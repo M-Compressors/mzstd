@@ -478,7 +478,6 @@ dependencies = [
 name = "mzstd-ffi"
 version = "0.2.5"
 dependencies = [
- "borrowed-buf",
  "criterion",
  "mzstd",
  "thiserror",

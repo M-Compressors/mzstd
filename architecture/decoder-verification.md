@@ -22,6 +22,7 @@ graph TD
         Corrupt[decoder_corruption: every truncation, bit flips, random damage]
         Api[decoder_api: modes, Finish contract, budgets, typed errors, retention]
         Io[decoder_io: Read / Write adapters, deferred and sink errors]
+        Uninit[decoder_uninit: process_uninit and decompress_to_uninit against the initialized methods, sentinels]
         Dict[decoder_dictionary: raw and trained dictionaries, IDs, entropy reuse, dictionary acceptance]
     end
     Ref --> Dict
@@ -82,6 +83,10 @@ graph TD
   byte budgets, typed errors (with reference agreement where it applies),
   retention, owned sessions, and the adapters' deferred errors, retries,
   `into_parts` and `FinishError` round trips.
+- **`decoder_uninit`** checks that the uninitialized methods match their
+  initialized counterparts byte for byte, count for count and error for
+  error, and that no byte past the reported output is written; see
+  [uninitialized output](decoder-uninit-output.md#verification).
 
 ## Running
 

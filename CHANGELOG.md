@@ -1,5 +1,57 @@
 # Changelog
 
+## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - Unreleased
+
+- **Decoder output into uninitialized memory.** `DecoderSession` and
+  `DecoderSessionOwned` have `process_uninit`, and `Decompressor` has
+  `decompress_to_uninit` and `decompress_with_dictionary_to_uninit`, as in
+  mbrotli. Each takes `&mut [MaybeUninit<u8>]`, such as
+  `Vec::spare_capacity_mut`, and writes exactly the bytes it reports,
+  nothing past them; a session's `DecodeFailure` has written exactly its
+  `produced` prefix. Bytes, counts, statuses and errors match `process`,
+  `decompress_to_slice` and `decompress_with_dictionary_to_slice`, and
+  `process` and `process_uninit` may be mixed on one operation. The crate
+  stays free of `unsafe`. Sessions only ever copy finished output out of
+  their history, so `process_uninit` writes the caller's memory once and
+  never zeroes it. The one-shot direct path reads its output back as history,
+  so it zeroes the destination through `borrowed-buf` one block ahead of the
+  decoder and never past a frame's declared end; raw and RLE blocks are
+  written once without zeroing. The `decompression` feature now pulls in
+  `borrowed-buf`. The decoder is generic over its destination rather than
+  matching on it, so `process` runs the code it ran before: streaming 4 MiB
+  of mixed data took 2.81 ms against 2.84 ms before the change (Criterion,
+  `benches/decompress.rs`, Apple M5 Pro). Against `decompress_to_slice`,
+  `decompress_to_uninit` took 0.97-1.05 times as long on 4 MiB of text and
+  binary at levels 1, 3 and 19 and on a 12 MiB LDM frame, and the same on
+  random data; `process_uninit` took 2.83 ms against 2.81 ms for `process`.
+  New Criterion cases `mzstd-uninit` cover both paths.
+- **`mzstd_decompress` no longer zeroes the destination.** The C ABI views
+  the caller's buffer as `MaybeUninit<u8>` and calls
+  `decompress_to_uninit`, so on success no byte past the result is written.
+  `mzstd-ffi` drops its `borrowed-buf` dependency. On
+  `mzstd-ffi/benches/one_shot.rs`, 256 KiB of random data decodes in
+  2.93 µs instead of 3.84 µs and 1 MiB of text 0-2.5% faster. The
+  large-literal corpus is 2-4% slower, and a 64-byte frame takes 30 ns
+  instead of 25 ns at level -5 and 1.5-3% longer at other levels.
+- **`0` restores a compression parameter's default.** Every numeric
+  `with_*` setter of `CompressionParams` and `LdmParams` stores `0` as
+  unset, as `ZSTD_CCtx_setParameter(.., 0)` does. The last value given now
+  wins, and a caller translating zstd-style parameters can apply each one
+  directly in its loop instead of collecting them in `Option`s first.
+  Before, `with_window_log(0)` stored `Some(0)` and `Compressor::new` rejected
+  it as out of range, and no setter could clear a value. `0` was already
+  accepted by `with_target_length` and `LdmParams::with_hash_rate_log` and
+  meant the default there, so no frame changes.
+- **Tests and fuzzing.** `tests/decoder_uninit.rs` compares the new
+  methods with their initialized counterparts across corpora, levels, input
+  chunks, output windows, failures, frame sequences and dictionaries, with
+  sentinels past every reported length. The AFL decoder targets alternate
+  `process` and `process_uninit`, and `decompress` checks
+  `decompress_to_uninit`; `parameter_parsing` accepts a zero window log.
+  The architecture adds a
+  [decoder uninitialized output](architecture/decoder-uninit-output.md)
+  specification.
+
 ## [v0.2.5](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.5) - 2026-10-15
 
 - **Faster fast levels (-5 to 2).** The hash widths of the default

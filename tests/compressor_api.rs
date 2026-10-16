@@ -196,6 +196,62 @@ fn explicit_ldm_params_match_the_reference() {
 }
 
 #[test]
+fn zero_restores_a_parameters_default_and_the_last_value_wins() {
+    let params = CompressionParams::default()
+        .with_window_log(20)
+        .with_hash_log(18)
+        .with_chain_log(17)
+        .with_search_log(4)
+        .with_min_match(5)
+        .with_target_length(64);
+    let cleared = params
+        .with_window_log(0)
+        .with_hash_log(0)
+        .with_chain_log(0)
+        .with_search_log(0)
+        .with_min_match(0)
+        .with_target_length(0);
+    assert_eq!(cleared, CompressionParams::default());
+    assert_eq!(
+        params.with_window_log(0).with_window_log(21).window_log(),
+        Some(21)
+    );
+    let ldm = LdmParams::default()
+        .with_hash_log(20)
+        .with_min_match(64)
+        .with_bucket_size_log(3)
+        .with_hash_rate_log(4);
+    let cleared = ldm
+        .with_hash_log(0)
+        .with_min_match(0)
+        .with_bucket_size_log(0)
+        .with_hash_rate_log(0);
+    assert_eq!(cleared, LdmParams::default());
+    // Zeroes are not out of range, and compress as the defaults do.
+    let input = corpus::text(100_000, 51);
+    let zeroed = EncoderConfig::default()
+        .with_params(
+            CompressionParams::default()
+                .with_window_log(0)
+                .with_search_log(0),
+        )
+        .with_long_distance_matching(LongDistanceMatching::Enabled(
+            LdmParams::default().with_hash_rate_log(0),
+        ));
+    let defaults = EncoderConfig::default()
+        .with_long_distance_matching(LongDistanceMatching::Enabled(LdmParams::default()));
+    let ours = Compressor::new(zeroed)
+        .expect("valid")
+        .compress(&input)
+        .expect("compresses");
+    let expected = Compressor::new(defaults)
+        .expect("valid")
+        .compress(&input)
+        .expect("compresses");
+    assert_eq!(ours, expected);
+}
+
+#[test]
 fn out_of_range_match_finder_params_name_the_parameter() {
     let cases = [
         (
@@ -214,9 +270,9 @@ fn out_of_range_match_finder_params_name_the_parameter() {
             "chain log 5 is outside 6..=30",
         ),
         (
-            CompressionParams::default().with_search_log(0),
+            CompressionParams::default().with_search_log(31),
             Parameter::SearchLog,
-            "search log 0 is outside 1..=30",
+            "search log 31 is outside 1..=30",
         ),
         (
             CompressionParams::default().with_min_match(8),

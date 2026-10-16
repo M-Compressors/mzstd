@@ -49,8 +49,9 @@ features = ["prefetch"]
 
 # Profiling instrumentation only; every anchor in `src/` is written as
 # `#[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]`.
-# Safe bookkeeping for uninitialized session output: the encoder writes
-# into a zeroed-ahead prefix instead of a temporary buffer.
+# Safe bookkeeping for uninitialized output: the encoder and the decoder's
+# one-shot path write into a zeroed-ahead prefix instead of a temporary
+# buffer.
 [dependencies.borrowed-buf]
 version = "0.1.1"
 optional = true
@@ -105,7 +106,12 @@ compression = [
     "dep:fearless_simd_macros",
     "dep:thiserror",
 ]
-decompression = ["dep:fearless_simd", "dep:fearless_simd_macros", "dep:thiserror"]
+decompression = [
+    "dep:borrowed-buf",
+    "dep:fearless_simd",
+    "dep:fearless_simd_macros",
+    "dep:thiserror",
+]
 # Standard library support: `std::io` adapters, `std::error::Error` and
 # runtime SIMD detection.
 std = ["branches?/std", "fearless_simd?/std", "thiserror?/std"]

@@ -12,7 +12,6 @@ graph TD
     Header[include/mzstd.h] -.declares.-> Lib
     Lib["lib.rs: MzstdResult, mzstd_compress, mzstd_decompress, mzstd_compress_bound"] --> Core["core.rs (private): validation, slices, panic guard, codecs"]
     Core --> Mzstd[mzstd: Compressor, Decompressor]
-    Core --> BB[borrowed-buf: zero an uninitialized destination safely]
 ```
 
 `lib.rs` holds only the exported functions and their contracts. Each forwards
@@ -68,7 +67,7 @@ Only the status code crosses the boundary.
 | Function | Behavior |
 | --- | --- |
 | `mzstd_compress` | `ZSTD_compress(level)` byte for byte: content size recorded, no checksum. Levels `-131072..=22`; `0` is 3. Out-of-range levels are rejected rather than clamped. A destination of `mzstd_compress_bound` bytes always suffices. A smaller one fails exactly when `ZSTD_compress` fails: the reference needs room for an 18-byte worst-case header and some slack, so a destination as long as the frame may be refused. |
-| `mzstd_decompress` | `ZSTD_decompress`: every Zstandard frame in order, with skippable frames skipped. Empty input decodes to nothing. Window logs up to 31 are accepted, because the destination already bounds memory. The destination is zeroed before decoding, because the decoder writes only to initialized memory. |
+| `mzstd_decompress` | `ZSTD_decompress`: every Zstandard frame in order, with skippable frames skipped. Empty input decodes to nothing. Window logs up to 31 are accepted, because the destination already bounds memory. The destination is viewed as `MaybeUninit<u8>` and decoded with `decompress_to_uninit`: it is never zeroed in full, and on success no byte past the result is written. |
 | `mzstd_compress_bound` | `ZSTD_compressBound`; `0` when it overflows `size_t`. |
 
 `*output_len` is the capacity on entry and the bytes written on return. It is
@@ -103,5 +102,6 @@ checking that their frames are identical.
 ## Known gaps
 
 - No streaming, advanced-parameter or dictionary entry points.
-- `mzstd_decompress` zeroes the whole destination even when the output is
-  much smaller.
+- `mzstd_decompress` decodes a 64-byte frame about 5 ns slower than when it
+  zeroed the destination and called `decompress_to_slice`; see
+  [uninitialized output](decoder-uninit-output.md#known-gaps).

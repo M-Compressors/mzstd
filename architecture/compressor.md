@@ -86,7 +86,12 @@ classDiagram
 like the reference's defaults; `Compressor::default()` uses it without
 validation because it has no explicit parameter. Explicit parameters are
 `Option`s: `None` keeps the level's value, exactly as an unset
-`ZSTD_c_*` parameter does.
+`ZSTD_c_*` parameter does. Every numeric `with_*` setter of
+`CompressionParams` and `LdmParams` stores `0` as `None`, as
+`ZSTD_CCtx_setParameter(.., 0)` resets a parameter to its default, so the
+last value given wins and a caller can apply a list of zstd-style parameters
+directly, one setter call each. Lowering maps `None` to `0`, which the core
+already treated as "derive from the level", so frames are unchanged.
 
 ## One-shot compression
 

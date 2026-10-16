@@ -366,7 +366,11 @@ pub fn parameter_parsing(data: &[u8]) {
         let window = value.unsigned_abs() % 64;
         let config = mzstd::EncoderConfig::default()
             .with_params(mzstd::CompressionParams::default().with_window_log(window));
-        assert_eq!(Compressor::new(config).is_ok(), (10..=31).contains(&window));
+        // `0` restores the default window.
+        assert_eq!(
+            Compressor::new(config).is_ok(),
+            window == 0 || (10..=31).contains(&window)
+        );
     }
 }
 
@@ -385,7 +389,8 @@ fn bounded_decoder() -> mzstd::Decompressor {
 }
 
 /// Decodes `input` through a session, `chunk` input bytes and `out_chunk`
-/// output bytes at a time.
+/// output bytes at a time. Calls alternate between `process` and
+/// `process_uninit`, which must not write a byte past what it reports.
 fn decode_in_pieces(
     decoder: &mut mzstd::Decompressor,
     input: &[u8],
@@ -400,27 +405,44 @@ fn decode_in_pieces(
     };
     let mut output = Vec::new();
     let mut buffer = vec![0u8; out_chunk.max(1)];
+    let mut uninit = vec![MaybeUninit::new(SENTINEL); out_chunk.max(1)];
     let mut position = 0;
-    loop {
+    for call in 0usize.. {
         let end = (position + chunk.max(1)).min(input.len());
         let operation = if end == input.len() {
             DecodeOperation::Finish
         } else {
             DecodeOperation::Process
         };
-        let progress = session
-            .process(&input[position..end], &mut buffer, operation)
-            .map_err(mzstd::DecodeFailure::into_error)?;
+        let piece = &input[position..end];
+        let progress = if call % 2 == 0 {
+            let progress = session
+                .process(piece, &mut buffer, operation)
+                .map_err(mzstd::DecodeFailure::into_error)?;
+            output.extend_from_slice(&buffer[..progress.produced]);
+            progress
+        } else {
+            let result = session.process_uninit(piece, &mut uninit, operation);
+            let produced = match &result {
+                Ok(progress) => progress.produced,
+                Err(failure) => failure.produced,
+            };
+            let written = initialized_with_sentinel(&uninit);
+            assert!(written[produced..].iter().all(|&byte| byte == SENTINEL));
+            output.extend_from_slice(&written[..produced]);
+            uninit.fill(MaybeUninit::new(SENTINEL));
+            result.map_err(mzstd::DecodeFailure::into_error)?
+        };
         assert!(progress.consumed <= end - position);
         assert!(progress.produced <= buffer.len());
         position += progress.consumed;
-        output.extend_from_slice(&buffer[..progress.produced]);
         match progress.status {
             DecoderStatus::Finished => return Ok(output),
             DecoderStatus::NeedsInput => assert_eq!(position, end, "NeedsInput leaves input"),
             DecoderStatus::NeedsOutput => {}
         }
     }
+    unreachable!("the call loop only ends by returning")
 }
 
 /// Arbitrary bytes never make the decoder panic, and whatever it accepts the
@@ -441,6 +463,23 @@ pub fn decompress(data: &[u8]) {
         }
         (Ok(_), Err(error)) => panic!("one-shot accepted, slice failed with {error:?}"),
         (Err(_), _) => {}
+    }
+    let mut uninit = vec![MaybeUninit::new(SENTINEL); slice.len()];
+    let uninitialized = decoder.decompress_to_uninit(data, &mut uninit);
+    let written = initialized_with_sentinel(&uninit);
+    match (&sliced, &uninitialized) {
+        (Ok(expected), Ok(size)) => {
+            assert_eq!(size, expected);
+            assert_eq!(written[..*size], slice[..*size]);
+            assert!(written[*size..].iter().all(|&byte| byte == SENTINEL));
+        }
+        (Err(expected), Err(error)) => {
+            assert_eq!(error.to_string(), expected.to_string());
+            if matches!(error, mzstd::DecodeError::OutputTooSmall { .. }) {
+                assert_eq!(written, slice);
+            }
+        }
+        _ => panic!("slice {sliced:?} vs uninit {uninitialized:?}"),
     }
     if let Ok(output) = ours
         && !data.is_empty()

@@ -74,6 +74,7 @@ classDiagram
         +decompress(src) Vec~u8~
         +decompress_into(src, Vec) Range
         +decompress_to_slice(src, slice) usize
+        +decompress_to_uninit(src, uninit slice) usize
         +start() DecoderSession
         +into_session() DecoderSessionOwned
         +reader(R) DecoderReader
@@ -81,6 +82,7 @@ classDiagram
         +decompress_with_dictionary(dict, src) Vec~u8~
         +decompress_with_dictionary_into(dict, src, Vec) Range
         +decompress_with_dictionary_to_slice(dict, src, slice) usize
+        +decompress_with_dictionary_to_uninit(dict, src, uninit slice) usize
         +start_with_dictionary(dict) DecoderSession
         +into_session_with_dictionary(D) DecoderSessionOwned~D~
         +reader_with_dictionary(R, dict) DecoderReader
@@ -121,6 +123,7 @@ classDiagram
     }
     class DecoderSession {
         +process(input, output, DecodeOperation) DecodeProgress
+        +process_uninit(input, uninit output, DecodeOperation) DecodeProgress
         +flush(output)
         +finish(output)
         +is_finished() bool
@@ -130,7 +133,7 @@ classDiagram
         +window_size() Option~u64~
     }
     class DecoderSessionOwned~D = DecodeDictionary~ {
-        +process / flush / finish
+        +process / process_uninit / flush / finish
         +reinit()
         +into_decompressor() Decompressor
     }
@@ -164,9 +167,13 @@ classDiagram
 - **One-shot.** `decompress` returns a new vector; `decompress_into`
   appends and returns the appended range, truncating back on error;
   `decompress_to_slice` fills a caller slice and reports `OutputTooSmall`
-  with the slice completely filled.
+  with the slice completely filled. `decompress_to_uninit` does the same
+  into `&mut [MaybeUninit<u8>]` and writes nothing past the result; see
+  [uninitialized output](decoder-uninit-output.md).
 - **Incremental.** `start()` borrows the decoder, `into_session()` owns it.
-  Both run the same `core::Stream` state machine; see below.
+  Both run the same `core::Stream` state machine; see below. Each has
+  `process_uninit`, the same call into `&mut [MaybeUninit<u8>]`, which may
+  be mixed with `process` and writes exactly `output[..produced]`.
 - **Retention.** `RetentionPolicy` (shared with the encoder) is applied
   after each one-shot operation, when a session's operation finishes or
   fails, when the next operation starts, and by
@@ -554,6 +561,8 @@ reference's, with these deliberate exceptions:
   regenerated: `decompress`/`decompress_into` reserve a declared size up
   front only up to 32 bytes per unread input byte, and grow with the output
   beyond that ([output paths](decoder-performance.md#output-paths)).
-- **No uninitialized-output APIs** (`*_to_uninit`, `process_uninit`) and
+- **Uninitialized output** has no `decompress_into` variant, and the
+  one-shot path zeroes compressed blocks' output before decoding into it
+  ([uninitialized output](decoder-uninit-output.md#known-gaps)). There is
   no exact-size output contract, unlike mbrotli.
 - **Legacy formats** (zstd v0.x) are not decoded.

@@ -4,15 +4,18 @@
 //! 2^27 window for one case), checked to decode to their input through both
 //! decoders, then decoded into preallocated buffers with
 //! `Decompressor::decompress_to_slice` and `ZSTD_decompressDCtx`, each with a
-//! reused context. A streaming group feeds `DecoderSession` 64 KiB of input
-//! at a time. A dictionary group decodes small records compressed with a
+//! reused context, and with `Decompressor::decompress_to_uninit` into a
+//! buffer that is never initialized. A streaming group feeds
+//! `DecoderSession` 64 KiB of input at a time, through `process` and
+//! through `process_uninit`. A dictionary group decodes small records compressed with a
 //! trained dictionary, each decoder holding the dictionary already parsed,
 //! and a small-frame group the same records compressed without one.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mzstd::dictionary::DecodeDictionary;
-use mzstd::{DecodeOperation, DecoderStatus, Decompressor};
+use mzstd::{DecodeOperation, DecodeProgress, DecoderSession, DecoderStatus, Decompressor};
 use std::hint::black_box;
+use std::mem::MaybeUninit;
 use zstd_ffi::corpus;
 use zstd_ffi::oracle::{self, Params};
 
@@ -52,6 +55,12 @@ fn one_shot(c: &mut Criterion) {
         );
         assert_eq!(output, input, "{name}");
         assert_eq!(theirs.decompress_into(&frame, &mut output), input.len());
+        let mut uninit = vec![MaybeUninit::<u8>::uninit(); input.len()];
+        assert_eq!(
+            ours.decompress_to_uninit(&frame, &mut uninit)
+                .expect("decodes"),
+            input.len()
+        );
         println!("{name}: {} -> {} bytes", input.len(), frame.len());
 
         let mut group = c.benchmark_group(format!("decompress/{name}"));
@@ -59,6 +68,12 @@ fn one_shot(c: &mut Criterion) {
         group.bench_function(BenchmarkId::from_parameter("mzstd"), |b| {
             b.iter(|| {
                 ours.decompress_to_slice(black_box(&frame), &mut output)
+                    .expect("decodes")
+            });
+        });
+        group.bench_function(BenchmarkId::from_parameter("mzstd-uninit"), |b| {
+            b.iter(|| {
+                ours.decompress_to_uninit(black_box(&frame), &mut uninit)
                     .expect("decodes")
             });
         });
@@ -70,16 +85,20 @@ fn one_shot(c: &mut Criterion) {
 }
 
 /// Feeds `frame` to a session `chunk` bytes at a time, returning the output
-/// size.
-fn stream(decoder: &mut Decompressor, frame: &[u8], chunk: usize, buffer: &mut [u8]) -> usize {
+/// size; `call` is one session call.
+fn stream<B: ?Sized>(
+    decoder: &mut Decompressor,
+    frame: &[u8],
+    chunk: usize,
+    buffer: &mut B,
+    call: fn(&mut DecoderSession<'_>, &[u8], &mut B) -> DecodeProgress,
+) -> usize {
     let mut session = decoder.start();
     let mut produced = 0;
     for piece in frame.chunks(chunk) {
         let mut piece = piece;
         loop {
-            let progress = session
-                .process(piece, buffer, DecodeOperation::Process)
-                .expect("decodes");
+            let progress = call(&mut session, piece, buffer);
             piece = &piece[progress.consumed..];
             produced += progress.produced;
             match progress.status {
@@ -92,19 +111,60 @@ fn stream(decoder: &mut Decompressor, frame: &[u8], chunk: usize, buffer: &mut [
     produced
 }
 
+fn process(session: &mut DecoderSession<'_>, input: &[u8], buffer: &mut [u8]) -> DecodeProgress {
+    session
+        .process(input, buffer, DecodeOperation::Process)
+        .expect("decodes")
+}
+
+fn process_uninit(
+    session: &mut DecoderSession<'_>,
+    input: &[u8],
+    buffer: &mut [MaybeUninit<u8>],
+) -> DecodeProgress {
+    session
+        .process_uninit(input, buffer, DecodeOperation::Process)
+        .expect("decodes")
+}
+
 fn streaming(c: &mut Criterion) {
     let input = corpus::mixed(4 << 20, 9);
     let frame = oracle::compress2(&input, &Params::level(3)).expect("reference");
     let mut decoder = Decompressor::default();
     let mut buffer = vec![0u8; 128 << 10];
+    let mut uninit = vec![MaybeUninit::<u8>::uninit(); 128 << 10];
+    let chunk = 64 << 10;
     assert_eq!(
-        stream(&mut decoder, &frame, 64 << 10, &mut buffer),
+        stream(&mut decoder, &frame, chunk, &mut buffer[..], process),
+        input.len()
+    );
+    assert_eq!(
+        stream(&mut decoder, &frame, chunk, &mut uninit[..], process_uninit),
         input.len()
     );
     let mut group = c.benchmark_group("decompress-stream/mixed-4MiB");
     group.throughput(Throughput::Bytes(input.len() as u64));
     group.bench_function("mzstd", |b| {
-        b.iter(|| stream(&mut decoder, black_box(&frame), 64 << 10, &mut buffer));
+        b.iter(|| {
+            stream(
+                &mut decoder,
+                black_box(&frame),
+                chunk,
+                &mut buffer[..],
+                process,
+            )
+        });
+    });
+    group.bench_function("mzstd-uninit", |b| {
+        b.iter(|| {
+            stream(
+                &mut decoder,
+                black_box(&frame),
+                chunk,
+                &mut uninit[..],
+                process_uninit,
+            )
+        });
     });
     group.finish();
 }

@@ -54,6 +54,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration and compatibility with the reference decoder. |
+| [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed one block ahead, the shared outcome mapping, the C ABI and their contract. |
 | [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman and sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
