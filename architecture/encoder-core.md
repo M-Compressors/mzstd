@@ -407,13 +407,26 @@ reference's templates are:
   base, the history pointer and its length. Otherwise the base-relative
   loop runs (`IN_PREFIX = false`);
 - dfast, and fast while its table is still filling, test candidates
-  without a branch on their validity (`mem::matches32` / `matches64`, the
-  reference's `ZSTD_match4Found_cmov` / `ZSTD_selectAddr`): an
-  out-of-prefix or stale candidate reads a stand-in word chosen by the
-  probed word's low bit (`DUMMIES`), which can never equal it, so only the
-  equality compare branches. While the table fills, stale and valid
-  entries are about equally likely, which made the validity branch the
-  finder's main source of mispredictions;
+  without a branch on their validity (the reference's
+  `ZSTD_match4Found_cmov` / `ZSTD_selectAddr`). While the table fills,
+  stale and valid entries are about equally likely, which made the
+  validity branch the finder's main source of mispredictions. fast clamps
+  the candidate's offset into the history (`min(offset, len - 4)`), so its
+  bytes load without a branch, and the candidate matches only when its
+  bytes equal the probed word and the clamp left the offset unchanged.
+  dfast, and the dictionary variants, select between the candidate and a
+  stand-in word picked by the probed word's low bit (`mem::matches32` /
+  `matches64`, `DUMMIES`), which can never equal it. In fast the clamp
+  replaced that select, whose stand-in address and low-bit choice were
+  rebuilt at every position; in dfast it measured faster on single small
+  blocks but slower on multi-block inputs (see the known gaps);
+- like the reference, fast and dfast prefetch the input at `ip1 + 64` and
+  `ip1 + 128` whenever the step grows (`mem::prefetch_l1`, through the
+  `branches` crate). The reference's per-position `ip + 256` on aarch64
+  is not ported: it measured 1-4% slower on the M5;
+- dfast's match counts call `mem::count_at_simd`, whose first-word test is
+  always inlined: one of its loop instances otherwise called the whole
+  count out of line for every match;
 - fast's prefix loop switches to branches (`BRANCHY`,
   `mem::matches32_branchy`: is the word inside the history, then does it
   equal the probed word) for a block whose history before it is at least
@@ -450,8 +463,8 @@ flowchart TD
     CW --> Y{"fast: history >= 4 << hashLog?"}
     CR --> Y
     Y -- yes --> C1["BRANCHY: validity branch, then compare"]
-    Y -- "no, or dfast" --> C2["select: stand-in word if invalid"]
-    B -- no --> D["compress_scan::<.., false, ..>: offsets from the window base, select"]
+    Y -- "no, or dfast" --> C2["fast: offset clamped into the history, match only if unclamped; dfast: stand-in word if invalid"]
+    B -- no --> D["compress_scan::<.., false, ..>: offsets from the window base, clamp or stand-in"]
     C1 --> E[probe: hash slots as Cell refs, window load = exit test]
     C2 --> E
     D --> E
@@ -526,7 +539,7 @@ Kernels, all safe code:
 
 | Kernel | Reference | What it does |
 | --- | --- | --- |
-| `lazy::row::match_mask` | `ZSTD_row_getMatchMask` | One `u8x16`/`u8x32`/`u8x64` compare of a tag row with the tag, `to_bitmask`, then a rotation so bit 0 is the row's head. |
+| `lazy::row::match_mask` | `ZSTD_row_getMatchMask` | One `u8x16`/`u8x32`/`u8x64` compare of a tag row with the tag, `to_bitmask`, then a rotation so bit 0 is the row's head. 16-slot rows on NEON instead narrow the compare to four bits per slot (`vshrn` by four in a `fearless_simd::kernel!`, the reference's `ZSTD_row_getNEONMask`), since NEON has no `movemask`; `Matches::pop` turns a group back into a slot. |
 | `lazy::count::count`, `common_run` | `ZSTD_count` | Window adapters for the shared `mem::count_slices_simd` word and vector scan described above. |
 | `Ctx::tree_step` | `ZSTD_count` + byte compare in the DUBT | Without an extDict, one 8-byte load per side gives both the common length and the two bytes that order the runs. |
 | `Probe` | `MEM_read32(match + ml - 3) == MEM_read32(ip + ml - 3)` | Cuts the searched window once per search (to the block end, which can precede the prefix end under LDM), and keeps its probe word until `ml` changes. |
@@ -753,7 +766,51 @@ buffers are always large enough) into `EncodeError::Internal`.
 - The select's stand-in picked by the word's low bit was measured
   (2026-10-15, first 20 MB of `silesia.tar`) against one fixed stand-in
   followed by the validity test, as `ZSTD_match4Found_cmov` does: the
-  latter was 1% slower at level 1 and 3% slower at level 3.
+  latter was 1% slower at level 1 and 3% slower at level 3. The clamp
+  in fast's loop, the prefetches and dfast's inlined count were measured
+  on an Apple M5 Pro (2026-10-17, three or more interleaved runs of both
+  builds, one reused context per input, on 1 KiB to 128 KiB slices of
+  Alice, the structured binary corpus and zstd's
+  `large-literal-and-match-lengths` file and on 1 MiB of the synthetic
+  text and binary corpora). Against the previous loops, level -5 took
+  2-18% less time, level 1 0.3-15%, level 2 0.3-14% and level 3 1-11%
+  (1 MiB of text at level 3 unchanged);
+  level 4 moved by -3% to +1%. The largest gains are on small inputs.
+  One case measured slower, 1 MiB of binary data at level 2 (+5%), and it
+  is equally slower with dfast's loop left untouched, so it comes from code
+  placement elsewhere, not from this loop.
+- Measured and rejected on the M5 (2026-10-17, interleaved runs of both
+  builds; these loops' timings move by up to 10% between builds that
+  differ only in code elsewhere, through inlining, register allocation
+  and placement):
+  - dfast's candidates clamped as fast's are. Clamping both was up to 18%
+    faster on single blocks up to 16 KiB at level 3, but 6% slower on
+    1 MiB of binary data at level 3, 16% at level 4, and 4-6% slower on
+    128 KiB at level 4: the compiler turned the long candidate's clamp
+    test into a branch that waited on the table load. Choosing per block
+    (clamped only on a frame's first block, or while the history is under
+    `4 << hashLog`) fixed 1 MiB, but as a second instance of the loop it
+    moved `compress_block_mls` out of line and as a run-time flag it cost
+    a register, and either made a single 128 KiB block 3-12% slower.
+    Clamping only the short candidate gave 1-4% on small inputs and lost
+    3-5% on 128 KiB blocks;
+  - dfast's validity tests as branches (5-18% faster up to 16 KiB, 11-32%
+    slower on 128 KiB blocks), its repcode read clamped instead of bounds
+    checked (no change), its searched index taken where the search stops
+    or read back from the short slot just written (no gain, 8-11% slower
+    on 128 KiB), and the per-position `ip + 256` prefetch on aarch64 (1-4%
+    slower);
+  - NEON kernels for the 32- and 64-slot tag masks (`vuzp` in place of
+    `vld2q`/`vld4q`; up to 6% slower at level 10, no change at 12) and for
+    match counting in 64-byte blocks (`vshrn` nibble masks; no change at
+    levels 1 and 3, 0.5-1% slower at 16 and 19, up to 7% slower on highly
+    repetitive input).
+- dfast executes about 60 instructions per probed position in its search
+  loop against the reference's 38 (hardware counters on the M5: about
+  1.4x the reference's instructions per call on 128 KiB of binary data,
+  with a similar share of mispredicted branches): the repcode read's
+  bounds check, the stand-in's address, the table masks and a spilled
+  index. It stays 10-20% slower than the reference at levels 3 and 4.
 - On the Silesia corpus (`silesia.tar`, 2026-10-15, warm contexts and the
   fastest of several runs, as lzbench measures) fast compresses about
   5-10% faster than before the constant widths and the validity branches,

@@ -1457,9 +1457,8 @@ fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
         // At most `ROW - 1` slots match (slot 0 never does), so the
         // attempts cannot run out and the loop counts only the candidates,
         // which also stay below the buffer's 64 slots.
-        while matches != 0 {
-            let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
-            matches &= matches - 1;
+        while let Some(offset) = matches.pop() {
+            let match_pos = (head as usize + offset) & (ROW - 1);
             let match_index = slot_row[match_pos];
             if match_index < low_limit {
                 break;
@@ -1473,9 +1472,10 @@ fn row_find_best_match<S: Simd, const MLS: u32, const ROW: usize>(
     } else {
         // Fewer attempts than a row has slots, all within the buffer.
         let nb_attempts = state.nb_attempts;
-        while matches != 0 && num_matches < nb_attempts {
-            let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
-            matches &= matches - 1;
+        while num_matches < nb_attempts
+            && let Some(offset) = matches.pop()
+        {
+            let match_pos = (head as usize + offset) & (ROW - 1);
             let match_index = slot_row[match_pos];
             if match_index < low_limit {
                 break;
@@ -1855,9 +1855,10 @@ fn row_find_best_match_dms<S: Simd, const MLS: u32, const ROW: usize>(
     // prefetches.
     let window = dict.src.as_ptr().wrapping_sub(dict.start as usize);
     let mut num_matches = 0usize;
-    while matches != 0 && nb_attempts > 0 {
-        let match_pos = (head as usize + matches.trailing_zeros() as usize) & (ROW - 1);
-        matches &= matches - 1;
+    while nb_attempts > 0
+        && let Some(offset) = matches.pop()
+    {
+        let match_pos = (head as usize + offset) & (ROW - 1);
         let match_index = slot_row[match_pos];
         if match_index < dict.start {
             break;

@@ -24,6 +24,34 @@
   byte-identical: new tests compare the sort with a verbatim port of
   `HUF_sort` and the quicksort with the recursive one on heavily tied
   counts, and a rebuilt table drops symbols that no longer occur.
+- **Faster fast and dfast levels (-131072 to 4).** The fast search tests a
+  candidate on a filling table by clamping its offset into the history and
+  loading its bytes there, which needs neither a branch nor a stand-in
+  word; a clamped offset never matches, so the reference's matches are
+  found. The select it replaces rebuilt a stand-in's address at every
+  position. Both searches now prefetch the input when their step grows,
+  as the reference does, and dfast compares the first word of each match
+  length inline. Against the previous commit, level -5 took 2-18% less
+  time, level 1 0.3-15%, level 2 0.3-14% and level 3 1-11% on 1 KiB to
+  1 MiB of text, binary and long-literal data (1 MiB of text at level 3
+  unchanged), with the largest gains on small inputs; level 4 moved by -3% to +1% (one reused context per input,
+  interleaved runs of both builds on an Apple M5 Pro). 1 MiB of binary data
+  at level 2 measured 5% slower, as it does with dfast untouched: code
+  placement, not the loop. Frames are byte-identical. Clamping dfast's
+  candidates too was up to 18% faster on single small blocks but up to 16%
+  slower on multi-block inputs, and was not kept.
+- **NEON tag mask for the row match finder.** 16-slot rows (levels 5 to 9
+  on inputs whose window exceeds 16 KiB) narrow their tag compare to four
+  bits per slot with `vshrn`, the reference's `ZSTD_row_getNEONMask`,
+  instead of emulating a byte-to-bit mask NEON lacks. The intrinsics run
+  in a `fearless_simd::kernel!`; mzstd's source stays free of `unsafe`.
+  Levels 5 and 7 took 1-6% less time on 64 KiB and 128 KiB of text and
+  binary data on an Apple M5 Pro. The reference's 32- and 64-slot NEON
+  masks and a NEON match-length kernel measured no faster than the
+  portable code and were not kept. x86 is unchanged.
+- **The Huffman encoder no longer zeroes its code table.** The 2 KiB of
+  packed codes are built with `array::from_fn`, so each entry is written
+  once and the `memset` in front of the fill is gone.
 
 ## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - Unreleased
 

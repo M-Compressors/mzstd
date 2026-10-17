@@ -469,6 +469,13 @@ pub(crate) fn matches64(src: &[u8], at: u32, word: u64) -> bool {
     *candidate(src, at, &word) == word
 }
 
+/// Hints that `src[at]` will be read soon (`PREFETCH_L1`). The pointer only
+/// reaches the prefetch instruction, so an offset past the end is harmless.
+#[inline(always)]
+pub(crate) fn prefetch_l1(src: &[u8], at: usize) {
+    branches::prefetch_read_data::<u8, 0>(src.as_ptr().wrapping_add(at));
+}
+
 /// The little-endian `u64` at offset `at` of `src`, or `None` when the
 /// eight bytes are not all inside it.
 ///

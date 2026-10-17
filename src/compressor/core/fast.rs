@@ -14,7 +14,7 @@ use super::cdict::TableLoad;
 use super::match_state::{BlockInput, DictMatchState, MatchState};
 use super::mem::{
     common_suffix, count_at_simd, count_slices_simd, hash_at, hash_ptr, hash_word, load32, load64,
-    probe_pair, probe_window, window_word,
+    prefetch_l1, probe_pair, probe_window, window_word,
 };
 use super::params::SHORT_CACHE_TAG_BITS;
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
@@ -230,14 +230,24 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
 }
 
 /// Whether the candidate at offset `at` of `history` starts with `word`:
-/// with branches (`BRANCHY`) or with a select (see [`super::mem::matches32`]).
+/// with branches (`BRANCHY`), or without: the offset is clamped into the
+/// history, so the load needs neither a branch nor a stand-in word, and a
+/// clamped offset never counts as a match.
 #[inline(always)]
 fn candidate_matches<const BRANCHY: bool>(history: &[u8], at: u32, word: u32) -> bool {
     if BRANCHY {
-        super::mem::matches32_branchy(history, at, word)
-    } else {
-        super::mem::matches32(history, at, word)
+        return super::mem::matches32_branchy(history, at, word);
     }
+    let at = at as usize;
+    let Some(limit) = history.len().checked_sub(4) else {
+        return false;
+    };
+    let clamped = at.min(limit);
+    let bytes = history[clamped..]
+        .first_chunk::<4>()
+        .copied()
+        .unwrap_or_default();
+    (u32::from_le_bytes(bytes) == word) & (at == clamped)
 }
 
 /// The bytes one `fast` block searches and the parameters it searches them
@@ -388,6 +398,9 @@ fn compress_scan<
             w0 = w2;
             ip2 = ip0 + step;
             if ip2 >= next_step {
+                // `ip1` is `ip0 + 1`.
+                prefetch_l1(src, ip0 + 1 + 64);
+                prefetch_l1(src, ip0 + 1 + 128);
                 step += 1;
                 next_step += k_step_incr;
             }

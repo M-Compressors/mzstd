@@ -10,7 +10,7 @@ use super::cdict::TableLoad;
 use super::fast::{DictBytes, rep_index_ok, tags_match, write_tagged_index};
 use super::match_state::{BlockInput, DictMatchState, MatchState};
 use super::mem::{
-    count_at_simd, count_slices_simd, hash_ptr, hash_word, load32, load64, try_load64,
+    count_at_simd, count_slices_simd, hash_ptr, hash_word, load32, load64, prefetch_l1, try_load64,
 };
 use super::params::SHORT_CACHE_TAG_BITS;
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
@@ -264,7 +264,10 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
 
     let index = |p: usize| p as u32 + base;
     let read32 = |p: usize| load32(src, p);
-    let count = |a: usize, b: usize| count_slices_simd(simd, &src[a..], &src[b..]);
+    // The first word is compared inline (`count_at_simd` is always inlined):
+    // most matches end there, and one instance of this loop called the
+    // whole count out of line for every match.
+    let count = |a: usize, b: usize| count_at_simd(simd, src, a, b);
 
     let Tables {
         long: hash_long,
@@ -359,6 +362,9 @@ fn compress_scan<S: Simd, const MLS: u32, const IN_PREFIX: bool>(
             }
 
             if ip1 >= next_step {
+                // `PREFETCH_L1`, as the reference does when the step grows.
+                prefetch_l1(src, ip1 + 64);
+                prefetch_l1(src, ip1 + 128);
                 step += 1;
                 next_step += k_step_incr;
             }
