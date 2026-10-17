@@ -2,14 +2,28 @@
 
 ## Unreleased
 
-- **Huffman tree sort without recursion.** The quicksort that orders
-  symbols within a count bucket (`HUF_simpleQuickSort`) keeps waiting
-  ranges on a fixed 28-entry stack instead of recursing, and short runs use
-  the standard library's stable sort in place of the hand-written insertion
-  sort, which is stable too. Code lengths, and so the compressed bytes, are
-  unchanged: a new test compares the order against a recursive port on
-  every length up to 256 with heavily tied counts, and the C-reference
-  table tests pass.
+- **Faster Huffman tables for small inputs.** The literal table's sort
+  (`HUF_sort`) no longer places symbols that do not occur: the reference
+  sorts them into a last bucket of their own, so the other symbols' order
+  is unchanged, and counting them was the longest chain of increments to
+  one bucket. One array replaces the reference's start and cursor per
+  bucket, since a bucket ends where the next lower one starts. The
+  quicksort for buckets from count 164 up (`HUF_simpleQuickSort`) keeps
+  waiting ranges on a fixed 28-entry stack of byte pairs instead of
+  recursing, and its insertion sort stays hand-written: the standard
+  library's stable sort, tried for it, linked about 1,200 instructions of
+  driftsort for `Node` that runs of at most nine nodes never reach. The
+  sort's stack frame shrank from 1,248 to 496 bytes. On histograms of
+  256-byte and 1 KiB slices of the test corpora the sort took 0.12-0.25 µs
+  instead of 0.16-0.77 µs, and 0.19-0.78 µs instead of 0.32-0.82 µs on
+  16 KiB and 128 KiB ones (an ad hoc timing loop, not checked in).
+  Compressing zstd's 1189-byte `http` file took 8.5% less time at level 1,
+  6.2% at level 3, 2.4% at level 9 and 7.3% at level 19 (Criterion,
+  `benches/compress.rs`, against the previous commit in back-to-back runs
+  on an Apple M5 Pro); 1 MiB inputs are unchanged. Frames are
+  byte-identical: new tests compare the sort with a verbatim port of
+  `HUF_sort` and the quicksort with the recursive one on heavily tied
+  counts, and a rebuilt table drops symbols that no longer occur.
 
 ## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - Unreleased
 

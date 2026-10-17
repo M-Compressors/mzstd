@@ -256,12 +256,21 @@ sequenceDiagram
     Each subsequent depth trial restores leaf lengths from the unchanged
     internal-node heights before applying the reference's height limit;
     table pricing, tie order and the selected depth are unchanged.
-    The bucket sort's quicksort (`HUF_simpleQuickSort`) runs without
-    recursion: the smaller side of each partition waits on a fixed stack
-    of at most 28 ranges, and runs short enough for the reference's
-    insertion sort, which is stable, use the standard library's stable
-    sort. Order among equal counts is the reference's (tested against a
-    recursive port).
+    `sort` (`HUF_sort`) places only symbols that occur: the reference
+    puts absent ones in the last bucket, so the others' positions do not
+    change, and their nodes keep the zero count and length of the cleared
+    tree. `fill_from_tree` therefore clears the alphabet's lengths and
+    writes those of the non-null ranks rather than reading every leaf.
+    One array replaces the reference's start and cursor per bucket: after
+    placement it holds each bucket's end, which is the next lower bucket's
+    start, so bucket `n - 1` spans `rank[n + 1]..rank[n]`. The buckets from
+    count 164 up are sorted by `HUF_simpleQuickSort` without recursion:
+    the smaller side of each partition waits on a fixed stack of at most
+    28 byte-sized ranges, and short runs go through the reference's stable
+    insertion sort, written out rather than `slice::sort_by_key`, which
+    would link a whole stable sort for runs of at most nine nodes. Order
+    among equal counts is the reference's; tests compare `sort` with a
+    verbatim port of `HUF_sort` and the quicksort with the recursive one.
   - `sequences::encode` walks codes and sequences backwards together. Each
     sequence's extra bits are assembled into one word (literal length,
     match length, offset, from the least significant bit; `SeqCodes::extra`)
@@ -294,6 +303,22 @@ flowchart LR
     ST --> EN
     SS --> LIT["literals: hist::count, Huffman"]
     FC --> SB["split_block: extra bits from histograms x extra bits per code"]
+```
+
+Huffman table construction (`huf::CTable::build`; `optimal_table_log` runs
+the same steps once and then only the height limit per depth):
+
+```mermaid
+flowchart TD
+    H["literal histogram"] --> C["count present symbols per bucket (exact below 165, log2 above)"]
+    C --> P["suffix sums: rank[r] = start of bucket r - 1"]
+    P --> L["place present symbols; rank[r] advances to the bucket's end"]
+    L --> Q{"bucket from count 164 up with 2+ nodes?"}
+    Q -->|yes| QS["quick_sort: Lomuto partitions, smaller side on a 28-entry stack, runs of 9 or fewer by insertion"]
+    Q -->|no| T
+    QS --> T["build_tree: unlimited lengths"]
+    T --> M["set_max_height: limit to the table log"]
+    M --> F["fill_from_tree: clear lengths, write present ranks, canonical codes"]
 ```
 
 ## Backend dispatch
