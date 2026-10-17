@@ -587,16 +587,15 @@ const HUF_CONTAINER_BITS: u32 = 64;
 /// Every symbol is packed; only those the table describes are meaningful.
 #[inline(always)]
 fn packed_codes(table: &CTable) -> [u64; 256] {
-    let mut codes = [0u64; 256];
     // Branch-free over the whole alphabet, so the loop vectorizes: a symbol
     // without a code packs to garbage (its shift wraps), but the input
-    // holds no such symbol and it is never written.
-    for ((code, &nb_bits), &value) in codes.iter_mut().zip(&table.nb_bits).zip(&table.value) {
-        let nb_bits = u32::from(nb_bits);
-        *code = u64::from(value).wrapping_shl(HUF_CONTAINER_BITS.wrapping_sub(nb_bits))
-            | u64::from(nb_bits);
-    }
-    codes
+    // holds no such symbol and it is never written. Each entry is written
+    // once, with no zeroing first.
+    core::array::from_fn(|symbol| {
+        let nb_bits = u32::from(table.nb_bits[symbol]);
+        u64::from(table.value[symbol]).wrapping_shl(HUF_CONTAINER_BITS.wrapping_sub(nb_bits))
+            | u64::from(nb_bits)
+    })
 }
 
 /// The Huffman stream writer (`HUF_CStream_t`).
