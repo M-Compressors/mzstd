@@ -5,6 +5,8 @@
 //! broken by those exact algorithms, and the resulting code lengths are part
 //! of the compressed bytes.
 
+use core::cmp::Reverse;
+
 use fearless_simd::Simd;
 use fearless_simd_macros::simd;
 
@@ -130,16 +132,22 @@ fn bucket_index(count: u32) -> u32 {
     }
 }
 
-/// Descending insertion sort of `nodes` (`HUF_insertionSort`).
-fn insertion_sort(nodes: &mut [Node]) {
-    for i in 1..nodes.len() {
-        let key = nodes[i];
-        let mut j = i as isize - 1;
-        while j >= 0 && nodes[j as usize].count < key.count {
-            nodes[(j + 1) as usize] = nodes[j as usize];
-            j -= 1;
-        }
-        nodes[(j + 1) as usize] = key;
+/// Ranges of `high - low` below this are sorted without partitioning.
+const INSERTION_SORT_THRESHOLD: isize = 8;
+
+/// Ranges [`quick_sort`] can have waiting at once. They are disjoint, each
+/// holds more than `INSERTION_SORT_THRESHOLD` nodes, and a bucket holds at
+/// most one node per symbol.
+const QUICK_SORT_PENDING: usize =
+    (SYMBOL_VALUE_MAX as usize + 1) / (INSERTION_SORT_THRESHOLD as usize + 1);
+
+/// Sorts `nodes[low..=high]` by descending count (`HUF_insertionSort`).
+///
+/// The reference's insertion sort moves a node only past strictly smaller
+/// counts, so it is stable, and any stable sort yields the same order.
+fn sort_short(nodes: &mut [Node], low: isize, high: isize) {
+    if high > low {
+        nodes[low as usize..=high as usize].sort_by_key(|node| Reverse(node.count));
     }
 }
 
@@ -158,24 +166,46 @@ fn partition(nodes: &mut [Node], low: isize, high: isize) -> isize {
 }
 
 /// Descending quicksort with insertion sort for short runs
-/// (`HUF_simpleQuickSort`).
-fn quick_sort(nodes: &mut [Node], mut low: isize, mut high: isize) {
-    const INSERTION_SORT_THRESHOLD: isize = 8;
+/// (`HUF_simpleQuickSort`), without recursion.
+///
+/// The reference recurses into the smaller side of each partition and keeps
+/// partitioning the larger side in its loop, where short ranges are not
+/// special-cased. Sorting a range never touches another, so the smaller
+/// sides wait on a stack instead, and a short one is sorted at once, as the
+/// reference's call would. The result is the reference's order, including
+/// among equal counts.
+fn quick_sort(nodes: &mut [Node]) {
+    let mut pending = [(0, 0); QUICK_SORT_PENDING];
+    let mut waiting = 0;
+    let (mut low, mut high) = (0, nodes.len() as isize - 1);
     if high - low < INSERTION_SORT_THRESHOLD {
-        if high > low {
-            insertion_sort(&mut nodes[low as usize..=high as usize]);
-        }
+        sort_short(nodes, low, high);
         return;
     }
-    while low < high {
-        let idx = partition(nodes, low, high);
-        if idx - low < high - idx {
-            quick_sort(nodes, low, idx - 1);
-            low = idx + 1;
-        } else {
-            quick_sort(nodes, idx + 1, high);
-            high = idx - 1;
+    loop {
+        while low < high {
+            let idx = partition(nodes, low, high);
+            let smaller = if idx - low < high - idx {
+                let side = (low, idx - 1);
+                low = idx + 1;
+                side
+            } else {
+                let side = (idx + 1, high);
+                high = idx - 1;
+                side
+            };
+            if smaller.1 - smaller.0 < INSERTION_SORT_THRESHOLD {
+                sort_short(nodes, smaller.0, smaller.1);
+            } else {
+                pending[waiting] = smaller;
+                waiting += 1;
+            }
         }
+        if waiting == 0 {
+            return;
+        }
+        waiting -= 1;
+        (low, high) = pending[waiting];
     }
 }
 
@@ -203,8 +233,7 @@ fn sort(tree: &mut Tree, count: &[u32], max_symbol_value: u32) {
         let bucket_size = curr[n] as isize - base[n] as isize;
         let start = usize::from(base[n]);
         if bucket_size > 1 {
-            let nodes = &mut tree.nodes[start + 1..];
-            quick_sort(nodes, 0, bucket_size - 1);
+            quick_sort(&mut tree.nodes[start + 1..start + 1 + bucket_size as usize]);
         }
     }
 }
@@ -1245,5 +1274,97 @@ mod tests {
             compress_1x(&mut dst[..7], &[1; 8], &table, Backend::SCALAR),
             0
         );
+    }
+
+    /// `HUF_insertionSort` as the reference writes it.
+    fn reference_insertion_sort(nodes: &mut [Node]) {
+        for i in 1..nodes.len() {
+            let key = nodes[i];
+            let mut j = i as isize - 1;
+            while j >= 0 && nodes[j as usize].count < key.count {
+                nodes[(j + 1) as usize] = nodes[j as usize];
+                j -= 1;
+            }
+            nodes[(j + 1) as usize] = key;
+        }
+    }
+
+    /// `HUF_simpleQuickSort` as the reference writes it, recursion included.
+    fn reference_quick_sort(nodes: &mut [Node], mut low: isize, mut high: isize) {
+        if high - low < INSERTION_SORT_THRESHOLD {
+            if high > low {
+                reference_insertion_sort(&mut nodes[low as usize..=high as usize]);
+            }
+            return;
+        }
+        while low < high {
+            let idx = partition(nodes, low, high);
+            if idx - low < high - idx {
+                reference_quick_sort(nodes, low, idx - 1);
+                low = idx + 1;
+            } else {
+                reference_quick_sort(nodes, idx + 1, high);
+                high = idx - 1;
+            }
+        }
+    }
+
+    #[test]
+    fn quick_sort_orders_equal_counts_like_the_recursive_reference() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let max = SYMBOL_VALUE_MAX as usize + 1;
+        for len in 0..=max {
+            for shape in 0..6 {
+                let nodes: alloc::vec::Vec<Node> = (0..len)
+                    .map(|i| Node {
+                        count: match shape {
+                            0 => (next() % 4) as u32,
+                            1 => (next() % 40) as u32,
+                            2 => next() as u32,
+                            3 => 7,
+                            4 => i as u32 / 3,
+                            _ => (len - i) as u32 / 5,
+                        },
+                        byte: i as u8,
+                        ..Node::default()
+                    })
+                    .collect();
+                let mut ours = nodes.clone();
+                quick_sort(&mut ours);
+                let mut reference = nodes;
+                reference_quick_sort(&mut reference, 0, len as isize - 1);
+                let order = |nodes: &[Node]| -> alloc::vec::Vec<(u32, u8)> {
+                    nodes.iter().map(|node| (node.count, node.byte)).collect()
+                };
+                assert_eq!(order(&ours), order(&reference), "len {len} shape {shape}");
+            }
+        }
+    }
+
+    #[test]
+    fn short_runs_keep_equal_counts_in_place() {
+        let mut nodes: alloc::vec::Vec<Node> = [3, 5, 3, 9, 5, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, count)| Node {
+                count,
+                byte: i as u8,
+                ..Node::default()
+            })
+            .collect();
+        let mut reference = nodes.clone();
+        sort_short(&mut nodes, 0, 5);
+        reference_insertion_sort(&mut reference);
+        let bytes = |nodes: &[Node]| -> alloc::vec::Vec<u8> {
+            nodes.iter().map(|node| node.byte).collect()
+        };
+        assert_eq!(bytes(&nodes), [3, 1, 4, 0, 2, 5]);
+        assert_eq!(bytes(&nodes), bytes(&reference));
     }
 }

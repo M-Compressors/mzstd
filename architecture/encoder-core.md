@@ -256,6 +256,12 @@ sequenceDiagram
     Each subsequent depth trial restores leaf lengths from the unchanged
     internal-node heights before applying the reference's height limit;
     table pricing, tie order and the selected depth are unchanged.
+    The bucket sort's quicksort (`HUF_simpleQuickSort`) runs without
+    recursion: the smaller side of each partition waits on a fixed stack
+    of at most 28 ranges, and runs short enough for the reference's
+    insertion sort, which is stable, use the standard library's stable
+    sort. Order among equal counts is the reference's (tested against a
+    recursive port).
   - `sequences::encode` walks codes and sequences backwards together. Each
     sequence's extra bits are assembled into one word (literal length,
     match length, offset, from the least significant bit; `SeqCodes::extra`)

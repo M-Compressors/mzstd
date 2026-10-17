@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Huffman tree sort without recursion.** The quicksort that orders
+  symbols within a count bucket (`HUF_simpleQuickSort`) keeps waiting
+  ranges on a fixed 28-entry stack instead of recursing, and short runs use
+  the standard library's stable sort in place of the hand-written insertion
+  sort, which is stable too. Code lengths, and so the compressed bytes, are
+  unchanged: a new test compares the order against a recursive port on
+  every length up to 256 with heavily tied counts, and the C-reference
+  table tests pass.
+
 ## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - Unreleased
 
 - **Decoder output into uninitialized memory.** `DecoderSession` and
