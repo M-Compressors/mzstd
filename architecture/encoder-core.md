@@ -25,6 +25,8 @@ graph TD
     Cctx --> Presplit[presplit: pre-splitter]
     Block --> Split[split_block: post splitter]
     Block --> MS[match_state: tables, opt state]
+    MS --> LB["lazy_box: LazyBox, state allocated on first write"]
+    Entropy --> LB
     Block --> Finders
     subgraph Finders[match finders]
         Fast[fast]
@@ -114,6 +116,31 @@ reference's `init_once` tags). The reference's per-frame salt is not
 modelled, because XOR-ing it into the hash permutes rows and tags without
 changing which positions collide. The engine's two block states (`prev`, `next`) are boxed, so
 confirming a block swaps two pointers as the reference does.
+
+Their tables are not allocated with them. `Tables` keeps the Huffman table
+and the three FSE tables in `LazyBox`es (`core::lazy_box`): the Huffman
+table alone, the sequence tables together (`FseCTables`, which `FseTables`
+dereferences to). A box is allocated, zeroed, on its first mutable access;
+before that it reads as one shared static all-zero table, the value a
+zeroed table holds. A table is read only after its repeat mode says a block
+wrote it, so empty or tiny inputs, raw literals and blocks without
+sequences allocate nothing, as the reference leaves these tables
+uninitialized in its workspace. `clone_from` copies in place when both sides
+are allocated, so `next.clone_from(prev)` per block never reallocates, and
+`huf::compress` stores a fresh table with `LazyBox::set`, without zeroing
+it first. The optimal parser's `OptState` (its price tables) is a `LazyBox`
+in `MatchState` too, allocated only by btopt and above; `reset` and
+`build_seq_store` write it only when it exists. `Engine::with_backend` is
+the engine's one constructor.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unallocated: Engine::with_backend
+    Unallocated --> Unallocated: read (static empty table)
+    Unallocated --> Allocated: first write (DerefMut, set) or clone_from(allocated)
+    Allocated --> Allocated: build / set / clone_from(allocated), in place
+    Allocated --> Unallocated: clone_from(unallocated)
+```
 
 `compress_continue` is `ZSTD_compressContinue_internal`: it writes the
 header once, updates the window, then `compress_frame_chunk` cuts the input
@@ -289,7 +316,11 @@ sequenceDiagram
 - `presplit` (`ZSTD_splitBlock`, by fingerprint distance) chooses block sizes
   before match finding for the strategies that enable it; `split_block`
   (`ZSTD_compressBlock_splitBlock`) splits the sequences of a finished block
-  for the ultra levels.
+  for the ultra levels. `split_by_chunks` dispatches once to an instance
+  compiled for the level's sampling rate and hash log (43/8, 11/9, 5/10,
+  1/10), as `ZSTD_GEN_RECORD_FINGERPRINT` does: a constant stride, hash
+  indices that provably fit the table, and an `fpDistance` whose products
+  of 32-bit factors vectorize.
 - After a block, `prev` and `next` swap (`confirm_block_state`) unless the
   block was stored raw or RLE, which keeps the previous entropy tables and
   demotes repeat-mode state as the reference does.
@@ -324,8 +355,8 @@ flowchart TD
 ## Backend dispatch
 
 The engine carries the compressor's `Backend` (a `fearless_simd::Level`
-chosen once when the compressor is built); `Engine::with_backend` copies it
-into `MatchState::backend` for the match finders. Dispatch happens once per
+chosen once when the compressor is built); `Engine::with_backend` stores it
+in `MatchState::backend` for the match finders. Dispatch happens once per
 block at the top of each kernel, never inside a loop:
 
 ```mermaid
@@ -398,7 +429,22 @@ reference's templates are:
   a constant, which frees two of the loop's registers; one test of the
   table's length before the loop proves the masked indices in bounds.
   Other parameters take the instance with the width read at run time
-  (`0`). Only the prefix loop is specialized;
+  (`0`). The defaults for inputs up to 128 and 256 KiB, (5, 12), (5, 13)
+  and (6, 14), also compile in the window index of the scan's first byte
+  (`ORIGIN`, the window's first index) and are taken only when the prefix
+  starts the window (one-shot frames and a fresh context's first frame),
+  with the select alone; any other prefix runs the generic instance. Only
+  the prefix loop is specialized;
+- dfast compiles in the widths of its defaults too, as `(MLS, hashLog,
+  chainLog)` = (5, 14, 14) (level 2 up to 256 KiB), (4, 16, 16) (level 3
+  up to 256 KiB), (5, 17, 16) and (5, 18, 18) (levels 3 and 4 above
+  256 KiB), (5, 16, 15) (level 3 up to 128 KiB) and (4, 17, 16) (level 4
+  on 64 KiB). Each set is its own out-of-line `#[simd]` function
+  (`compress_scan_widths`), called once per block: inlined side by side
+  into `compress_block_mls`, LLVM merged the instances back into one loop
+  that loads the widths at run time. The tables are cut to
+  `1 << hashLog` entries first, so the masks are constants. Other
+  parameters run the inlined `compress_scan::<.., 0, 0>`;
 - `IN_PREFIX` holds when the block starts in the prefix and both repeat
   offsets reach no further back than the prefix start from the block's
   first position. Every later repeat offset is then `ip - match` with the
@@ -414,6 +460,10 @@ reference's templates are:
   the candidate's offset into the history (`min(offset, len - 4)`), so its
   bytes load without a branch, and the candidate matches only when its
   bytes equal the probed word and the clamp left the offset unchanged.
+  Both conditions are folded into one value, `(bytes ^ word) | (offset ^
+  clamped)`, and tested once: written as two comparisons joined with `&`,
+  LLVM turned the range test back into a branch on x86, which mispredicts
+  as often as the validity branch the clamp replaced.
   dfast, and the dictionary variants, select between the candidate and a
   stand-in word picked by the probed word's low bit (`mem::matches32` /
   `matches64`, `DUMMIES`), which can never equal it. In fast the clamp
@@ -424,9 +474,22 @@ reference's templates are:
   `ip1 + 128` whenever the step grows (`mem::prefetch_l1`, through the
   `branches` crate). The reference's per-position `ip + 256` on aarch64
   is not ported: it measured 1-4% slower on the M5;
-- dfast's match counts call `mem::count_at_simd`, whose first-word test is
-  always inlined: one of its loop instances otherwise called the whole
-  count out of line for every match;
+- dfast's loops call `mem::count_at_simd`, whose first-word test is
+  always inlined; the 128-byte scan behind it stays out of line. Its
+  repeat offsets are `usize` inside the scan, which saves LLVM a second
+  copy of the first one. Its hash slots come from `Slots::{long, small}`
+  (always inlined, widths as const generics): closures that LLVM left out
+  of line reloaded the compiled-in widths from memory;
+- after a match, dfast's prefix loop computes the forward end before the
+  backward extension and loads the word there with its long-table slot
+  (`Slots::ahead`), prefetching both candidates when the widths are
+  compiled in; the catch-up loop and the sequence store follow, and the
+  next search starts from the carried word and slot (the slot is read
+  again after the complementary insertions, so their writes are seen).
+  The load succeeding is the reference's `ip <= ilimit` test, also after
+  each immediate repcode. The kernel is bound by the latency after each
+  mispredicted match: this took its work off the next search's load chain
+  and made text 2-3% faster with 2% more instructions;
 - fast's prefix loop switches to branches (`BRANCHY`,
   `mem::matches32_branchy`: is the word inside the history, then does it
   equal the probed word) for a block whose history before it is at least
@@ -449,17 +512,53 @@ reference's templates are:
   inline (`mem::count_at_simd`), and reads `ip0 - 2` once for both the
   hash insert and the first repcode compare;
 - the extDict variants use the same prefix offsets, reading only
-  candidates below the prefix from the external segment by window index;
+  candidates below the prefix from the external segment by window index.
+  fast's (`compress_block_ext_dict_mls`, `ZSTD_compressBlock_fast_extDict_generic`)
+  addresses a candidate through `locate`, which picks without a branch
+  (`select_unpredictable`, the reference's `idxBase` select) the slice
+  holding it: the external segment from `dict_start_index` up to the
+  prefix, or `src` from `base`, and adds that slice's origin as a masked
+  difference (selected together with the slice, LLVM turned the origin
+  back into a branch). `segment_matches` clamps the offset to the slice's
+  last whole word and folds the range test into the word comparison, so a
+  stale entry below `dict_start_index` wraps to an out-of-range offset and
+  is rejected, as the reference's `idx >= dictStartIndex` test rejects it.
+  Offset matches extend backwards inside the selected slice, and matches
+  starting in the external segment are counted out of line
+  (`count_from_ext`, `ZSTD_count_2segments`). An external segment shorter
+  than one word never matches;
 - literals go to the sequence store through `SeqStore::store_seq_from`,
   which copies a run of at most 16 bytes as one fixed chunk
-  (`ZSTD_copy16`) and cuts the excess.
+  (`ZSTD_copy16`) and cuts the excess. fast's and dfast's prefix loops use
+  a local `store_seq_wild` instead, which appends the 16-byte chunk straight from
+  the input without the stack copy and overflow test; the same body in
+  `store_seq_from` made fast 2.3% faster but dfast 1.3-1.6% slower, so the
+  shared store keeps its form.
+
+dfast's match tail:
+
+```mermaid
+sequenceDiagram
+    participant S as search loop
+    participant M as match tail
+    participant T as tables / seq store
+    S->>M: match found (start, forward length)
+    M->>T: ahead(end): word, long slot, prefetch both candidates
+    M->>M: catch-up (backward extension)
+    M->>T: offsets, store_seq_wild
+    M->>T: complementary insertions (curr + 2, end - 2, end - 1)
+    loop immediate repcode while the word matches ip - offset_2
+        M->>T: store_seq_only, slots at ip, try_load64(new ip)
+    end
+    M->>S: word and long slot of the next position (none past ilimit)
+```
 
 ```mermaid
 flowchart TD
     A[compress_block_mls: rep offsets, saved offsets] --> B{block in prefix and reps within it?}
-    B -- yes --> W{"fast: default (MLS, hashLog)?"}
-    W -- yes --> CW["compress_scan with constant widths"]
-    W -- "no, or dfast" --> CR["compress_scan with run-time widths"]
+    B -- yes --> W{"default (MLS, hashLog[, chainLog])?"}
+    W -- yes --> CW["fast: compress_scan with constant widths (and ORIGIN when the prefix starts the window); dfast: compress_scan_widths, out of line"]
+    W -- no --> CR["compress_scan with run-time widths"]
     CW --> Y{"fast: history >= 4 << hashLog?"}
     CR --> Y
     Y -- yes --> C1["BRANCHY: validity branch, then compare"]
@@ -470,7 +569,7 @@ flowchart TD
     D --> E
     E --> F{"candidate word == probed word?"}
     F -- no --> E
-    F -- yes --> G[extend back, count forward, store_seq_from, insert hashes, repcode loop]
+    F -- yes --> G["extend back, count forward, store_seq_from (fast: store_seq_wild), insert hashes, repcode loop"]
     G --> E
     E -- window load fails --> H[trailing literals, rep offsets]
 ```
@@ -509,16 +608,17 @@ the dispatch happens once per block, never per position.
 sequenceDiagram
     participant B as block::build_seq_store
     participant E as lazy entry (e.g. lazy2_row)
-    participant P as lazy_generic::<S, RowHash, 2>
+    participant P as lazy_generic::<S, RowHash<MLS, SLOTS>, 2>
     participant F as RowHash::find
     participant R as row_find_best_match::<S, MLS, ROW>
     participant K as kernels (row::match_mask, count)
     B->>E: ms (backend set), seq_store, rep, block
     E->>E: dispatch!(ms.backend) once
-    E->>P: concrete token S
+    E->>E: row_block!: (mls, row_log) once
+    E->>P: concrete token S, concrete row search
     loop every searched position
         P->>F: ip
-        F->>R: match on (mls, row_log), as ZSTD_searchMax
+        F->>R: row_find_best_match::<S, MLS, SLOTS>, chosen once per block
         R->>K: tag compare, match lengths
         R-->>P: length, offset
     end
@@ -528,9 +628,18 @@ sequenceDiagram
 The parser is specialized on its search (the `Search` trait: `HashChain`,
 `BinaryTree`, `RowHash`) and on its depth (greedy 0, lazy 1, lazy2 2). The
 searches are specialized on the minimum match (4, 5 or 6) and the row finder
-on its row size (16, 32 or 64 slots), and each search picks its
-specialization with one `match` per call, as `ZSTD_searchMax` does. The row
-and hash-chain searches are inlined into the parser. The binary tree stays
+on its row size (16, 32 or 64 slots). The hash chain and the binary tree
+pick their specialization with one `match` per call, as `ZSTD_searchMax`
+does. The row finder (`RowHash<MLS, SLOTS>`) is chosen once per block
+instead (`row_block!`, inside the backend's dispatch), so each prefix-only
+and extDict parser inlines a single row search: when every call site
+inlined all nine behind a `match`, the parser kept their state live and
+branched on the parameters at every position (lazy2 levels 1-2.5% slower,
+6-8% more mispredicted branches in Callgrind's model on Alice). The
+dictMatchState parsers keep the per-search choice (`RowHashAny`):
+specializing them too would add about 600 KB of code for parsers that run
+only with attached dictionaries. The row and hash-chain searches are
+inlined into the parser. The binary tree stays
 out of line behind `#[fearless_simd_macros::simd]`, which measured fewer
 instructions. Candidate loops are specialized on whether the window has an
 external dictionary (`EXT`), so the prefix-only case has no segment test.
@@ -756,13 +865,54 @@ buffers are always large enough) into `EncodeError::Internal`.
   Histogram counting is scalar. Output is identical on every backend.
 - See the [benchmarks](../docs/benchmarks/encoder-comparison.md) for the
   current end-to-end ratios. Text at the fast levels and the lazy levels
-  6–12 still trails the reference. The fast kernel executes about 1.5x the
-  reference's instructions on Alice (loop-carried positions spill, and
-  each match costs about 140 instructions against 92, `store_seq_from`
-  about 50 against 28); its speed comes from fewer branch mispredictions.
-  The lazy finders now run at or below the reference's instruction count
-  and remain 2–8% slower on text for reasons not yet attributed (no
-  hardware counters under WSL2).
+  6–12 still trails the reference. After the small-table widths
+  (2026-10-18) the fast kernel executes 1.34x the reference's
+  instructions on Alice at level 1 (11.99M against 8.96M over three calls;
+  1.48x before). Per match it executes about 146 instructions plus 27 to
+  restart the search against the reference's 87 plus 28, with 21
+  conditional branches against 10: bounds tests in the backward extension,
+  the first-word count and the post-match fill, and the `Vec` capacity
+  tests of the literal and sequence pushes. Per two probed positions it
+  is about 61 against 54. Mispredictions are at the reference's level.
+  Removing instructions did not make it faster (i7-13700KF, paired cold
+  calls): a literal buffer whose length runs ahead of the stored literals
+  (up to 3.5% fewer kernel instructions, 1-4% slower on text at levels -5
+  and -1), the repcode read clamped instead of bounds checked (7% fewer
+  kernel branches, 1-2% slower), the long count out of line (1.5% faster
+  at level 1, 2% slower at -5), a branch-free eight-byte backward
+  extension (a quarter fewer mispredictions in callgrind's model, 7%
+  faster on 1 MiB of text at -5, but 5-6% slower on Alice at -1 and 1-5%
+  on binary data), the clamp limit unified with the probe window's (1.6%
+  more instructions), the post-match fill bounded by one 10-byte window
+  and repcodes held as `usize` (no gain). random-1m timings move by 5-15%
+  between builds from code placement alone.
+- Cold, the row finder plus its table setup runs at the reference's speed
+  on 1 MiB of text (levels 9-12, i7-13700KF, measured against
+  `ZSTD_generateSequences` with the entropy stage short-circuited). The
+  pre-splitter was the larger part of the rest (1.3M extra instructions on
+  1 MiB at level 9) before it was compiled per rate; the entropy stage
+  after `build_seq_store` executes at or below the reference's
+  instruction count (2.43M against 2.50M there). On Alice at levels 7-8
+  (minimum match 4, 16-slot rows) the finder is still 2-3% slower and
+  executes about 4% more instructions, two per collected candidate for the
+  masked buffer index. The finder is bound by memory latency (without its
+  prefetches it is 15-26% slower), so instruction counts are a poor proxy
+  there. A reused context measures the finder 2-6% slower on an input
+  identical to the previous one, because the reference salts its row hash
+  at each reset and mzstd does not: the previous call's entries match tags
+  and end each search early. btlazy2 executes about 21% more instructions
+  than the reference on Alice at level 12 (index arithmetic and bounds
+  checks in the tree walk) at equal or better speed. Measured and
+  rejected (2026-10-18): the row search out of line (0.5-4.5% slower),
+  the reference's branch-free next-slot arithmetic instead of the lookup
+  table (0-1% slower), the row update out of line (1.5-2.5% slower), and
+  row state pre-cut into rows and generic over the row size (no gain).
+- A cold one-shot call into a `Vec` zeroes its destination before writing
+  it (`compressBound` of one block, and one block's bound ahead for
+  longer inputs), about 0.8 µs per 64 KiB on the i7-13700KF, which the
+  reference, writing into uninitialized memory, does not pay. Sizing it
+  down would change the capacity the entropy coder's fit decisions see;
+  writing without zeroing needs `unsafe` or bit writers that append.
 - The select's stand-in picked by the word's low bit was measured
   (2026-10-15, first 20 MB of `silesia.tar`) against one fixed stand-in
   followed by the validity test, as `ZSTD_match4Found_cmov` does: the
@@ -779,6 +929,21 @@ buffers are always large enough) into `EncodeError::Internal`.
   One case measured slower, 1 MiB of binary data at level 2 (+5%), and it
   is equally slower with dfast's loop left untouched, so it comes from code
   placement elsewhere, not from this loop.
+- The same changes were rechecked on the i7-13700KF (2026-10-17, the
+  comparison harness's profile driver, seven to nine interleaved
+  process pairs per case on one pinned core). The clamp as first written
+  (`(bytes == word) & (offset == clamped)`) compiled to a second,
+  mispredicted branch: text at levels -5 to 2 took 5-17% longer than with
+  the select (callgrind: 40% more mispredicted conditional branches with
+  4% fewer instructions). With the folded test it is back to the select's
+  time on text and 1-5% faster on 64 KiB of binary and random data at
+  levels -5 to 1. A
+  `select_unpredictable` between the loaded word and the probe's
+  complement was as slow on text as the split test. dfast's inlined count
+  took 3-6% longer on text at levels 2 to 4 (Alice at level 2, 1 MiB at
+  levels 3 and 4) and saved 2-3% only on 44 bytes, so dfast's prefix loop
+  went back to the out-of-line count. Removing the prefetches did not
+  remove the slowdown on text, and they were kept.
 - Measured and rejected on the M5 (2026-10-17, interleaved runs of both
   builds; these loops' timings move by up to 10% between builds that
   differ only in code elsewhere, through inlining, register allocation
@@ -805,12 +970,30 @@ buffers are always large enough) into `EncodeError::Internal`.
     match counting in 64-byte blocks (`vshrn` nibble masks; no change at
     levels 1 and 3, 0.5-1% slower at 16 and 19, up to 7% slower on highly
     repetitive input).
-- dfast executes about 60 instructions per probed position in its search
-  loop against the reference's 38 (hardware counters on the M5: about
-  1.4x the reference's instructions per call on 128 KiB of binary data,
-  with a similar share of mispredicted branches): the repcode read's
-  bounds check, the stand-in's address, the table masks and a spilled
-  index. It stays 10-20% slower than the reference at levels 3 and 4.
+- dfast's kernel is latency bound: on Alice at level 2 it takes about 78%
+  of a cold call's time but 67% of its instructions, and executes 18.3M
+  instructions over three calls against the reference's 12.3M (about 61
+  against 51 per searched position: the repcode test with its bounds
+  check, the word-dependent stand-in select and about 16 spills and
+  reloads, since the loop's values do not fit x86-64's 15 registers; about
+  185 against 121 per match: store bookkeeping, `SeqDef` packing and
+  bounds-checked insertions) while matching or beating its time. Removing
+  instructions (the wild literal copy alone, a branch-free catch-up, one
+  match tail shared by all exits) did not change the time; only taking
+  work off the post-match load chain did. Prefetching the four likeliest
+  match ends instead of the match end's own candidates was 1-3% slower.
+  The 44-byte input at level 3 (run-time widths) is 1.5-3% slower than
+  before the look-ahead (a 0.5 µs call). Measured and rejected
+  (2026-10-18, i7-13700KF, paired runs): `branches::unlikely` on the candidate exits (18% more
+  instructions; LLVM lost the constant widths), an un-pipelined loop (same
+  instructions, 1-3% slower), a branch-free backward extension (28% fewer
+  mispredictions in callgrind's model, 1-2% slower: the hardware predicts
+  the catch-up branch far better than the model), software pipelining one
+  position ahead (21% more instructions, 4-8% slower), a lean loop with
+  match handling after it (2% faster on text, up to 3.8% slower on random
+  data), the post-match insertions and repcode check through one 10-byte
+  window (2.3-3% fewer instructions, 1-2% slower), and `&` instead of `&&`
+  in the repcode test (3% more instructions).
 - On the Silesia corpus (`silesia.tar`, 2026-10-15, warm contexts and the
   fastest of several runs, as lzbench measures) fast compresses about
   5-10% faster than before the constant widths and the validity branches,
@@ -825,9 +1008,10 @@ buffers are always large enough) into `EncodeError::Internal`.
   to drop its bounds check (2-3% slower with the select, noise with the
   branches), the search loop out of line in its own function (5-10%
   slower: the call and the result per match cost more than the registers
-  it freed), dfast's candidates with branches (level 3 +1%, level 4 6%
-  slower), and dfast's compiled-in table widths (no change at levels 3
-  and 4). A sequence store written through a block-long cursor kept its
+  it freed) and dfast's candidates with branches (level 3 +1%, level 4 6%
+  slower). dfast's compiled-in table widths measured no change then
+  because LLVM merged the inlined instances into one loop with run-time
+  widths; as separate functions they are now kept. A sequence store written through a block-long cursor kept its
   positions in registers and gave dfast 5%, but its buffers had to be
   initialized at full capacity to be written safely: a cold one-shot call
   on 64 KiB then paid about 2.5 us more (32-50% at levels -5 to 1), so the

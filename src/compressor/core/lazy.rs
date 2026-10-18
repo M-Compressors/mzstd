@@ -410,8 +410,19 @@ trait Search {
 struct HashChain;
 /// The DUBT binary tree (`search_binaryTree`).
 struct BinaryTree;
-/// The row-based tag matcher (`search_rowHash`).
-struct RowHash;
+/// The row-based tag matcher (`search_rowHash`) for a minimum match of
+/// `MLS` (4, 5 or 6) and rows of `SLOTS` slots (16, 32 or 64).
+///
+/// Unlike the other searches it is specialized once per block (`row_block!`)
+/// rather than per search: each parser then inlines one row search at its
+/// call sites instead of all nine, and no search branches on the parameters
+/// (2% faster at the lazy2 levels, with 7% fewer mispredicted branches in
+/// Callgrind's model).
+struct RowHash<const MLS: u32, const SLOTS: usize>;
+/// The row-based tag matcher choosing its [`RowHash`] specialization per
+/// search, as `ZSTD_searchMax` does. The dictMatchState parsers use it, so
+/// their rarely run code is not multiplied by nine.
+struct RowHashAny;
 
 impl Search for HashChain {
     const ROW: bool = false;
@@ -501,7 +512,49 @@ impl Search for BinaryTree {
     }
 }
 
-impl Search for RowHash {
+impl<const MLS: u32, const SLOTS: usize> Search for RowHash<MLS, SLOTS> {
+    const ROW: bool = true;
+    type State<'t> = RowState<'t>;
+
+    fn state<'t>(ms: &'t mut MatchState, ctx: &Ctx<'_>) -> Self::State<'t> {
+        RowState::new(ms, ctx)
+    }
+
+    #[inline(always)]
+    fn find<S: Simd>(
+        simd: S,
+        state: &mut RowState<'_>,
+        ctx: &Ctx<'_>,
+        ip: u32,
+        lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize {
+        row_find_best_match::<S, MLS, SLOTS>(simd, state, ctx, ip, lazy_skipping, offset).0
+    }
+
+    #[inline(always)]
+    fn find_dms<S: Simd>(
+        simd: S,
+        state: &mut RowState<'_>,
+        ctx: &Ctx<'_>,
+        dict: &DictCtx<'_>,
+        ip: u32,
+        lazy_skipping: bool,
+        offset: &mut u32,
+    ) -> usize {
+        let (s, d, l) = (state, dict, lazy_skipping);
+        row_find_best_match_dms::<S, MLS, SLOTS>(simd, s, ctx, d, ip, l, offset)
+    }
+
+    fn fill_cache(state: &mut RowState<'_>, ctx: &Ctx<'_>, i_limit: i64) {
+        let idx = state.next_to_update;
+        let bits = state.bits;
+        let tables = (&*state.tags, &*state.slots);
+        row_fill_hash_cache::<MLS>(state.cache, tables, ctx, bits, idx, i_limit);
+    }
+}
+
+impl Search for RowHashAny {
     const ROW: bool = true;
     type State<'t> = RowState<'t>;
 
@@ -520,15 +573,15 @@ impl Search for RowHash {
     ) -> usize {
         let (s, l) = (state, lazy_skipping);
         match (ctx.mls, ctx.row_log) {
-            (5, 4) => row_find_best_match::<S, 5, 16>(simd, s, ctx, ip, l, offset).0,
-            (5, 5) => row_find_best_match::<S, 5, 32>(simd, s, ctx, ip, l, offset).0,
-            (5, _) => row_find_best_match::<S, 5, 64>(simd, s, ctx, ip, l, offset).0,
-            (6, 4) => row_find_best_match::<S, 6, 16>(simd, s, ctx, ip, l, offset).0,
-            (6, 5) => row_find_best_match::<S, 6, 32>(simd, s, ctx, ip, l, offset).0,
-            (6, _) => row_find_best_match::<S, 6, 64>(simd, s, ctx, ip, l, offset).0,
-            (_, 4) => row_find_best_match::<S, 4, 16>(simd, s, ctx, ip, l, offset).0,
-            (_, 5) => row_find_best_match::<S, 4, 32>(simd, s, ctx, ip, l, offset).0,
-            (_, _) => row_find_best_match::<S, 4, 64>(simd, s, ctx, ip, l, offset).0,
+            (5, 4) => RowHash::<5, 16>::find(simd, s, ctx, ip, l, offset),
+            (5, 5) => RowHash::<5, 32>::find(simd, s, ctx, ip, l, offset),
+            (5, _) => RowHash::<5, 64>::find(simd, s, ctx, ip, l, offset),
+            (6, 4) => RowHash::<6, 16>::find(simd, s, ctx, ip, l, offset),
+            (6, 5) => RowHash::<6, 32>::find(simd, s, ctx, ip, l, offset),
+            (6, _) => RowHash::<6, 64>::find(simd, s, ctx, ip, l, offset),
+            (_, 4) => RowHash::<4, 16>::find(simd, s, ctx, ip, l, offset),
+            (_, 5) => RowHash::<4, 32>::find(simd, s, ctx, ip, l, offset),
+            (_, _) => RowHash::<4, 64>::find(simd, s, ctx, ip, l, offset),
         }
     }
 
@@ -544,27 +597,25 @@ impl Search for RowHash {
     ) -> usize {
         let (s, d, l) = (state, dict, lazy_skipping);
         match (ctx.mls, ctx.row_log) {
-            (5, 4) => row_find_best_match_dms::<S, 5, 16>(simd, s, ctx, d, ip, l, offset),
-            (5, 5) => row_find_best_match_dms::<S, 5, 32>(simd, s, ctx, d, ip, l, offset),
-            (5, _) => row_find_best_match_dms::<S, 5, 64>(simd, s, ctx, d, ip, l, offset),
-            (6, 4) => row_find_best_match_dms::<S, 6, 16>(simd, s, ctx, d, ip, l, offset),
-            (6, 5) => row_find_best_match_dms::<S, 6, 32>(simd, s, ctx, d, ip, l, offset),
-            (6, _) => row_find_best_match_dms::<S, 6, 64>(simd, s, ctx, d, ip, l, offset),
-            (_, 4) => row_find_best_match_dms::<S, 4, 16>(simd, s, ctx, d, ip, l, offset),
-            (_, 5) => row_find_best_match_dms::<S, 4, 32>(simd, s, ctx, d, ip, l, offset),
-            (_, _) => row_find_best_match_dms::<S, 4, 64>(simd, s, ctx, d, ip, l, offset),
+            (5, 4) => RowHash::<5, 16>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (5, 5) => RowHash::<5, 32>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (5, _) => RowHash::<5, 64>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (6, 4) => RowHash::<6, 16>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (6, 5) => RowHash::<6, 32>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (6, _) => RowHash::<6, 64>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (_, 4) => RowHash::<4, 16>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (_, 5) => RowHash::<4, 32>::find_dms(simd, s, ctx, d, ip, l, offset),
+            (_, _) => RowHash::<4, 64>::find_dms(simd, s, ctx, d, ip, l, offset),
         }
     }
 
     fn fill_cache(state: &mut RowState<'_>, ctx: &Ctx<'_>, i_limit: i64) {
-        let idx = state.next_to_update;
-        let bits = state.bits;
-        let cache = &mut *state.cache;
-        let tables = (&*state.tags, &*state.slots);
+        // Filling the cache depends on the minimum match; the rows it
+        // prefetches follow `ctx.row_log`, whatever the row size named here.
         match ctx.mls {
-            5 => row_fill_hash_cache::<5>(cache, tables, ctx, bits, idx, i_limit),
-            6 => row_fill_hash_cache::<6>(cache, tables, ctx, bits, idx, i_limit),
-            _ => row_fill_hash_cache::<4>(cache, tables, ctx, bits, idx, i_limit),
+            5 => RowHash::<5, 16>::fill_cache(state, ctx, i_limit),
+            6 => RowHash::<6, 16>::fill_cache(state, ctx, i_limit),
+            _ => RowHash::<4, 16>::fill_cache(state, ctx, i_limit),
         }
     }
 }
@@ -2557,9 +2608,72 @@ block_compressors! {
     lazy, lazy_ext => HashChain, 1;
     lazy2, lazy2_ext => HashChain, 2;
     btlazy2, btlazy2_ext => BinaryTree, 2;
-    greedy_row, greedy_row_ext => RowHash, 0;
-    lazy_row, lazy_row_ext => RowHash, 1;
-    lazy2_row, lazy2_row_ext => RowHash, 2;
+}
+
+/// Runs `$run!` with the [`RowHash`] specialization for the minimum match
+/// and row size of `$ms`, clamped as the parsers pass them to [`Ctx::new`]
+/// (the reference's `ZSTD_searchMax` switch, taken once per block).
+macro_rules! row_block {
+    ($ms:expr, $run:ident) => {
+        match ($ms.cparams.min_match.clamp(4, 6), $ms.cparams.search_log.clamp(4, 6)) {
+            (5, 4) => $run!(RowHash<5, 16>),
+            (5, 5) => $run!(RowHash<5, 32>),
+            (5, _) => $run!(RowHash<5, 64>),
+            (6, 4) => $run!(RowHash<6, 16>),
+            (6, 5) => $run!(RowHash<6, 32>),
+            (6, _) => $run!(RowHash<6, 64>),
+            (_, 4) => $run!(RowHash<4, 16>),
+            (_, 5) => $run!(RowHash<4, 32>),
+            (_, _) => $run!(RowHash<4, 64>),
+        }
+    };
+}
+
+/// Defines the row finder's block compressors of one depth, as
+/// `block_compressors!` does, with the search specialized by `row_block!`
+/// inside the backend's dispatch.
+macro_rules! row_block_compressors {
+    ($($name:ident, $ext_name:ident => $depth:expr;)*) => {$(
+        pub(crate) fn $name(
+            ms: &mut MatchState,
+            seq_store: &mut SeqStore,
+            rep: &mut [u32; 3],
+            block: &BlockInput<'_>,
+        ) -> usize {
+            let backend = ms.backend;
+            fearless_simd::dispatch!(backend.0, simd => {
+                macro_rules! run {
+                    ($search:ty) => {
+                        lazy_generic::<_, $search, $depth>(simd, ms, seq_store, rep, block)
+                    };
+                }
+                row_block!(ms, run)
+            })
+        }
+
+        pub(crate) fn $ext_name(
+            ms: &mut MatchState,
+            seq_store: &mut SeqStore,
+            rep: &mut [u32; 3],
+            block: &BlockInput<'_>,
+        ) -> usize {
+            let backend = ms.backend;
+            fearless_simd::dispatch!(backend.0, simd => {
+                macro_rules! run {
+                    ($search:ty) => {
+                        lazy_ext_generic::<_, $search, $depth>(simd, ms, seq_store, rep, block)
+                    };
+                }
+                row_block!(ms, run)
+            })
+        }
+    )*};
+}
+
+row_block_compressors! {
+    greedy_row, greedy_row_ext => 0;
+    lazy_row, lazy_row_ext => 1;
+    lazy2_row, lazy2_row_ext => 2;
 }
 
 /// Indexes dictionary content up to `target` (`ZSTD_loadDictionaryContent`
@@ -2648,9 +2762,9 @@ dms_block_compressors! {
     lazy_dms, lazy => HashChain, 1;
     lazy2_dms, lazy2 => HashChain, 2;
     btlazy2_dms, btlazy2 => BinaryTree, 2;
-    greedy_row_dms, greedy_row => RowHash, 0;
-    lazy_row_dms, lazy_row => RowHash, 1;
-    lazy2_row_dms, lazy2_row => RowHash, 2;
+    greedy_row_dms, greedy_row => RowHashAny, 0;
+    lazy_row_dms, lazy_row => RowHashAny, 1;
+    lazy2_row_dms, lazy2_row => RowHashAny, 2;
 }
 
 #[cfg(test)]
@@ -3005,6 +3119,55 @@ mod tests {
                     oracle::compress_stream(&oracle_params(&requested), &steps).expect("oracle");
                 let ours = stream(&mut engine, &requested, None, &chunks);
                 assert!(ours == theirs, "{backend} request {r}");
+            }
+        }
+    }
+
+    /// The row finder's parsers are specialized per block on the minimum
+    /// match and row size (`row_block!`): every one of the nine pairs, at
+    /// every depth, on prefix-only and extDict windows, writes the
+    /// reference's frames.
+    #[test]
+    fn every_row_specialization_matches_the_reference() {
+        let input = [corpus::text(40_000, 71), corpus::mixed(30_000, 72)].concat();
+        let chunks: Vec<&[u8]> = input.chunks(5_003).collect();
+        let steps: Vec<(&[u8], Directive)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(n, &data)| {
+                let op = if n + 1 == chunks.len() {
+                    Directive::End
+                } else {
+                    Directive::Continue
+                };
+                (data, op)
+            })
+            .collect();
+        for backend in Backend::available() {
+            let mut engine = Engine::with_backend(backend);
+            for strategy in [Strategy::Greedy, Strategy::Lazy, Strategy::Lazy2] {
+                for min_match in 4..=6 {
+                    for search_log in 4..=6 {
+                        let mut requested = RequestedParams::default();
+                        requested.cparams.strategy = Some(strategy);
+                        requested.cparams.min_match = min_match;
+                        requested.cparams.search_log = search_log;
+                        requested.use_row_match_finder = ParamSwitch::Enable;
+                        let case =
+                            alloc::format!("{backend} {strategy:?} {min_match} {search_log}");
+                        let ours =
+                            compress_once(&mut engine, &requested, &input, 1).expect("compress");
+                        let theirs =
+                            oracle::compress2(&input, &oracle_params(&requested)).expect("oracle");
+                        assert!(ours == theirs, "{case} prefix");
+
+                        requested.cparams.window_log = 12;
+                        let theirs = oracle::compress_stream(&oracle_params(&requested), &steps)
+                            .expect("oracle");
+                        let ours = stream(&mut engine, &requested, None, &chunks);
+                        assert!(ours == theirs, "{case} extDict");
+                    }
+                }
             }
         }
     }

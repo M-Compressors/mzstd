@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use super::entropy::Tables;
+use super::lazy_box::LazyBox;
 use super::ldm::RawSeqStore;
 use super::mem;
 use super::opt::OptState;
@@ -81,8 +82,9 @@ pub(crate) struct MatchState {
     pub(crate) chain_table: Vec<u32>,
     /// Treat the next input as non-contiguous.
     pub(crate) force_non_contiguous: bool,
-    /// Optimal parser state.
-    pub(crate) opt: OptState,
+    /// Optimal parser state, allocated when an optimal strategy first
+    /// needs it (2 KB a one-shot call at the other levels never touches).
+    pub(crate) opt: LazyBox<OptState>,
     pub(crate) cparams: CParams,
     /// Lazy match finders only insert searched positions.
     pub(crate) lazy_skipping: bool,
@@ -119,7 +121,7 @@ impl MatchState {
             hash_table3: Vec::new(),
             chain_table: Vec::new(),
             force_non_contiguous: false,
-            opt: OptState::default(),
+            opt: LazyBox::default(),
             cparams,
             lazy_skipping: false,
             use_row_match_finder,
@@ -192,7 +194,10 @@ impl MatchState {
         self.next_to_update = self.window.dict_limit;
         self.loaded_dict_end = 0;
         self.dict_match_state = false;
-        self.opt.lit_length_sum = 0;
+        // An unallocated state already reads as a zero sum.
+        if let Some(opt) = self.opt.get_mut() {
+            opt.lit_length_sum = 0;
+        }
 
         // The reference zeroes its tables only when indices restart
         // (`ZSTD_cwksp_mark_tables_dirty`, then `ZSTD_cwksp_clean_tables`),

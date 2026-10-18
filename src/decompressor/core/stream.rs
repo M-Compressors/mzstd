@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use borrowed_buf::BorrowedBuf;
 
-use super::block::{BlockHeader, BlockKind};
+use super::block::{BlockHeader, BlockKind, BlockOutput};
 use super::copy::WILDCOPY_OVERLENGTH;
 use super::dictionary::DictView;
 use super::frame::{FrameDecoder, FrameHeader, MAGIC_SIZE, header_size};
@@ -414,12 +414,13 @@ impl Stream {
                         return Ok(DecoderStatus::NeedsInput);
                     }
                     let window = self.window_size().ok_or(DecodeError::InvalidState)?;
-                    let (buffer, start) = self.history.prepare(window, self.frame.block_max())?;
+                    let (mut buffer, start) =
+                        self.history.prepare(window, self.frame.block_max())?;
                     let end = self.frame.decode_block(
                         self.backend,
                         &block,
                         &self.scratch,
-                        buffer,
+                        &mut buffer,
                         0..start,
                         dictionary,
                     )?;
@@ -505,6 +506,7 @@ impl Stream {
             filled: 0,
             frame_end: None,
             cut,
+            limit: 0,
         };
         out.filled = out.buffer.len();
         let result = self.walk(src, &mut out, dictionary);
@@ -553,6 +555,7 @@ impl Stream {
             buffer: BorrowedBuf::from(dst),
             filled: 0,
             frame_end: 0,
+            limit: 0,
         };
         self.walk(src, &mut out, dictionary).ok()?;
         Some(out.filled)
@@ -673,9 +676,9 @@ trait Output {
     /// `unread` input bytes follow the header.
     fn begin_frame(&mut self, content_size: Option<u64>, unread: usize) -> Result<(), DecodeError>;
 
-    /// The buffer, with room for a block of `block_max` bytes after the
-    /// output where it can grow.
-    fn reserve(&mut self, block_max: usize) -> Result<&mut [u8], DecodeError>;
+    /// The buffer, which may grow to hold a block of `block_max` bytes
+    /// after the output where the output can grow.
+    fn reserve(&mut self, block_max: usize) -> Result<&mut dyn BlockOutput, DecodeError>;
 
     /// Records the end of the block just decoded.
     fn commit(&mut self, end: usize);
@@ -696,7 +699,16 @@ trait Output {
 /// declared frame before seeing any output.
 const PLAUSIBLE_RATIO: usize = 32;
 
+/// Bytes a growing output zeroes at a time ahead of a block's writes:
+/// small enough to stay in the first-level cache until the copies
+/// overwrite them, large enough that each extension costs little.
+const ZERO_CHUNK: usize = 4 * 1024;
+
 /// A caller's vector, grown with initialized slack for chunked copies.
+///
+/// Its length is the end of the zeroed prefix, which runs ahead of the
+/// output; each compressed block extends it a chunk at a time
+/// ([`BlockOutput::grow`]), up to [`Self::limit`].
 struct VecOutput<'a> {
     buffer: &'a mut Vec<u8>,
     filled: usize,
@@ -704,6 +716,49 @@ struct VecOutput<'a> {
     frame_end: Option<usize>,
     /// Whether blocks are cut at [`Self::frame_end`].
     cut: bool,
+    /// How far the block in progress may extend the buffer.
+    limit: usize,
+}
+
+impl BlockOutput for VecOutput<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        self.buffer
+    }
+
+    fn grow(&mut self, end: usize) -> bool {
+        let len = self.buffer.len();
+        let target = end.max(len + ZERO_CHUNK).min(self.limit);
+        if target <= len {
+            return false;
+        }
+        // `reserve` made room for the limit, so this never reallocates.
+        self.buffer.resize(target, 0);
+        true
+    }
+
+    fn append(&mut self, at: usize, literals: &[u8], offset: usize, match_length: usize) -> bool {
+        let lit_end = at + literals.len();
+        if at > self.buffer.len() || lit_end + match_length > self.limit {
+            return false;
+        }
+        let start = match lit_end.checked_sub(offset) {
+            _ if match_length == 0 => 0,
+            Some(start) if offset > 0 => start,
+            _ => return false,
+        };
+        // Bytes zeroed past `at` are written again by the append.
+        self.buffer.truncate(at);
+        self.buffer.extend_from_slice(literals);
+        // The copied source doubles while it is shorter than the match, so
+        // an overlapping match repeats its period.
+        let mut copied = 0;
+        while copied < match_length {
+            let step = (match_length - copied).min(offset + copied);
+            self.buffer.extend_from_within(start..start + step);
+            copied += step;
+        }
+        true
+    }
 }
 
 impl Output for VecOutput<'_> {
@@ -728,19 +783,26 @@ impl Output for VecOutput<'_> {
         Ok(())
     }
 
-    fn reserve(&mut self, block_max: usize) -> Result<&mut [u8], DecodeError> {
+    /// Reserves the block's room without zeroing it: the block zeroes
+    /// what it reaches, a chunk at a time.
+    fn reserve(&mut self, block_max: usize) -> Result<&mut dyn BlockOutput, DecodeError> {
         let slack = block_max + WILDCOPY_OVERLENGTH;
         let wanted = self.filled + slack;
         if self.cut
             && let Some(end) = self.frame_end
         {
             let len = wanted.min(end);
-            grow_output(self.buffer, len, Some(end))?;
-            return Ok(&mut self.buffer[..len]);
+            reserve_output(self.buffer, len, Some(end))?;
+            // Slack zeroed for an earlier, uncut block may reach past the
+            // frame's end; the buffer is cut back to it.
+            self.buffer.truncate(len);
+            self.limit = len;
+            return Ok(self);
         }
         let bound = self.frame_end.and_then(|end| end.checked_add(slack));
-        grow_output(self.buffer, wanted, bound)?;
-        Ok(self.buffer)
+        reserve_output(self.buffer, wanted, bound)?;
+        self.limit = wanted;
+        Ok(self)
     }
 
     fn commit(&mut self, end: usize) {
@@ -768,24 +830,13 @@ impl Output for VecOutput<'_> {
     }
 }
 
-/// Grows `buffer` to `len` initialized bytes.
+/// Makes room for `len` bytes in `buffer`, without initializing them.
 ///
 /// Capacity doubles, as `Vec` would grow it, so allocation stays within
 /// twice the output requested so far. When the frame's last request
 /// `bound` is known and lies within that factor, capacity jumps straight
 /// to it: the frame then needs no further reallocation, copy, or capacity
 /// past its end.
-fn grow_output(buffer: &mut Vec<u8>, len: usize, bound: Option<usize>) -> Result<(), DecodeError> {
-    if buffer.len() >= len {
-        return Ok(());
-    }
-    reserve_output(buffer, len, bound)?;
-    buffer.resize(len, 0);
-    Ok(())
-}
-
-/// Makes room for `len` bytes in `buffer` under [`grow_output`]'s
-/// capacity policy, without initializing them.
 fn reserve_output(
     buffer: &mut Vec<u8>,
     len: usize,
@@ -812,6 +863,20 @@ struct SliceOutput<'a> {
     frame_end: usize,
 }
 
+impl BlockOutput for SliceOutput<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        &mut self.buffer[..self.frame_end]
+    }
+
+    fn grow(&mut self, _end: usize) -> bool {
+        false
+    }
+
+    fn grows(&self) -> bool {
+        false
+    }
+}
+
 impl Output for SliceOutput<'_> {
     fn filled(&self) -> usize {
         self.filled
@@ -834,8 +899,8 @@ impl Output for SliceOutput<'_> {
         }
     }
 
-    fn reserve(&mut self, _block_max: usize) -> Result<&mut [u8], DecodeError> {
-        Ok(&mut self.buffer[..self.frame_end])
+    fn reserve(&mut self, _block_max: usize) -> Result<&mut dyn BlockOutput, DecodeError> {
+        Ok(self)
     }
 
     fn commit(&mut self, end: usize) {
@@ -845,13 +910,32 @@ impl Output for SliceOutput<'_> {
 
 /// A caller's uninitialized slice, cut at each frame's declared end as
 /// [`SliceOutput`] is. The buffer's filled part is the zeroed-ahead prefix
-/// the decoder may read and write; it grows by at most a block at a time,
-/// so each byte is zeroed at most once and only inside a frame's output.
+/// the decoder may read and write; it grows a chunk at a time, never past
+/// the block in progress, so each byte is zeroed at most once and only
+/// inside a frame's output.
 struct UninitOutput<'a> {
     buffer: BorrowedBuf<'a, u8>,
     /// Bytes of output, never more than `buffer.len()`.
     filled: usize,
     frame_end: usize,
+    /// How far the block in progress may extend the zeroed prefix.
+    limit: usize,
+}
+
+impl BlockOutput for UninitOutput<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        self.buffer.filled_mut()
+    }
+
+    fn grow(&mut self, end: usize) -> bool {
+        let len = self.buffer.len();
+        let target = end.max(len + ZERO_CHUNK).min(self.limit);
+        if target <= len {
+            return false;
+        }
+        self.zero_to(target);
+        true
+    }
 }
 
 impl UninitOutput<'_> {
@@ -885,13 +969,14 @@ impl Output for UninitOutput<'_> {
         }
     }
 
-    fn reserve(&mut self, block_max: usize) -> Result<&mut [u8], DecodeError> {
-        let end = self
+    /// Bounds the block's room; the block zeroes what it reaches, a chunk
+    /// at a time.
+    fn reserve(&mut self, block_max: usize) -> Result<&mut dyn BlockOutput, DecodeError> {
+        self.limit = self
             .filled
             .saturating_add(block_max + WILDCOPY_OVERLENGTH)
             .min(self.frame_end);
-        self.zero_to(end);
-        Ok(&mut self.buffer.filled_mut()[..end])
+        Ok(self)
     }
 
     fn commit(&mut self, end: usize) {
@@ -1201,6 +1286,13 @@ mod tests {
 
     #[test]
     fn output_growth_doubles_and_stops_at_a_frames_bound() {
+        let grow_output = |buffer: &mut Vec<u8>, len, bound| {
+            reserve_output(buffer, len, bound)?;
+            if buffer.len() < len {
+                buffer.resize(len, 0);
+            }
+            Ok::<(), DecodeError>(())
+        };
         // Without a bound, capacity doubles.
         let mut buffer = Vec::new();
         grow_output(&mut buffer, 100, None).expect("grows");
@@ -1225,6 +1317,39 @@ mod tests {
             grow_output(&mut buffer, usize::MAX, None),
             Err(DecodeError::AllocationFailed)
         ));
+    }
+
+    #[test]
+    fn vec_output_zeroes_in_chunks_and_appends_long_sequences() {
+        let mut dst = b"ab".to_vec();
+        let mut out = VecOutput {
+            buffer: &mut dst,
+            filled: 2,
+            frame_end: None,
+            cut: true,
+            limit: 0,
+        };
+        // Room for a block is reserved, not zeroed.
+        let room = out.reserve(10).expect("room");
+        assert_eq!(room.buffer(), b"ab");
+        // A chunk at a time, capped at the block and the overlength.
+        assert!(room.grow(3));
+        assert_eq!(room.buffer().len(), 2 + 10 + WILDCOPY_OVERLENGTH);
+        assert!(!room.grow(50));
+        // Appending cuts the zeroed bytes; an overlapping match repeats
+        // its period.
+        assert!(room.append(2, b"cd", 2, 7));
+        assert_eq!(room.buffer(), b"abcdcdcdcdc");
+        // A match before the buffer or with offset zero, a sequence past
+        // the room, or a start past the buffer is refused.
+        assert!(!room.append(11, b"", 12, 1));
+        assert!(!room.append(11, b"", 0, 1));
+        assert!(!room.append(11, b"x", 1, 40));
+        assert!(!room.append(12, b"x", 1, 1));
+        // Without a match the offset does not matter.
+        assert!(room.append(11, b"xyz", 0, 0));
+        assert_eq!(room.buffer(), b"abcdcdcdcdcxyz");
+        assert!(dst.capacity() >= 2 + 10 + WILDCOPY_OVERLENGTH);
     }
 
     #[test]
@@ -1297,12 +1422,13 @@ mod tests {
     }
 
     #[test]
-    fn uninit_output_zeroes_one_block_ahead_within_the_frame() {
+    fn uninit_output_zeroes_on_demand_within_the_block_and_frame() {
         let mut storage = [MaybeUninit::new(0xAAu8); 64];
         let mut out = UninitOutput {
             buffer: BorrowedBuf::from(&mut storage[..]),
             filled: 0,
             frame_end: 0,
+            limit: 0,
         };
         assert!(matches!(
             out.begin_frame(None, 0),
@@ -1313,10 +1439,18 @@ mod tests {
             Err(DecodeError::OutputTooSmall { written: 0 })
         ));
         out.begin_frame(Some(60), 0).expect("fits");
-        assert_eq!(out.reserve(1).expect("room").len(), 1 + WILDCOPY_OVERLENGTH);
+        let room = out.reserve(1).expect("room");
+        // Nothing is zeroed until the block asks; then a chunk at a time,
+        // capped at the block's maximum and the overlength.
+        assert!(room.buffer().is_empty());
+        assert!(room.grow(2));
+        assert_eq!(room.buffer().len(), 1 + WILDCOPY_OVERLENGTH);
+        assert!(!room.grow(40));
         out.commit(1);
         // The frame's end caps the zeroing however large a block may be.
-        assert_eq!(out.reserve(1 << 17).expect("room").len(), 60);
+        let room = out.reserve(1 << 17).expect("room");
+        assert!(room.grow(2));
+        assert_eq!(room.buffer().len(), 60);
         assert_eq!(out.filled(), 1);
         assert_eq!(bytes(&storage[..61]), [&[0u8; 60][..], &[0xAA]].concat());
     }
@@ -1328,6 +1462,7 @@ mod tests {
             buffer: BorrowedBuf::from(&mut storage[..]),
             filled: 0,
             frame_end: 0,
+            limit: 0,
         };
         out.begin_frame(Some(40), 0).expect("fits");
         assert!(
@@ -1337,7 +1472,9 @@ mod tests {
         );
         // Zero the copies' overlength ahead, then place a raw block across
         // its end.
-        assert!(out.reserve(0).expect("room").iter().all(|&byte| byte == 0));
+        let room = out.reserve(0).expect("room");
+        assert!(room.grow(0));
+        assert!(room.buffer().iter().all(|&byte| byte == 0));
         out.commit(0);
         let zeroed = out.buffer.len();
         assert_eq!(zeroed, WILDCOPY_OVERLENGTH);

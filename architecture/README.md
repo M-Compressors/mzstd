@@ -54,7 +54,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration and compatibility with the reference decoder. |
-| [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed one block ahead, the shared outcome mapping, the C ABI and their contract. |
+| [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed on demand a chunk at a time, the shared outcome mapping, the C ABI and their contract. |
 | [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman and sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
@@ -71,17 +71,18 @@ signatures. Each codec compiles on its own, with or without `std`.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
   and dispatched once per block. In the cold comparison against zstd 1.5.7
   ([benchmarks](../docs/benchmarks/README.md), i7-13700KF, AVX2, one core,
-  2026-10-15, mzstd 0.2.5) compression runs at a median 1.099x the
-  reference's speed, faster in 157 of 192 dataset/level pairs, and
-  decompression at 1.024x. These medians include empty and tiny inputs. The
-  encoder still trails on text at its fastest levels (Alice 0.89-0.94x at
-  levels -5 to 1), on large inputs at the dfast and lazy levels, and at the
-  lazy levels on Alice (0.93-0.96x at levels 5 to 10;
-  [encoder core](encoder-core.md#known-gaps)). The decoder trails on
-  compressible text (0.81-1.01x): its sequence loop executes about 5% more
-  instructions than the reference's and `decompress` zeroes its output
-  before decoding into it
-  ([decoder fast paths](decoder-performance.md#known-gaps)).
+  2026-10-18, mzstd 0.2.7) compression runs at a median 1.112x the
+  reference's speed, faster in 166 of 192 dataset/level pairs, and
+  decompression at 1.111x, faster in 147. These medians include empty and
+  tiny inputs. The encoder still trails on Alice at its fastest levels
+  (0.92-0.94x at levels -5 to 1) and at the lazy levels 5 to 9
+  (0.94-0.97x), and on 1 MiB of text at some lazy levels (0.96-0.99x);
+  the fast and dfast kernels execute 1.3-1.5x the reference's instructions
+  at equal or lower misprediction rates ([encoder core](encoder-core.md#known-gaps)).
+  The decoder trails on literal-heavy text (Alice 0.92-0.97x, cyclic Alice
+  0.95-0.99x at most levels): its Huffman loops execute about 15% more
+  instructions per symbol than the reference's, and short sequences still
+  need zeroed room ([decoder fast paths](decoder-performance.md#known-gaps)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's: segments are primed with their
   overlap the way ZSTDMT primes a job, but the overlap is capped at a

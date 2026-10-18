@@ -41,44 +41,80 @@ const LOOKUP_SHIFT: u32 = 64 - LOOKUP_BITS;
 /// Masks an index into [`TABLE_SIZE`].
 const INDEX_MASK: usize = TABLE_SIZE - 1;
 
-/// One lookup row packs the symbol in the low byte and its code length in
-/// the high byte.
+/// Bits a pair lookup reads: the reference's fast tables'
+/// (`HUF_DECODER_FAST_TABLELOG`). Trees up to this depth decode pairs;
+/// five lookups then read at most 55 bits, which one refill provides.
+const PAIR_BITS: u32 = LIT_HUF_LOG;
+/// Rows of the pair table.
+const PAIR_SIZE: usize = 1 << PAIR_BITS;
+/// Shift that leaves the next [`PAIR_BITS`] bits of a [`Sentinel`].
+const PAIR_SHIFT: u32 = 64 - PAIR_BITS;
+/// Masks an index into [`PAIR_SIZE`].
+const PAIR_MASK: usize = PAIR_SIZE - 1;
+
+/// One lookup row packs the code length in the low byte, so a
+/// [`Sentinel`] shift by the whole row consumes exactly the code, and the
+/// symbol in the high byte.
 type Row = u16;
 
-/// A pair lookup row, the reference's `HUF_DEltX2`: one or two symbols in
-/// the low 16 bits, the bits they take in the next byte, and eight times
-/// their count (the shift that places the next symbols) in the top byte.
-/// Packed in one word, a row of one symbol and a row continuing it add up
-/// to the row of both, which keeps the table build to one add per row.
+/// A pair lookup row, the reference's `HUF_DEltX2`: the bits the symbols
+/// take in the low byte, so a [`Sentinel`] shift by the whole row consumes
+/// them straight from the load, as single rows do; one or two symbols in
+/// the next 16 bits, first one lower; and the symbol count in the top two
+/// bits, where a shift extracts it without a mask and its type bounds the
+/// stores it advances. Packed in one word, a row of one symbol and a row
+/// continuing it add up to the row of both, which keeps the table build to
+/// one add per row.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(transparent)]
 struct PairRow(u32);
 
+/// Where a [`PairRow`] keeps its symbols.
+const PAIR_SYMBOLS_SHIFT: u32 = 8;
+/// Where a [`PairRow`] keeps its symbol count.
+const PAIR_COUNT_SHIFT: u32 = 30;
+
 impl PairRow {
     /// Packs a row.
-    const fn new(symbols: u16, nb_bits: u8, shift: u8) -> Self {
-        Self(symbols as u32 | (nb_bits as u32) << 16 | (shift as u32) << 24)
+    const fn new(symbols: u16, nb_bits: u8, count: u8) -> Self {
+        Self(
+            nb_bits as u32
+                | (symbols as u32) << PAIR_SYMBOLS_SHIFT
+                | (count as u32) << PAIR_COUNT_SHIFT,
+        )
     }
 
     /// The decoded symbols, first one in the low byte.
     const fn symbols(self) -> u16 {
-        self.0 as u16
+        (self.0 >> PAIR_SYMBOLS_SHIFT) as u16
     }
 
     /// The bits the symbols take.
+    #[cfg(test)]
     const fn nb_bits(self) -> u8 {
-        (self.0 >> 16) as u8
+        self.0 as u8
     }
 
-    /// Eight times the number of symbols.
-    const fn shift(self) -> u8 {
-        (self.0 >> 24) as u8
+    /// The number of symbols: one or two in a table, at most three by the
+    /// type.
+    const fn count(self) -> usize {
+        (self.0 >> PAIR_COUNT_SHIFT) as usize
     }
 }
 
 /// Packs a row.
 const fn row(symbol: u8, nb_bits: u32) -> Row {
-    symbol as Row | ((nb_bits as Row) << 8)
+    nb_bits as Row | ((symbol as Row) << 8)
+}
+
+/// A row's code length.
+const fn row_bits(row: Row) -> u32 {
+    (row & 0xff) as u32
+}
+
+/// A row's symbol.
+const fn row_symbol(row: Row) -> u8 {
+    (row >> 8) as u8
 }
 
 /// A literal decoding table, and on demand a table of symbol pairs.
@@ -87,8 +123,9 @@ pub(crate) struct HuffmanTable {
     /// Depth of the tree.
     log: u32,
     rows: Box<[Row; TABLE_SIZE]>,
-    /// Pair rows, allocated on first use.
-    pairs: Option<Box<[PairRow; TABLE_SIZE]>>,
+    /// Pair rows for trees of at most [`PAIR_BITS`], allocated on first
+    /// use.
+    pairs: Option<Box<[PairRow; PAIR_SIZE]>>,
     /// Whether `pairs` describes the current tree.
     pairs_valid: bool,
 }
@@ -145,8 +182,8 @@ const fn prefers_pairs(literals: usize, compressed: usize) -> bool {
 #[inline(always)]
 fn decode_symbol(rows: &[Row; TABLE_SIZE], bits: &mut BitContainer) -> u8 {
     let row = rows[bits.look_nonzero(LOOKUP_BITS) as usize & INDEX_MASK];
-    bits.skip(u32::from(row >> 8));
-    row as u8
+    bits.skip(row_bits(row));
+    row_symbol(row)
 }
 
 /// Finishes one stream into `out`: the reference's `HUF_decodeStreamX1`,
@@ -213,116 +250,253 @@ fn affordable_rounds(sentinels: &[Sentinel; 4], starts: &[usize; 5]) -> usize {
     rounds
 }
 
+/// Refills one stream within `limit` and decodes `K` symbols into
+/// `window`, or returns `false`, leaving the stream as it was, when `limit`
+/// lies past the end of `src`.
+#[inline(always)]
+fn single_round<const K: usize>(
+    rows: &[Row; TABLE_SIZE],
+    (src, limit): (&[u8], usize),
+    sentinel: &mut Sentinel,
+    window: &mut [u8; K],
+) -> bool {
+    if !sentinel.reload_within(src, limit) {
+        return false;
+    }
+    for byte in window {
+        let row = rows[sentinel.peek(LOOKUP_SHIFT)];
+        sentinel.skip(u32::from(row));
+        *byte = row_symbol(row);
+    }
+    true
+}
+
+/// The `K`-byte windows of `segment` from `from` on.
+#[inline(always)]
+fn windows<const K: usize>(segment: &mut [u8], from: usize) -> core::slice::IterMut<'_, [u8; K]> {
+    segment
+        .get_mut(from..)
+        .unwrap_or_default()
+        .as_chunks_mut::<K>()
+        .0
+        .iter_mut()
+}
+
 /// Decodes `K` symbols per stream per round with single-symbol rows while
 /// every stream can afford it, and returns how many symbols each stream
 /// decoded; all four advance together.
 ///
 /// Every round reads at most `K * log` bits after a refill that leaves at
-/// most seven consumed, which the caller keeps within 57.
+/// most seven consumed, which the caller keeps within 56. Each stream
+/// stores its symbols straight into a `K`-byte window of its segment, the
+/// reference's `HUF_4X1_DECODE_SYMBOL`, so a round keeps no symbols in
+/// registers. The windows come from walking the four segments, each cut
+/// to the shortest one, in `K`-byte chunks, so they need no bounds checks.
 #[inline(always)]
 fn single_rounds<const K: usize>(
     rows: &[Row; TABLE_SIZE],
     streams: &mut FourStreams<'_>,
     sentinels: &mut [Sentinel; 4],
-) -> usize {
+) -> [usize; 4] {
     let src = streams.src;
-    // Every sentinel sits at least eight bytes before the end.
-    let Some(last) = src.len().checked_sub(8) else {
-        return 0;
-    };
-    let [b1, b2, b3, b4, _] = streams.segments;
+    let [b1, b2, b3, b4, end] = streams.segments;
     // The fourth segment is the shortest.
-    let length = streams.segments[4] - b4;
+    let length = end - b4;
     let mut done = 0;
-    let [mut s1, mut s2, mut s3, mut s4] = *sentinels;
-    loop {
-        let rounds = affordable_rounds(&[s1, s2, s3, s4], &streams.starts).min((length - done) / K);
+    let mut decoded = [0; 4];
+    let mut s = *sentinels;
+    let segments = streams.out.get_mut(b1..end).and_then(|out| {
+        let (first, rest) = out.split_at_mut_checked(b2 - b1)?;
+        let (second, rest) = rest.split_at_mut_checked(b3 - b2)?;
+        let (third, fourth) = rest.split_at_mut_checked(b4 - b3)?;
+        Some([
+            first.get_mut(..length)?,
+            second.get_mut(..length)?,
+            third.get_mut(..length)?,
+            fourth,
+        ])
+    });
+    // Refills stay below this, which the round counts ensure; clamped to
+    // it, they need no branches.
+    let (Some([first, second, third, fourth]), Some(limit)) = (segments, src.len().checked_sub(8))
+    else {
+        return decoded;
+    };
+    let src = (src, limit);
+    'rounds: loop {
+        let rounds = affordable_rounds(&s, &streams.starts).min((length - done) / K);
         if rounds == 0 {
             break;
         }
-        for _ in 0..rounds {
-            s1.reload(src, last);
-            s2.reload(src, last);
-            s3.reload(src, last);
-            s4.reload(src, last);
-            let mut q = [[0u8; K]; 4];
-            for k in 0..K {
-                for (quad, sentinel) in q.iter_mut().zip([&mut s1, &mut s2, &mut s3, &mut s4]) {
-                    let row = rows[sentinel.peek(LOOKUP_SHIFT)];
-                    sentinel.skip(u32::from(row >> 8));
-                    quad[k] = row as u8;
-                }
+        let windows = windows::<K>(first, done)
+            .zip(windows::<K>(second, done))
+            .zip(windows::<K>(third, done))
+            .zip(windows::<K>(fourth, done))
+            .take(rounds);
+        let [s1, s2, s3, s4] = &mut s;
+        for (((w1, w2), w3), w4) in windows {
+            // Stopping between two streams leaves the earlier ones a round
+            // ahead, which their counts record; the counts above never let
+            // it happen.
+            let stopped = if !single_round(rows, src, s1, w1) {
+                0
+            } else if !single_round(rows, src, s2, w2) {
+                1
+            } else if !single_round(rows, src, s3, w3) {
+                2
+            } else if !single_round(rows, src, s4, w4) {
+                3
+            } else {
+                done += K;
+                continue;
+            };
+            for count in &mut decoded[..stopped] {
+                *count = K;
             }
-            let out = &mut *streams.out;
-            for (quad, base) in q.iter().zip([b1, b2, b3, b4]) {
-                let at = (base + done) & u32::MAX as usize;
-                out[at..at + K].copy_from_slice(quad);
-            }
-            done += K;
+            break 'rounds;
         }
     }
-    *sentinels = [s1, s2, s3, s4];
-    done
+    *sentinels = s;
+    decoded.map(|extra| done + extra)
 }
 
-/// Decodes `K` pair lookups per stream per round while every stream can
-/// afford them and has room for an eight-byte store, and returns how many
-/// symbols each stream decoded.
+/// Pair lookups per stream per round.
+const PAIR_LOOKUPS: usize = 5;
+/// Bytes a round may write per stream: two per lookup.
+const PAIR_ROUND_BYTES: usize = 2 * PAIR_LOOKUPS;
+/// Each stream's window per round. A [`PairRow`] count is at most three by
+/// its type, so the stores of a round provably end inside the window and
+/// need no checks; the counts in a table are at most two.
+const PAIR_WINDOW: usize = 3 * (PAIR_LOOKUPS - 1) + 2;
+
+/// Decodes [`PAIR_LOOKUPS`] pair lookups per stream per round while every
+/// stream can afford them and has room for the round's stores, and
+/// returns how many symbols each stream decoded: the reference's
+/// `HUF_decompress4X2_usingDTable_internal_fast_c_loop`.
 ///
-/// Every round reads at most `K * 12` bits after a refill that leaves at
-/// most seven consumed. A round's symbols are gathered in one word and
-/// stored at once; the store's bytes past the symbols lie inside the
-/// stream's own segment, where the next round or the tail overwrites them.
+/// Every round reads at most `5 * 11` bits after a refill that leaves at
+/// most seven consumed. Each lookup stores two bytes and advances by the
+/// symbols it decoded, as `HUF_4X2_DECODE_SYMBOL` does; a store's byte past
+/// the symbols lies inside the stream's own segment, where the next lookup
+/// or the tail overwrites it.
+///
+/// Refill positions and window offsets are clamped to the last ones that
+/// fit their buffers. The round counts keep them below those anyway, so
+/// the clamps change nothing, but they prove the loads and windows in
+/// bounds with a compare and a conditional move instead of a branch each.
 #[inline(always)]
-fn pair_rounds<const K: usize>(
-    pairs: &[PairRow; TABLE_SIZE],
+fn pair_rounds(
+    pairs: &[PairRow; PAIR_SIZE],
     streams: &mut FourStreams<'_>,
     sentinels: &mut [Sentinel; 4],
 ) -> [usize; 4] {
-    const { assert!(2 * K <= 8 && K * LOOKUP_BITS as usize + 7 <= 64) };
-    let src = streams.src;
-    let Some(last) = src.len().checked_sub(8) else {
-        return [0; 4];
+    const {
+        assert!(PAIR_LOOKUPS * PAIR_BITS as usize + 7 <= 63);
+        assert!(PAIR_WINDOW >= PAIR_ROUND_BYTES);
     };
+    let src = streams.src;
     let segments = streams.segments;
     let mut ops = [segments[0], segments[1], segments[2], segments[3]];
-    let [mut s1, mut s2, mut s3, mut s4] = *sentinels;
-    loop {
-        let mut rounds = affordable_rounds(&[s1, s2, s3, s4], &streams.starts);
+    let mut s = *sentinels;
+    let out = &mut *streams.out;
+    // Refills and windows stay below these, which the round counts ensure;
+    // clamped to them, they need no branches.
+    let (Some(src_limit), Some(out_limit)) =
+        (src.len().checked_sub(8), out.len().checked_sub(PAIR_WINDOW))
+    else {
+        return [0; 4];
+    };
+    'rounds: loop {
+        let mut rounds = affordable_rounds(&s, &streams.starts);
+        // A round's window must fit before the segment's end, which also
+        // keeps its stores inside the segment.
         for (op, end) in ops.iter().zip(&segments[1..]) {
-            rounds = rounds.min((end - op) / 8);
+            rounds = rounds
+                .min((end - op).saturating_sub(PAIR_WINDOW - PAIR_ROUND_BYTES) / PAIR_ROUND_BYTES);
         }
         if rounds == 0 {
             break;
         }
         for _ in 0..rounds {
             // Stream by stream: the four chains are independent, so the
-            // core overlaps them anyway, and only one stream's word is
+            // core overlaps them anyway, and only one stream's window is
             // live at a time.
-            let out = &mut *streams.out;
-            for (op, sentinel) in ops.iter_mut().zip([&mut s1, &mut s2, &mut s3, &mut s4]) {
-                sentinel.reload(src, last);
-                let mut word = 0u64;
-                let mut shift = 0u32;
-                for _ in 0..K {
-                    let pair = pairs[sentinel.peek(LOOKUP_SHIFT)];
-                    sentinel.skip(u32::from(pair.nb_bits()));
-                    word |= u64::from(pair.symbols()) << (shift & 63);
-                    shift += u32::from(pair.shift());
+            for (op, sentinel) in ops.iter_mut().zip(s.iter_mut()) {
+                // Every stream keeps its own position and output, so
+                // stopping between two streams leaves each one where its
+                // tail can take over; the limits above never let it happen.
+                if !sentinel.reload_within(src, src_limit) {
+                    break 'rounds;
                 }
-                let at = *op & u32::MAX as usize;
-                out[at..at + 8].copy_from_slice(&word.to_le_bytes());
-                *op += (shift >> 3) as usize;
+                let at = (*op).min(out_limit);
+                if let Some(window) = out
+                    .get_mut(at..)
+                    .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
+                {
+                    let mut written = 0usize;
+                    for _ in 0..PAIR_LOOKUPS {
+                        let pair = pairs[sentinel.peek(PAIR_SHIFT)];
+                        sentinel.skip(pair.0);
+                        // Counts are at most three, so the stores stay
+                        // inside the window without a check.
+                        window[written..written + 2].copy_from_slice(&pair.symbols().to_le_bytes());
+                        written += pair.count();
+                    }
+                    *op = at + written;
+                }
             }
         }
     }
-    *sentinels = [s1, s2, s3, s4];
+    *sentinels = s;
     [
         ops[0] - segments[0],
         ops[1] - segments[1],
         ops[2] - segments[2],
         ops[3] - segments[3],
     ]
+}
+
+/// Slots for weights `0..=12` in a counting sort.
+const WEIGHT_SLOTS: usize = 16;
+
+/// Writes one run of `L` rows per symbol from `start`, returning where the
+/// next run starts. Runs start at multiples of `L`, so the mask never
+/// changes an index; it only shows the stores stay inside the table.
+#[inline(always)]
+fn fill_runs<const L: usize>(
+    rows: &mut [Row; TABLE_SIZE],
+    mut start: usize,
+    symbols: &[u8],
+    nb_bits: u32,
+) -> usize {
+    for &symbol in symbols {
+        let at = start & (TABLE_SIZE - L);
+        rows[at..at + L].copy_from_slice(&[row(symbol, nb_bits); L]);
+        start += L;
+    }
+    start
+}
+
+/// [`fill_runs`] for runs of `len` rows, a power of two of at least 16,
+/// written sixteen rows at a time.
+#[inline(always)]
+fn fill_long_runs(
+    rows: &mut [Row; TABLE_SIZE],
+    mut start: usize,
+    symbols: &[u8],
+    nb_bits: u32,
+    len: usize,
+) -> usize {
+    for &symbol in symbols {
+        let chunk = [row(symbol, nb_bits); 16];
+        if let Some(run) = rows.get_mut(start..start + len) {
+            for rows in run.as_chunks_mut::<16>().0 {
+                *rows = chunk;
+            }
+        }
+        start += len;
+    }
+    start
 }
 
 impl HuffmanTable {
@@ -332,7 +506,7 @@ impl HuffmanTable {
             + self
                 .pairs
                 .as_ref()
-                .map_or(0, |_| size_of::<[PairRow; TABLE_SIZE]>())
+                .map_or(0, |_| size_of::<[PairRow; PAIR_SIZE]>())
     }
 
     /// Parses a tree description at the start of `src` into this table,
@@ -403,54 +577,82 @@ impl HuffmanTable {
         // symbol order within one weight. A code of `log + 1 - weight` bits
         // fills `1 << (weight - 1)` rows of a `log`-bit table, and the
         // 12-bit table repeats each of them `1 << (12 - log)` times.
+        //
+        // As the reference's `HUF_readDTableX1_wksp` does, the symbols are
+        // first sorted by weight, so each weight's runs, which all have one
+        // length, are written in fixed-size stores. A complete code starts
+        // every code at a multiple of its run length.
         let spread = LOOKUP_BITS - log;
-        let mut rank_start = [0usize; MAX_TABLE_LOG as usize + 2];
-        for weight in 1..=MAX_TABLE_LOG as usize {
-            rank_start[weight + 1] = rank_start[weight]
-                + ((rank_count[weight] as usize) << (weight - 1 + spread as usize));
+        let mut next = [0usize; WEIGHT_SLOTS];
+        let mut position = 0;
+        for (slot, &count) in next.iter_mut().zip(&rank_count) {
+            *slot = position;
+            position += count as usize;
         }
+        let mut sorted = [0u8; MAX_WEIGHTS + 1];
         for (symbol, &weight) in weights[..=count].iter().enumerate() {
-            if weight == 0 {
-                continue;
-            }
-            let weight = usize::from(weight);
-            let start = rank_start[weight];
-            let len = 1 << (weight - 1 + spread as usize);
-            rank_start[weight] = start + len;
-            self.rows[start..start + len].fill(row(symbol as u8, log + 1 - weight as u32));
+            let slot = &mut next[usize::from(weight) & (WEIGHT_SLOTS - 1)];
+            sorted[*slot & MAX_WEIGHTS] = symbol as u8;
+            *slot += 1;
         }
-        debug_assert_eq!(rank_start[log as usize], TABLE_SIZE);
+        let rows = &mut *self.rows;
+        let mut start = 0;
+        let mut first = rank_count[0] as usize;
+        for weight in 1..=log {
+            let count = rank_count[weight as usize] as usize;
+            let Some(symbols) = sorted.get(first..first + count) else {
+                return Err(invalid);
+            };
+            first += count;
+            let nb_bits = log + 1 - weight;
+            start = match weight - 1 + spread {
+                0 => fill_runs::<1>(rows, start, symbols, nb_bits),
+                1 => fill_runs::<2>(rows, start, symbols, nb_bits),
+                2 => fill_runs::<4>(rows, start, symbols, nb_bits),
+                3 => fill_runs::<8>(rows, start, symbols, nb_bits),
+                len_log => fill_long_runs(rows, start, symbols, nb_bits, 1 << len_log),
+            };
+        }
+        debug_assert_eq!(start, TABLE_SIZE);
         self.log = log;
         Ok(())
     }
 
-    /// Builds the pair rows from the single-symbol rows.
+    /// Builds the pair rows from the single-symbol rows, for a tree of at
+    /// most [`PAIR_BITS`]; deeper trees decode without them.
     ///
-    /// A row pairs the code at the top of its index with the code that
-    /// follows when both fit in the lookup; decoding then reads exactly
-    /// the bits of the symbols it yields, as the single-symbol table does.
+    /// A row pairs the code at the top of its [`PAIR_BITS`]-bit index with
+    /// the code that follows when both fit in the lookup; decoding then
+    /// reads exactly the bits of the symbols it yields, as the
+    /// single-symbol table does.
     ///
-    /// A code of `b` bits fills a run of `1 << (12 - b)` rows, whose `j`th
+    /// A code of `b` bits fills a run of `1 << (11 - b)` rows, whose `j`th
     /// row continues with the code at row `j << b`. Every code of one
     /// length is therefore followed by the same series, built once per
     /// length (the reference's `HUF_fillDTableX2Level2` per rank); each row
     /// of the run is that series' row plus the first symbol's.
     fn build_pairs(&mut self) {
+        if self.log > PAIR_BITS {
+            return;
+        }
         let rows = &*self.rows;
+        // The single rows of an 11-bit index: a code of at most 11 bits
+        // fills both 12-bit rows that share its top 11 bits.
+        let single = |index: usize| rows[(index & PAIR_MASK) << (LOOKUP_BITS - PAIR_BITS)];
         let pairs = self
             .pairs
-            .get_or_insert_with(|| Box::new([PairRow::default(); TABLE_SIZE]));
+            .get_or_insert_with(|| Box::new([PairRow::default(); PAIR_SIZE]));
         // The first run of each length is built from the rows; later runs
         // of that length copy it, swapping in their own first symbol.
         let mut series = (0, 0, 0);
         let mut index = 0;
-        while index < TABLE_SIZE {
-            let first = rows[index];
-            // Rows are built for codes of 1 to 12 bits.
-            let first_bits = u32::from(first >> 8).clamp(1, LOOKUP_BITS);
-            let len = 1 << (LOOKUP_BITS - first_bits);
-            let end = (index + len).min(TABLE_SIZE);
-            let own = PairRow::new(first & 0xff, first_bits as u8, 0).0;
+        while index < PAIR_SIZE {
+            let first = single(index);
+            // Rows are built for codes of 1 to 11 bits.
+            let first_bits = row_bits(first).clamp(1, PAIR_BITS);
+            let len = 1 << (PAIR_BITS - first_bits);
+            let end = (index + len).min(PAIR_SIZE);
+            let own = PairRow::new(u16::from(row_symbol(first)), first_bits as u8, 1).0;
             let (series_bits, series_start, series_own) = series;
             if first_bits == series_bits && series_start + len <= index {
                 let (built, rest) = pairs.split_at_mut(index);
@@ -461,12 +663,12 @@ impl HuffmanTable {
             } else {
                 series = (first_bits, index, own);
                 for (j, pair) in pairs[index..end].iter_mut().enumerate() {
-                    let second = rows[(j << first_bits) & INDEX_MASK];
-                    let second_bits = u32::from(second >> 8);
-                    let next = if first_bits + second_bits <= LOOKUP_BITS {
-                        PairRow::new((second & 0xff) << 8, second_bits as u8, 16)
+                    let second = single(j << first_bits);
+                    let second_bits = row_bits(second);
+                    let next = if first_bits + second_bits <= PAIR_BITS {
+                        PairRow::new(u16::from(row_symbol(second)) << 8, second_bits as u8, 1)
                     } else {
-                        PairRow::new(0, 0, 8)
+                        PairRow(0)
                     };
                     *pair = PairRow(next.0 + own);
                 }
@@ -525,7 +727,7 @@ trait TableAccess {
     fn table(&self) -> &HuffmanTable;
 
     /// The pair rows of the current tree, if available.
-    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]>;
+    fn pairs(&mut self) -> Option<&[PairRow; PAIR_SIZE]>;
 }
 
 impl TableAccess for &mut HuffmanTable {
@@ -535,11 +737,15 @@ impl TableAccess for &mut HuffmanTable {
     }
 
     #[inline(always)]
-    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]> {
+    fn pairs(&mut self) -> Option<&[PairRow; PAIR_SIZE]> {
         if !self.pairs_valid {
             self.build_pairs();
         }
-        self.pairs.as_deref()
+        if self.pairs_valid {
+            self.pairs.as_deref()
+        } else {
+            None
+        }
     }
 }
 
@@ -550,7 +756,7 @@ impl TableAccess for &HuffmanTable {
     }
 
     #[inline(always)]
-    fn pairs(&mut self) -> Option<&[PairRow; TABLE_SIZE]> {
+    fn pairs(&mut self) -> Option<&[PairRow; PAIR_SIZE]> {
         if self.pairs_valid {
             self.pairs.as_deref()
         } else {
@@ -618,19 +824,18 @@ fn decode_four<T: TableAccess>(
             out: &mut *out,
             segments,
         };
-        done = if pairs {
-            match table.pairs() {
-                Some(pairs) => pair_rounds::<4>(pairs, &mut four, &mut sentinels),
-                None => [0; 4],
-            }
+        // Without pair rows (a tree deeper than they serve, or a shared
+        // table without them), the single-symbol loop decodes instead.
+        let pairs = if pairs { table.pairs() } else { None };
+        done = if let Some(pairs) = pairs {
+            pair_rounds(pairs, &mut four, &mut sentinels)
         } else {
             let single = table.table();
-            let decoded = if single.log <= 11 {
+            if single.log <= 11 {
                 single_rounds::<5>(&single.rows, &mut four, &mut sentinels)
             } else {
                 single_rounds::<4>(&single.rows, &mut four, &mut sentinels)
-            };
-            [decoded; 4]
+            }
         };
         for ((container, sentinel), &start) in bits.iter_mut().zip(sentinels).zip(&starts) {
             *container = sentinel.into_container(streams, start);
@@ -816,8 +1021,9 @@ mod tests {
     fn codes(table: &HuffmanTable) -> [(u64, u32); 256] {
         let mut codes = [(0, 0); 256];
         for (index, &row) in table.rows.iter().enumerate().rev() {
-            let length = u32::from(row >> 8);
-            codes[usize::from(row as u8)] = ((index >> (LOOKUP_BITS - length)) as u64, length);
+            let length = row_bits(row);
+            codes[usize::from(row_symbol(row))] =
+                ((index >> (LOOKUP_BITS - length)) as u64, length);
         }
         codes
     }
@@ -967,31 +1173,32 @@ mod tests {
         table.build_pairs();
         let pairs = table.pairs.as_deref().expect("built");
         // A = 1, then A again: two symbols in two bits.
-        let both = pairs[0b11 << (LOOKUP_BITS - 2)];
-        assert_eq!(both, PairRow::new(0, 2, 16));
-        assert_eq!((both.symbols(), both.nb_bits(), both.shift()), (0, 2, 16));
+        let both = pairs[0b11 << (PAIR_BITS - 2)];
+        assert_eq!(both, PairRow::new(0, 2, 2));
+        assert_eq!((both.symbols(), both.nb_bits(), both.count()), (0, 2, 2));
+        // E = 0000, then A = 1: E in the low byte, A in the high one.
+        let two = pairs[0b1 << (PAIR_BITS - 5)];
+        assert_eq!((two.symbols(), two.nb_bits(), two.count()), (4, 5, 2));
         assert!(table.pairs_valid);
-        assert_eq!(table.retained_bytes(), 2 * TABLE_SIZE + 4 * TABLE_SIZE);
+        assert_eq!(table.retained_bytes(), 2 * TABLE_SIZE + 4 * PAIR_SIZE);
         // A new tree invalidates them.
         let src = [132, 0x43, 0x20, 0x10];
         table.read(&src).expect("valid");
         assert!(!table.pairs_valid);
     }
 
-    /// The pair row of `index` by its definition, from the single rows.
+    /// The pair row of the 11-bit `index` by its definition, from the
+    /// single rows.
     fn naive_pair(rows: &[Row; TABLE_SIZE], index: usize) -> PairRow {
-        let first = rows[index];
-        let first_bits = u32::from(first >> 8);
-        let second = rows[(index << first_bits) & INDEX_MASK];
-        let second_bits = u32::from(second >> 8);
-        if first_bits + second_bits <= LOOKUP_BITS {
-            PairRow::new(
-                (first & 0xff) | (second & 0xff) << 8,
-                (first_bits + second_bits) as u8,
-                16,
-            )
+        let first = rows[index << 1];
+        let first_bits = row_bits(first);
+        let second = rows[((index << first_bits) & PAIR_MASK) << 1];
+        let second_bits = row_bits(second);
+        let (first, second) = (u16::from(row_symbol(first)), u16::from(row_symbol(second)));
+        if first_bits + second_bits <= PAIR_BITS {
+            PairRow::new(first | second << 8, (first_bits + second_bits) as u8, 2)
         } else {
-            PairRow::new(first & 0xff, first_bits as u8, 8)
+            PairRow::new(first, first_bits as u8, 1)
         }
     }
 
@@ -1014,6 +1221,11 @@ mod tests {
                 continue;
             };
             table.build_pairs();
+            if table.log > PAIR_BITS {
+                // Twelve-bit trees decode without pair rows.
+                assert!(!table.pairs_valid && table.pairs.is_none());
+                continue;
+            }
             let pairs = table.pairs.as_deref().expect("built");
             for (index, &pair) in pairs.iter().enumerate() {
                 assert_eq!(
@@ -1025,7 +1237,7 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked >= 12, "{checked} trees");
+        assert!(checked >= 11, "{checked} trees");
     }
 
     #[test]

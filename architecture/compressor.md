@@ -202,6 +202,14 @@ the call.
 caller can retry or recover the sink. `EncoderReader` wraps a `Read` source
 and yields the compressed frame; it drives the session with `End` once the
 source is exhausted. Both use internal buffers of one block.
+`EncoderWriter` pulls compressed bytes into an owned buffer of
+`ZSTD_CStreamOutSize` bytes (a full block's compress bound plus a block
+header and a checksum). A session writes a block straight into the
+caller's output whenever the room left there holds the block's bound, so
+every full block lands in the writer's buffer without passing through the
+session's internal output buffer; only a frame's end or a partly drained
+buffer falls back to it and the Flush stage. With 128 KiB, a few hundred
+bytes short of the bound, every block took that detour and its copy.
 
 ## Errors
 
@@ -243,3 +251,12 @@ changes output: a reused engine's frames equal a fresh one's (checked by
 - The stable-buffer streaming modes (`ZSTD_c_stableInBuffer`,
   `ZSTD_c_stableOutBuffer`) are not exposed; sessions always behave as the
   reference's buffered mode.
+- Streaming at the fast levels trails zstd on the `stream/mixed-4MiB`
+  bench (level 1: 7.4 ms against 6.1 ms on the i7-13700KF before the
+  branch-free segment select, about 2% less since) because of the extDict
+  fast finder, which most blocks use once the stream buffer wraps: it
+  executes about 1.6x the reference's instructions (73.5M against about
+  45M per 4 MiB stream; stack spills and bounds checks in its search loop)
+  and mispredicts 136K branches against 95K. The session, window and
+  output layers cost under 0.02M instructions per 4 MiB call, at parity
+  with the reference.

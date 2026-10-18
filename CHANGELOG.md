@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v0.2.7](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.7) - 2026-10-18
 
 - **Faster Huffman tables for small inputs.** The literal table's sort
   (`HUF_sort`) no longer places symbols that do not occur: the reference
@@ -30,8 +30,7 @@
   word; a clamped offset never matches, so the reference's matches are
   found. The select it replaces rebuilt a stand-in's address at every
   position. Both searches now prefetch the input when their step grows,
-  as the reference does, and dfast compares the first word of each match
-  length inline. Against the previous commit, level -5 took 2-18% less
+  as the reference does. Against the previous commit, level -5 took 2-18% less
   time, level 1 0.3-15%, level 2 0.3-14% and level 3 1-11% on 1 KiB to
   1 MiB of text, binary and long-literal data (1 MiB of text at level 3
   unchanged), with the largest gains on small inputs; level 4 moved by -3% to +1% (one reused context per input,
@@ -40,6 +39,15 @@
   placement, not the loop. Frames are byte-identical. Clamping dfast's
   candidates too was up to 18% faster on single small blocks but up to 16%
   slower on multi-block inputs, and was not kept.
+- **Fixed an x86 slowdown in the fast and dfast levels.** On x86 the
+  compiler split the clamped candidate test above back into two branches,
+  the range test mispredicting on text while the table fills: Alice and
+  1 MiB of text took 5-17% longer at levels -5 to 2 than before the
+  change (i7-13700KF, interleaved process pairs). The test now folds both
+  conditions into one value, which restores the previous time on text and
+  keeps a 1-5% gain on 64 KiB of binary and random data. dfast's inlined
+  match-length compare, also measured 3-6% slower on text at levels 2 to
+  4 on x86, was reverted. Frames are byte-identical.
 - **NEON tag mask for the row match finder.** 16-slot rows (levels 5 to 9
   on inputs whose window exceeds 16 KiB) narrow their tag compare to four
   bits per slot with `vshrn`, the reference's `ZSTD_row_getNEONMask`,
@@ -52,8 +60,129 @@
 - **The Huffman encoder no longer zeroes its code table.** The 2 KiB of
   packed codes are built with `array::from_fn`, so each entry is written
   once and the `memset` in front of the fill is gone.
+- **Compiled-in table widths for small inputs at the fast levels.** The
+  `fast` search compiles in the hash widths of the reference's defaults
+  for inputs up to 128 and 256 KiB (minimum match and hash log (5,12),
+  (5,13) and (6,14), levels -5, -1 and 1), together with the window's
+  first index, for blocks whose prefix starts the window (one-shot frames
+  and a fresh context's first frame); other prefixes keep the generic
+  loop. Before, only the large-input widths were compiled in, so Alice
+  and every 64 KiB input ran the generic loop. Its short literal runs are
+  appended straight from the input as one 16-byte chunk, without a stack
+  copy or an overflow test (`store_seq_wild`). Cold one-shot calls on
+  Alice take 3-5% less time at levels -5, -1 and 1, and 64 KiB inputs
+  1-6% less (i7-13700KF, 10 interleaved process pairs per case); the fast
+  kernel executes 9% fewer instructions. About 30 KB of code.
+- **dfast's table widths are compiled in, one function per width.** The
+  six (minimum match, hash log, chain log) sets the default parameters
+  give on inputs up to 64 KiB, 256 KiB and above, at levels 2 to 4, each
+  run in a separate `#[inline(never)]` search function, so their shifts
+  are immediates and their table bounds constants. Inlined side by side,
+  LLVM had merged the instances back into one loop with run-time widths,
+  which is why the compiled-in widths once measured no faster. The first
+  word of a match length is compared inline again, now neutral to 3%
+  faster inside the separate functions. After a match, dfast loads the
+  word and long-table slot where the match ends and prefetches their
+  candidates before the backward extension and the sequence store, so the
+  next search no longer waits for them (the kernel is bound by the latency
+  after each mispredicted match, not by its instruction count), and short
+  literal runs are appended straight from the input as fast's are.
+  Together, Alice takes 5% less time at level 2 and 7% at level 3, 1 MiB
+  of text 5% at levels 3 and 4 and random data 3% (12 interleaved pairs).
+  About 160 KB of code over the four x86 SIMD levels; the 44-byte text at
+  level 3 is 1.5-3% slower (0.5 µs calls).
+- **The row match finder is chosen once per block.** greedy, lazy and
+  lazy2 with the row finder picked among nine (minimum match, row size)
+  searches at every searched position, and each parser inlined all nine.
+  The search is now picked when a block starts, so each parser inlines
+  one. Levels 8 to 12 take 1-2.5% less time on Alice and 1 MiB of text,
+  with 6-8% fewer mispredicted branches; greedy and lazy are unchanged.
+  The dictMatchState parsers keep the per-search choice. About 570 KB of
+  code.
+- **Cold calls no longer zero tables they may never use.** The Huffman
+  table, the three sequence tables and the optimal parser's state are
+  allocated on their first write (a private `LazyBox`: an unwritten table
+  reads as one shared all-zero value, as the reference leaves its
+  workspace untouched until a block writes it). The engine is built once
+  instead of copied, and is 2 KB smaller. Empty input compresses in half
+  the time (289 to 145 ns at level 1), the 44-byte text 30-40% faster at
+  levels -5 to 9, 64 KiB inputs 1-11% faster; a 44-byte call executes
+  5.6K instructions instead of 17.6K (zstd: 6.0K).
+- **The block pre-splitter is compiled per sampling rate and hash log**,
+  as the reference's `ZSTD_GEN_RECORD_FINGERPRINT` does, and its distance
+  loop vectorizes: `ZSTD_splitBlock` executes 40% fewer instructions,
+  below the reference's, and 1 MiB of text takes 2.7% less time at
+  level 9, 1 MiB of repeated bytes 4-8% less at levels 3 to 19.
+- **The decoder no longer zeroes output ahead of each block.**
+  `decompress` and `decompress_into` zeroed a whole block of room before
+  decoding a compressed block into it. Sequences of 1 KiB or more, a
+  block's trailing literals and literal-only blocks are now appended to
+  the vector, so their bytes are written once, and room for shorter
+  sequences is zeroed 4 KiB at a time as the sequence loop reaches it. A
+  `BlockOutput` trait carries both kinds of destination; the sequence loop
+  is compiled for fixed destinations (`decompress_to_slice`, streaming
+  history), which keep the previous loop, and for growing ones, which
+  leave it for a cold path when a sequence needs more room. 1 MiB of text
+  decodes 8-16% faster, the 64 KiB binary corpus 14-22% (now faster than
+  zstd at every level) and 1 MiB of repeated bytes 10-19%.
+  `decompress_to_uninit` zeroes on demand, a chunk at a time.
+- **Faster Huffman literal decoding.** The four-stream pair loop follows
+  the reference's fast loop: 11-bit pair tables (half the size and build
+  cost), five lookups per refill and two-byte stores whose window the
+  compiler proves from the row's two-bit symbol count, and refills clamped
+  instead of bounds checked: 13.2 instructions per lookup instead of 17.7
+  (zstd: 11.25). The single-symbol loop stores symbols straight into
+  fixed-size chunks of the four outputs instead of gathering them in an
+  array that spilled to the stack (8.8 per symbol instead of 11.6; zstd
+  8.2). Single-symbol tables are filled by weight in fixed-size runs
+  after a counting sort (`HUF_readDTableX1_wksp`), weight streams decode
+  four symbols per refill, and sequence FSE tables are spread without
+  per-cell tests when no symbol has a "less than one" probability
+  (`ZSTD_buildFSETable_body`): reading a Huffman tree costs 35% fewer
+  instructions, a sequence table 20%. Alice and 1 MiB of text decode
+  3-5% faster at levels 1 to 19. These table builds were measured slower
+  on 2026-10-15; that run compared builds whose unchanged sequence loop
+  moved by ±1.6% instructions with code placement, which this
+  measurement controlled for.
+- **The extDict fast finder selects its segment without a branch.**
+  Streams use it once their buffer wraps (most blocks of a long stream at
+  the fast levels). It picks the segment holding a hash-table candidate
+  with `select_unpredictable` (the reference's `idxBase` select) and
+  extends matches backwards inside that segment without a per-byte
+  segment test. Mispredicted branches fall by a quarter on a 4 MiB stream
+  at level 1, which compresses about 2% faster (`stream/mixed-4MiB`;
+  levels -5 and 1, random data 3%).
+- **Predefined sequence tables are built once per decoder.** A frame
+  start forgot every sequence table, so each frame that used the
+  predefined distributions rebuilt all three. A slot now remembers that
+  its entries hold the predefined table until an RLE or described table
+  overwrites them, as the reference points at static tables. Decoding
+  1,000 small dictionary-compressed records one frame at a time takes 13%
+  less time (27% fewer instructions); larger inputs are unchanged.
+- **`EncoderWriter` no longer copies every block twice.** It offered each
+  session call 128 KiB of output room, a few hundred bytes less than a
+  full block's compress bound, so every block was compressed into the
+  session's internal buffer and copied out by the flush stage. It now
+  offers `ZSTD_CStreamOutSize` (131,591 bytes), into which full blocks are
+  written directly. 4 MiB of random data written in 64 KiB pieces
+  compresses 10% faster at level 1 and 6.5% at level 3 (17% fewer
+  instructions); frames are unchanged.
+- **AFL regressions cover the benchmark inputs.** The comparison
+  benchmark's eight inputs at its 24 levels replay through the
+  `differential_c` and `decode_roundtrip` bodies
+  (`fuzz/afl/tests/benchmark_corpora.rs`; the 1 MiB inputs are cut to the
+  targets' 256 KiB cap), the 44-byte text and empty input at every level
+  are committed regressions, and `prepare-seeds.sh` adds Alice at one
+  level per strategy to the campaign seeds.
+- **Benchmarks.** Both comparison suites were rerun on this release
+  (`enc-20261018`, `dec-20261018`); the previous run's archives were
+  replaced. Compression runs at a median 1.112x zstd's speed, faster in 166
+  of 192 dataset/level pairs, against 1.086x and 159 for the tree before
+  these changes swept the same day; decompression at 1.111x, faster in 147,
+  against 1.032x and 122. Every case that looked slower in the sweep was
+  rerun as interleaved process pairs and was not.
 
-## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - Unreleased
+## [v0.2.6](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.6) - 2026-10-16
 
 - **Decoder output into uninitialized memory.** `DecoderSession` and
   `DecoderSessionOwned` have `process_uninit`, and `Decompressor` has

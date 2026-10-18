@@ -69,15 +69,24 @@ pub(crate) struct CTable {
     pub(crate) value: [u16; 256],
 }
 
+impl CTable {
+    /// The all-zero table a block state starts with.
+    pub(crate) const EMPTY: Self = Self {
+        table_log: 0,
+        max_symbol_value: 0,
+        nb_bits: [0; 256],
+        value: [0; 256],
+    };
+}
+
 impl Default for CTable {
     fn default() -> Self {
-        Self {
-            table_log: 0,
-            max_symbol_value: 0,
-            nb_bits: [0; 256],
-            value: [0; 256],
-        }
+        Self::EMPTY
     }
+}
+
+impl crate::compressor::core::lazy_box::StaticEmpty for CTable {
+    const EMPTY_REF: &'static Self = &Self::EMPTY;
 }
 
 /// A node of the construction tree (`nodeElt`).
@@ -972,7 +981,7 @@ pub(crate) fn compress(
     dst: &mut [u8],
     src: &[u8],
     options: Options,
-    old_table: &mut CTable,
+    old_table: &mut crate::compressor::core::lazy_box::LazyBox<CTable>,
     repeat: &mut Repeat,
 ) -> Result<usize, CoreError> {
     let Options {
@@ -1072,7 +1081,7 @@ pub(crate) fn compress(
         return Ok(0);
     }
     *repeat = Repeat::None;
-    *old_table = table;
+    old_table.set(table);
     Ok(compress_with_table(
         dst, h_size, src, streams, old_table, backend,
     ))
@@ -1302,7 +1311,7 @@ mod tests {
 
     #[test]
     fn tiny_or_empty_inputs_are_not_compressed() {
-        let mut table = CTable::default();
+        let mut table = crate::compressor::core::lazy_box::LazyBox::<CTable>::default();
         let mut repeat = Repeat::None;
         let mut dst = [0u8; 64];
         let options = Options {
@@ -1317,6 +1326,8 @@ mod tests {
         let result = compress(&mut dst, &[9; 40], options, &mut table, &mut repeat);
         assert_eq!(result, Ok(1));
         assert_eq!(dst[0], 9);
+        // Neither outcome builds a table, so none is allocated.
+        assert_eq!(table.heap_bytes(), 0);
         assert_eq!(compress_4x(&mut dst, &[1; 8], &table, Backend::SCALAR), 0);
         assert_eq!(
             compress_1x(&mut dst[..7], &[1; 8], &table, Backend::SCALAR),

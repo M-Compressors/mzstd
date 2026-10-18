@@ -95,7 +95,7 @@ fn build_literals_stats(
     if repeat == huf::Repeat::Check && !prev.table.validate(&count, max_symbol_value) {
         repeat = huf::Repeat::None;
     }
-    next.table = huf::CTable::default();
+    *next.table = huf::CTable::EMPTY;
     let flags = Flags {
         optimal_depth,
         ..Flags::default()

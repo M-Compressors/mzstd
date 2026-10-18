@@ -16,7 +16,10 @@
 //! row carries its baseline and extra-bit count ([`SeqRow`]), the container
 //! is refilled once per sequence and once more in the middle when the
 //! sequence's extra bits could exhaust it, and sequences with room to spare
-//! in both buffers are executed with wildcopies.
+//! in both buffers are executed with wildcopies. Any other sequence leaves
+//! the loop for a cold path that appends it to an output that can append,
+//! zeroes more room for it in an output that grows, or executes it exactly,
+//! and then resumes the loop.
 
 use alloc::boxed::Box;
 
@@ -104,6 +107,10 @@ const _: () = assert!(
         && ML_BITS[MAX_ML as usize] <= 16
 );
 
+/// Shortest sequence that [`SequenceTables::execute`] appends to an output
+/// that can append rather than zeroing room for it first.
+const APPEND_MIN: usize = 1024;
+
 /// Most extra bits a sequence can read between two refills without
 /// exhausting the container, given the state bits that follow: the
 /// reference's `64 - 7 - (LLFSELog + MLFSELog + OffFSELog)`.
@@ -184,6 +191,11 @@ enum SlotContent {
 struct TableSlot {
     table: Option<Box<SeqTable>>,
     content: SlotContent,
+    /// Whether `table` holds the predefined distribution, whatever
+    /// `content` says: a frame start forgets the table for `Repeat_Mode`
+    /// but not its entries, so the next predefined mode reuses them
+    /// instead of rebuilding them (the reference points at static tables).
+    predefined: bool,
 }
 
 impl TableSlot {
@@ -201,15 +213,16 @@ impl TableSlot {
     ) -> Result<usize, InvalidDataKind> {
         match mode {
             EncodingType::Basic => {
-                if self.content != SlotContent::Predefined {
+                if !self.predefined {
                     self.table_mut().fill(
                         kind.default,
                         kind.default_log,
                         kind.bases,
                         kind.extra_bits,
                     );
-                    self.content = SlotContent::Predefined;
+                    self.predefined = true;
                 }
+                self.content = SlotContent::Predefined;
                 Ok(0)
             }
             EncodingType::Rle => {
@@ -221,11 +234,13 @@ impl TableSlot {
                 self.table_mut()
                     .fill_rle(kind.bases[symbol], kind.extra_bits[symbol]);
                 self.content = SlotContent::Custom;
+                self.predefined = false;
                 Ok(1)
             }
             EncodingType::Compressed => {
                 let used = fill_described(self.table_mut(), kind, src)?;
                 self.content = SlotContent::Custom;
+                self.predefined = false;
                 Ok(used)
             }
             EncodingType::Repeat => {
@@ -416,7 +431,12 @@ impl SequenceDecoder<'_> {
 
 /// The executing half of the sequence loop: literals and matches copied
 /// into the output, the reference's `ZSTD_execSequence`.
-struct Executor<'a, 'b> {
+///
+/// With `GROW`, the output may grow: a sequence the wildcopies cannot
+/// execute stops the loop for the caller's cold path. Without it, such a
+/// sequence is executed exactly in place, as the reference does, and the
+/// loop runs to the end.
+struct Executor<'a, 'b, const GROW: bool> {
     /// The output, from the lowest byte a match may reach, cut to the
     /// block's maximum and the overlength.
     out: &'a mut [u8],
@@ -427,19 +447,58 @@ struct Executor<'a, 'b> {
     block_limit: usize,
     window: usize,
     /// Dictionary content before the output's first byte, read only by the
-    /// cold path.
+    /// exact path.
     dictionary: &'b [u8],
 }
 
-impl Executor<'_, '_> {
-    /// Executes one sequence, checking it as the reference does.
+impl<const GROW: bool> Executor<'_, '_, GROW> {
+    /// Executes `pending`, then decodes and executes the `left` sequences
+    /// before the last one, and the last one unless `last` was taken,
+    /// until one stops the loop; that sequence is returned unexecuted.
+    #[inline(always)]
+    fn run<S: Simd>(
+        &mut self,
+        simd: S,
+        copy: MatchCopy,
+        decoder: &mut SequenceDecoder<'_>,
+        left: &mut usize,
+        last: &mut bool,
+        pending: Option<Sequence>,
+    ) -> Result<Option<Sequence>, BlockError> {
+        if let Some(sequence) = pending
+            && !self.execute(simd, copy, sequence)?
+        {
+            return Ok(Some(sequence));
+        }
+        // The last sequence leaves the states alone; peeling it keeps that
+        // test out of the loop.
+        while *left != 0 {
+            let sequence = decoder.decode(false)?;
+            *left -= 1;
+            if !self.execute(simd, copy, sequence)? {
+                return Ok(Some(sequence));
+            }
+        }
+        if ::core::mem::take(last) {
+            let sequence = decoder.decode(true)?;
+            if !self.execute(simd, copy, sequence)? {
+                return Ok(Some(sequence));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Executes one sequence, checking it as the reference does. Returns
+    /// `false`, having written nothing, when `GROW` is set and the
+    /// wildcopies cannot execute it: it lacks room for the overlength, or
+    /// its match leaves the output or the window.
     #[inline(always)]
     fn execute<S: Simd>(
         &mut self,
         simd: S,
         copy: MatchCopy,
         sequence: Sequence,
-    ) -> Result<(), BlockError> {
+    ) -> Result<bool, BlockError> {
         let literal_length = sequence.literal_length as usize;
         let match_length = sequence.match_length as usize;
         let offset = sequence.offset as usize;
@@ -457,6 +516,9 @@ impl Executor<'_, '_> {
             // Within the block's maximum, with room for the overlength.
             if offset > lit_end || offset > self.window {
                 // Into a dictionary, past the window with one, or invalid.
+                if GROW {
+                    return Ok(false);
+                }
                 execute_exactly(
                     self.out,
                     self.lits,
@@ -468,7 +530,7 @@ impl Executor<'_, '_> {
                 )?;
                 self.op = match_end;
                 self.lp = lit_stop;
-                return Ok(());
+                return Ok(true);
             }
             wildcopy_literals(self.out, op, self.lits, lp, literal_length);
             if offset >= 32 {
@@ -493,6 +555,9 @@ impl Executor<'_, '_> {
                 wildcopy_match(simd, copy, self.out, lit_end, offset, match_length);
             }
         } else {
+            if GROW {
+                return Ok(false);
+            }
             execute_exactly(
                 self.out,
                 self.lits,
@@ -505,8 +570,19 @@ impl Executor<'_, '_> {
         }
         self.op = match_end;
         self.lp = lit_stop;
-        Ok(())
+        Ok(true)
     }
+}
+
+/// `out` from `base`, the lowest byte a match may reach, cut to
+/// [`INDEX_LIMIT`] bytes, which the copies' index masks rely on, and to
+/// `room_end`, the block's maximum and the overlength.
+#[inline(always)]
+fn cut_output(out: &mut [u8], base: usize, room_end: usize) -> &mut [u8] {
+    let end = out.len().min(base.saturating_add(INDEX_LIMIT));
+    let out = &mut out[base..end];
+    let len = out.len().min(room_end);
+    &mut out[..len]
 }
 
 /// Executes a sequence that ends too close to the end of the output for
@@ -642,7 +718,11 @@ impl SequenceTables {
     ///
     /// `reps` holds the repeat offsets on entry and is updated only when the
     /// whole block succeeds. [`BlockError::OutputFull`] reports that `out`
-    /// ends before the block does.
+    /// ends before the block does and cannot grow there.
+    ///
+    /// An output that grows ([`super::block::BlockOutput`]) is extended only
+    /// as sequences reach its end: long sequences are appended, written
+    /// once, and others get room zeroed a chunk at a time.
     #[fearless_simd_macros::simd]
     pub(crate) fn execute<S: Simd>(
         &self,
@@ -657,7 +737,11 @@ impl SequenceTables {
             stream,
             literals,
         } = section;
-        let Target { out, op, context } = target;
+        let Target {
+            out: room,
+            op,
+            context,
+        } = target;
         // Valid matches never reach before `base`: offsets are bounded by
         // the history and by the window. Cutting the buffer there keeps
         // every index below 2^32 (windows are at most 2^31 bytes), which
@@ -671,9 +755,7 @@ impl SequenceTables {
         } else {
             &[]
         };
-        let cut_end = out.len().min(base.saturating_add(INDEX_LIMIT));
-        let out = &mut out[base..cut_end];
-        let op = op - base;
+        let mut op = op - base;
         let missing = InvalidDataKind::SequencesSection;
         let entropy = context.entropy;
         let ll_table = self
@@ -710,38 +792,101 @@ impl SequenceTables {
         let lit_len = literals.len;
         let lits = &literals.bytes[..lit_len + WILDCOPY_OVERLENGTH];
         let block_limit = op + context.block_max;
-        let out_len = out.len().min(block_limit + WILDCOPY_OVERLENGTH);
-        let mut executor = Executor {
-            out: &mut out[..out_len],
-            op,
-            lits,
-            lp: 0,
-            block_limit,
-            window,
-            dictionary,
-        };
-        // The last sequence leaves the states alone; peeling it keeps that
-        // test out of the loop. Callers handle empty sections themselves.
+        let room_end = block_limit + WILDCOPY_OVERLENGTH;
+        let mut lp = 0;
+        // Callers handle empty sections themselves.
         debug_assert!(count > 0);
         let mut left = count - 1;
-        while left != 0 {
-            let sequence = decoder.decode(false)?;
-            executor.execute(simd, copy, sequence)?;
-            left -= 1;
+        let mut last = true;
+        if !room.grows() {
+            let mut executor = Executor::<false> {
+                out: cut_output(room.buffer(), base, room_end),
+                op,
+                lits,
+                lp,
+                block_limit,
+                window,
+                dictionary,
+            };
+            executor.run(simd, copy, &mut decoder, &mut left, &mut last, None)?;
+            (op, lp) = (executor.op, executor.lp);
         }
-        let sequence = decoder.decode(true)?;
-        executor.execute(simd, copy, sequence)?;
+        let mut pending = None;
+        while left != 0 || last || pending.is_some() {
+            let mut executor = Executor::<true> {
+                out: cut_output(room.buffer(), base, room_end),
+                op,
+                lits,
+                lp,
+                block_limit,
+                window,
+                dictionary,
+            };
+            let stalled = executor.run(
+                simd,
+                copy,
+                &mut decoder,
+                &mut left,
+                &mut last,
+                pending.take(),
+            )?;
+            (op, lp) = (executor.op, executor.lp);
+            let Some(sequence) = stalled else {
+                break;
+            };
+            let literal_length = sequence.literal_length as usize;
+            let match_length = sequence.match_length as usize;
+            let offset = sequence.offset as usize;
+            let lit_end = op + literal_length;
+            let match_end = lit_end + match_length;
+            let lit_range = [lp, lp + literal_length];
+            if offset <= lit_end && offset <= window && match_end <= block_limit {
+                // A long sequence is appended where the output can: written
+                // once, with no zeroing.
+                if literal_length + match_length >= APPEND_MIN
+                    && room.append(
+                        base + op,
+                        &lits[lit_range[0]..lit_range[1]],
+                        offset,
+                        match_length,
+                    )
+                {
+                    (op, lp) = (match_end, lit_range[1]);
+                    continue;
+                }
+                // Otherwise zero the output up to the sequence's end, or as
+                // far as the block's room goes, and retry it.
+                let wanted = match_end + WILDCOPY_OVERLENGTH;
+                if room.buffer().len() < base + wanted && room.grow(base + wanted) {
+                    pending = Some(sequence);
+                    continue;
+                }
+            }
+            // Into a dictionary, at the end of the output, or invalid: room
+            // for exactly the sequence, where the output can grow.
+            if room.buffer().len() < base + match_end {
+                room.grow(base + match_end);
+            }
+            execute_exactly(
+                cut_output(room.buffer(), base, room_end),
+                lits,
+                [op, lit_end, match_end],
+                lit_range,
+                offset,
+                [block_limit, window],
+                dictionary,
+            )?;
+            (op, lp) = (match_end, lit_range[1]);
+        }
         if !decoder.bits.is_exhausted() {
             return Err(InvalidDataKind::SequenceStream.into());
         }
-        let Executor { out, op, lp, .. } = executor;
         let rest = lit_len - lp;
         if op + rest > block_limit {
             return Err(InvalidDataKind::BlockSize.into());
         }
         let end = op + rest;
-        let target = out.get_mut(op..end).ok_or(BlockError::OutputFull)?;
-        target.copy_from_slice(&lits[lp..lit_len]);
+        room.put(base + op, &lits[lp..lit_len])?;
         *reps = decoder.repeat;
         Ok(base + end)
     }
@@ -751,11 +896,14 @@ impl SequenceTables {
 mod tests {
     use super::*;
     use crate::Backend;
+    use crate::decompressor::core::block::tests::Growing;
     use crate::shared::format::REP_START;
     use alloc::vec::Vec;
 
     /// Executes `count` sequences after `out` on every backend and copy
-    /// mode, requiring them to agree, and appends the output.
+    /// mode, into a buffer with room for the block and into outputs that
+    /// grow on demand, with and without appends, requiring them all to
+    /// agree, and appends the output.
     fn run(
         tables: &SequenceTables,
         count: usize,
@@ -779,7 +927,7 @@ mod tests {
                 buffer.resize(start + context.block_max + WILDCOPY_OVERLENGTH, 0);
                 let mut repeat = *reps;
                 let target = Target {
-                    out: &mut buffer,
+                    out: &mut buffer.as_mut_slice(),
                     op: start,
                     context,
                 };
@@ -792,6 +940,24 @@ mod tests {
                     simd, copy, section, &mut repeat, target
                 ));
                 results.push(result.map(|end| (buffer[start..end].to_vec(), repeat)));
+                for (step, appends) in [(1, false), (7, true), (4096, true)] {
+                    let mut growing = Growing {
+                        buffer: out.clone(),
+                        limit: start + context.block_max + WILDCOPY_OVERLENGTH,
+                        step,
+                        appends,
+                    };
+                    let mut repeat = *reps;
+                    let target = Target {
+                        out: &mut growing,
+                        op: start,
+                        context,
+                    };
+                    let result = fearless_simd::dispatch!(backend.0, simd => tables.execute(
+                        simd, copy, section, &mut repeat, target
+                    ));
+                    results.push(result.map(|end| (growing.buffer[start..end].to_vec(), repeat)));
+                }
             }
         }
         assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
@@ -934,6 +1100,102 @@ mod tests {
         run(&tables, 1, &stream, b"abcXY", &mut reps, &mut out, CONTEXT).expect("valid");
         assert_eq!(out, b"abcabcabXY");
         assert_eq!(reps, [3, 1, 4]);
+    }
+
+    #[test]
+    fn long_sequences_execute_alike_however_the_output_grows() {
+        // Literal length code 29 (1024 plus ten extra bits), offset code 2
+        // with extra bits 2 (offset 3), match length code 46 (1027 plus ten
+        // extra bits): sequences long enough to be appended.
+        let tables = rle_tables(29, 2, 46);
+        let lengths = [(5, 0), (0, 900), (1000, 3)];
+        let fields: Vec<(u64, u32)> = lengths
+            .iter()
+            .flat_map(|&(ll, ml)| [(2, 2), (ml, 10), (ll, 10)])
+            .collect();
+        let literals: Vec<u8> = (0..4100u32).map(|i| (i % 251) as u8).collect();
+        let mut expected = b"history".to_vec();
+        let mut lp = 0;
+        for &(ll, ml) in &lengths {
+            let ll = 1024 + ll as usize;
+            expected.extend_from_slice(&literals[lp..lp + ll]);
+            lp += ll;
+            for _ in 0..1027 + ml {
+                expected.push(expected[expected.len() - 3]);
+            }
+        }
+        expected.extend_from_slice(&literals[lp..]);
+        let mut reps = REP_START;
+        let mut out = b"history".to_vec();
+        run(
+            &tables,
+            lengths.len(),
+            &backward_stream(&fields),
+            &literals,
+            &mut reps,
+            &mut out,
+            CONTEXT,
+        )
+        .expect("valid");
+        assert_eq!(out, expected);
+        // The block's maximum bounds appended sequences too.
+        let small = BlockContext {
+            block_max: 3000,
+            ..CONTEXT
+        };
+        assert_eq!(
+            run(
+                &tables,
+                lengths.len(),
+                &backward_stream(&fields),
+                &literals,
+                &mut reps,
+                &mut b"history".to_vec(),
+                small
+            ),
+            Err(InvalidDataKind::BlockSize)
+        );
+    }
+
+    #[test]
+    fn outputs_that_stop_growing_short_of_the_overlength_execute_exactly() {
+        // "abc", then a five-byte match at offset 3 and the literals "XY":
+        // ten bytes, in an output that may grow to exactly that.
+        let tables = rle_tables(3, 2, 2);
+        let stream = backward_stream(&[(2, 2)]);
+        let mut bytes = b"abcXY".to_vec();
+        bytes.resize(5 + WILDCOPY_OVERLENGTH, 0);
+        let literals = Literals {
+            bytes: &bytes,
+            len: 5,
+        };
+        for (limit, expected) in [(10, Ok(10)), (9, Err(BlockError::OutputFull))] {
+            let mut growing = Growing {
+                buffer: Vec::new(),
+                limit,
+                step: 1,
+                appends: false,
+            };
+            let mut reps = REP_START;
+            let target = Target {
+                out: &mut growing,
+                op: 0,
+                context: CONTEXT,
+            };
+            let section = SequenceSection {
+                count: 1,
+                stream: &stream,
+                literals,
+            };
+            let backend = Backend::default();
+            let result = fearless_simd::dispatch!(backend.0, simd => tables.execute(
+                simd, MatchCopy::Shuffle, section, &mut reps, target
+            ));
+            assert_eq!(result, expected);
+            if expected.is_ok() {
+                assert_eq!(growing.buffer, b"abcabcabXY");
+            }
+        }
     }
 
     #[test]
@@ -1232,6 +1494,28 @@ mod tests {
             read_table(SymbolType::Offsets, &[0x04, 0, 0, 0]).map(|_| ()),
             Err(InvalidDataKind::FseTable)
         );
+    }
+
+    #[test]
+    fn predefined_tables_survive_frame_starts_until_replaced() {
+        let literal_lengths = |tables: &SequenceTables| tables.literal_lengths.get(None).cloned();
+        let mut tables = SequenceTables::default();
+        tables.read_header(&[1, 0x00]).expect("predefined modes");
+        let predefined = literal_lengths(&tables).expect("built");
+        assert!(tables.literal_lengths.predefined);
+        // A frame start forgets the table for repeat modes, not its
+        // entries, which the next predefined mode reuses.
+        tables.reset(false);
+        assert!(literal_lengths(&tables).is_none());
+        tables.read_header(&[1, 0x00]).expect("predefined modes");
+        assert_eq!(literal_lengths(&tables).as_ref(), Some(&predefined));
+        // An RLE table overwrites the entries, so they are rebuilt.
+        tables.read_header(&[1, 0x54, 0, 0, 0]).expect("RLE modes");
+        assert!(!tables.literal_lengths.predefined);
+        assert_ne!(literal_lengths(&tables).as_ref(), Some(&predefined));
+        tables.reset(false);
+        tables.read_header(&[1, 0x00]).expect("predefined modes");
+        assert_eq!(literal_lengths(&tables), Some(predefined));
     }
 
     #[test]

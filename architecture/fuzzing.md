@@ -8,7 +8,7 @@ under `cargo afl test` without instrumentation.
 
 ```mermaid
 graph TD
-    Seeds["prepare-seeds.sh: vendored golden-compression files and zstd.h behind parameter headers"] --> AFL[cargo afl fuzz]
+    Seeds["prepare-seeds.sh: vendored golden-compression files and zstd.h behind parameter headers, benchmark text at one level per strategy"] --> AFL[cargo afl fuzz]
     AFL --> Bin["src/bin/<target>.rs: afl::fuzz!"]
     Bin --> Body["src/targets.rs: target body"]
     Body --> Decode["src/lib.rs: decode_config"]
@@ -17,6 +17,7 @@ graph TD
     Findings[findings/: crashes] -->|cargo afl tmin| Reg["regressions/<target>/*.bin"]
     Reg --> Replay["tests/regressions.rs (cargo afl test)"]
     Replay --> Body
+    Bench["tests/benchmark_corpora.rs: the comparison benchmark's 8 inputs x 24 levels"] --> Body
 ```
 
 ## Input layout
@@ -68,8 +69,10 @@ dependencies never enable it.
 
 `prepare-seeds.sh` builds `seeds/params` from upstream's
 `tests/golden-compression` payloads and `lib/zstd.h`, each behind twelve
-parameter headers, and `seeds/frames` from the golden decompression
-fixtures. Campaigns use `seeds/frames` for `decompress`, the committed
+parameter headers, the first 64 KiB of `testdata/alice29.txt` (the
+comparison benchmark's text) at levels -5, 1, 3, 5, 6, 9, 13, 16, 19 and
+22, and the committed `bench-*` regressions; and `seeds/frames` from the
+golden decompression fixtures. Campaigns use `seeds/frames` for `decompress`, the committed
 regressions for `decode_streaming`, `decode_dictionary` and
 `compress_dictionary`, and
 `seeds/params` for every other target. Seeds and findings are local
@@ -84,6 +87,20 @@ trained dictionary at several levels (also read as raw content, and with a
 12-bit window at level 22), with raw text, an empty dictionary (which must
 behave as none; this seed caught the first encoder mismatch) and the
 rejections: raw bytes as the Zstandard format and a truncated dictionary.
+
+The [comparison benchmark](benchmarking.md)'s cases are regressions too.
+`tests/benchmark_corpora.rs` generates its eight inputs with the
+benchmark's own generators (`testdata/alice29.txt`, Alice cycled to 1 MiB,
+the structured 64 KiB binary, xorshift data at 64 KiB and 1 MiB, 1 MiB of
+`a`, the 44-byte text, empty input), puts each behind the header for each
+of the benchmark's 24 levels (-5, -1 and 1 to 22, no flags), and replays
+all 192 through `differential_c` (byte identity with `ZSTD_compress2`) and
+`decode_roundtrip` (the reference's frames decode one-shot and in pieces).
+The 1 MiB inputs are cut to the targets' 256 KiB cap, as any payload is.
+The 44-byte text at every level is also committed as
+`regressions/{differential_c,decode_roundtrip}/bench-tiny-text-l<level>.bin`,
+and empty input at every level as
+`regressions/differential_c/boundary-bench-empty-l<level>.bin`.
 
 ## Campaigns
 
@@ -105,6 +122,14 @@ It now records only calls that made progress, and
 A 10-minute run of `decode_dictionary` from its committed regressions
 (2026-10-15) found no crashes or hangs: 952 new corpus items, 40% map
 coverage.
+
+A 10-minute run of all eleven targets (2026-10-18, after the 0.2.7
+encoder and decoder optimizations, seeds including the benchmark inputs)
+found no crashes or hangs: `differential_c` 1,470 new corpus items,
+`output_capacity` 605, `encoder_session` 1,731, `compressor_lifecycle`
+3,365, `parallel` 185, `parameter_parsing` 3,683, `decompress` 387,
+`decode_streaming` 1,119, `decode_roundtrip` 226, `decode_dictionary`
+1,174, `compress_dictionary` 2,746.
 
 ## Known gaps
 

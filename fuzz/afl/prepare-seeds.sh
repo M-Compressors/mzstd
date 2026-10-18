@@ -57,6 +57,16 @@ for path in "$tests"/golden-compression/* "$here/../../zstd-ffi/vendor/zstd/lib/
     done
 done
 
+# The comparison benchmark's text (its first 64 KiB) at one level per
+# strategy, and the benchmark inputs committed as regressions, so campaigns
+# start from what the published benchmarks time.
+alice="$here/../../testdata/alice29.txt"
+for level in -5 1 3 5 6 9 13 16 19 22; do
+    printf "$(printf '\\%03o' $((level + 10)))\\000" > "$params/bench-alice29-l$level"
+    dd if="$alice" bs="$max_bytes" count=1 2>/dev/null >> "$params/bench-alice29-l$level"
+done
+cp "$here"/regressions/differential_c/bench-*.bin "$params/"
+
 for path in "$tests"/golden-decompression/* "$tests"/golden-decompression-errors/*; do
     [ -f "$path" ] || continue
     dd if="$path" of="$frames/$(basename "$path")" bs="$max_bytes" count=1 2>/dev/null

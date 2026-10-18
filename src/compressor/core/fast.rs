@@ -18,7 +18,7 @@ use super::mem::{
 };
 use super::params::SHORT_CACHE_TAG_BITS;
 use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
-use super::window::HASH_READ_SIZE;
+use super::window::{HASH_READ_SIZE, WINDOW_START_INDEX};
 
 /// `kSearchStrength`.
 const SEARCH_STRENGTH: u32 = 8;
@@ -174,32 +174,46 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         // the table is still filling, a select spares the mispredictions.
         let warm = u64::from(block.start - prefix_start_index) >= 4 << cparams.hash_log;
         macro_rules! scan {
+            ($hlog:literal, $branchy:literal, $origin:expr) => {
+                compress_scan::<S, MLS, true, $hlog, $branchy, $origin>(
+                    simd, table, seq_store, &scan, ip0, reps,
+                )
+            };
+            ($hlog:literal, $branchy:literal) => {
+                scan!($hlog, $branchy, 0)
+            };
             ($hlog:literal) => {
                 if warm {
-                    compress_scan::<S, MLS, true, $hlog, true>(
-                        simd, table, seq_store, &scan, ip0, reps,
-                    )
+                    scan!($hlog, true)
                 } else {
-                    compress_scan::<S, MLS, true, $hlog, false>(
-                        simd, table, seq_store, &scan, ip0, reps,
-                    )
+                    scan!($hlog, false)
                 }
             };
         }
-        // The hash widths of the default parameters for large inputs
-        // (negative levels, levels 1 and 2) are compiled in with their
-        // match lengths: the hash shift and the table mask become
-        // constants, which frees two of the loop's registers.
-        match (MLS, cparams.hash_log) {
-            (6, 13) => scan!(13),
-            (7, 14) => scan!(14),
-            (6, 16) => scan!(16),
+        // The hash widths of the default parameters are compiled in with
+        // their match lengths: the hash shift and the table mask become
+        // constants, which frees two of the loop's registers. Large inputs
+        // (negative levels, levels 1 and 2) get both candidate checks.
+        // Inputs of at most 128 or 256 KiB (negative levels and level 1)
+        // span one or two blocks, whose table is still filling or holds at
+        // most twice the block's history: they take the select only, with
+        // the window's first index compiled in as well, which a one-shot
+        // frame's prefix starts at. That frees a third register and costs
+        // one instance per pair. Any other prefix takes the generic loop.
+        let first = prefix_start_index == WINDOW_START_INDEX;
+        match (MLS, cparams.hash_log, warm, first) {
+            (6, 13, ..) => scan!(13),
+            (7, 14, ..) => scan!(14),
+            (6, 16, ..) => scan!(16),
+            (5, 12, _, true) => scan!(12, false, WINDOW_START_INDEX),
+            (5, 13, _, true) => scan!(13, false, WINDOW_START_INDEX),
+            (6, 14, _, true) => scan!(14, false, WINDOW_START_INDEX),
             _ => scan!(0),
         }
     } else {
         let scan = scan(base);
         let ip0 = (ip0 - base) as usize;
-        compress_scan::<S, MLS, false, 0, false>(
+        compress_scan::<S, MLS, false, 0, false, 0>(
             simd,
             table,
             seq_store,
@@ -233,6 +247,11 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
 /// with branches (`BRANCHY`), or without: the offset is clamped into the
 /// history, so the load needs neither a branch nor a stand-in word, and a
 /// clamped offset never counts as a match.
+///
+/// Both conditions are folded into one value tested once. Written as
+/// `(loaded == word) & (at == clamped)`, LLVM split the range test back
+/// into a branch on x86, mispredicted on every fourth to fifth probe of a
+/// filling table: text at levels -5 to 2 took 5-17% longer.
 #[inline(always)]
 fn candidate_matches<const BRANCHY: bool>(history: &[u8], at: u32, word: u32) -> bool {
     if BRANCHY {
@@ -247,7 +266,8 @@ fn candidate_matches<const BRANCHY: bool>(history: &[u8], at: u32, word: u32) ->
         .first_chunk::<4>()
         .copied()
         .unwrap_or_default();
-    (u32::from_le_bytes(bytes) == word) & (at == clamped)
+    let differs = u32::from_le_bytes(bytes) ^ word;
+    (differs as usize | (at ^ clamped)) == 0
 }
 
 /// The bytes one `fast` block searches and the parameters it searches them
@@ -275,6 +295,9 @@ struct Scan<'a> {
 ///
 /// `IN_PREFIX` states that `scan.prefix_start` is zero, so the candidates'
 /// history is all of `src` and its lower bound the window index `origin`.
+/// `HLOG` and `ORIGIN`, when not zero, are `scan.hlog` and `scan.origin`
+/// compiled in; `BRANCHY` picks the candidate check
+/// ([`candidate_matches`]).
 #[inline(always)]
 fn compress_scan<
     S: Simd,
@@ -282,6 +305,7 @@ fn compress_scan<
     const IN_PREFIX: bool,
     const HLOG: u32,
     const BRANCHY: bool,
+    const ORIGIN: u32,
 >(
     simd: S,
     table: &mut [u32],
@@ -290,12 +314,11 @@ fn compress_scan<
     mut ip0: usize,
     reps: [u32; 2],
 ) -> (usize, [u32; 2]) {
-    let Scan {
-        src,
-        origin: base,
-        step_size,
-        ..
-    } = *scan;
+    let Scan { src, step_size, .. } = *scan;
+    // `ORIGIN`, when not zero, is `scan.origin` known at compile time; the
+    // caller selects it only when the two are equal.
+    debug_assert!(ORIGIN == 0 || ORIGIN == scan.origin);
+    let base = if ORIGIN == 0 { scan.origin } else { ORIGIN };
     // `HLOG`, when not zero, is the table's hash width known at compile
     // time; the caller selects it only when `scan.hlog` equals it.
     let hlog = if HLOG == 0 { scan.hlog } else { HLOG };
@@ -436,7 +459,7 @@ fn compress_scan<
 
         // _match:
         m_length += count_at_simd(simd, src, ip0 + m_length, match0 + m_length);
-        seq_store.store_seq_from(src, anchor, ip0 - anchor, offcode, m_length);
+        store_seq_wild(seq_store, src, anchor, ip0 - anchor, offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
@@ -469,6 +492,36 @@ fn compress_scan<
     (iend - anchor, [rep_offset1, rep_offset2])
 }
 
+/// [`SeqStore::store_seq_from`] for the fast search: a literal run of at
+/// most 16 bytes is copied as the 16-byte chunk at `anchor` (`ZSTD_copy16`)
+/// when `src` holds that many, and the excess is cut off again.
+///
+/// The chunk is appended straight from `src`, so it is not first copied to
+/// the stack, and the bounds test is `16 <= src.len() - anchor`, which
+/// cannot overflow (on Alice at level 1, 2.5% fewer instructions and 2-3%
+/// less time than the shared helper).
+#[inline(always)]
+fn store_seq_wild(
+    seq_store: &mut SeqStore,
+    src: &[u8],
+    anchor: usize,
+    lit_length: usize,
+    off_base: u32,
+    match_length: usize,
+) {
+    debug_assert!(seq_store.literals.len() + lit_length <= seq_store.max_nb_lit);
+    let literals = &mut seq_store.literals;
+    match src.get(anchor..).and_then(<[u8]>::first_chunk::<16>) {
+        Some(chunk) if lit_length <= 16 => {
+            let start = literals.len();
+            literals.extend_from_slice(chunk);
+            literals.truncate(start + lit_length);
+        }
+        _ => literals.extend_from_slice(&src[anchor..anchor + lit_length]),
+    }
+    seq_store.store_seq_only(lit_length, off_base, match_length);
+}
+
 /// `ZSTD_compressBlock_fast_extDict`: selects the variant compiled for
 /// the minimum match length, dispatched once per block.
 pub(crate) fn compress_block_ext_dict(
@@ -483,6 +536,37 @@ pub(crate) fn compress_block_ext_dict(
         7.. => compress_block_ext_dict_mls::<_, 7>(simd, ms, seq_store, rep, block),
         _ => compress_block_ext_dict_mls::<_, 4>(simd, ms, seq_store, rep, block),
     })
+}
+
+/// Whether the four bytes at offset `at` of `history`, which holds at
+/// least one word, equal `word`. The offset is clamped to the last whole
+/// word, so the load needs no branch, and a clamped offset never counts as
+/// a match: unlike [`candidate_matches`], the history length is not tested
+/// for a word on every probe.
+///
+/// # Panics
+///
+/// When `history` is shorter than four bytes.
+#[inline(always)]
+fn segment_matches(history: &[u8], at: u32, word: u32) -> bool {
+    let at = at as usize;
+    let clamped = at.min(history.len().wrapping_sub(4));
+    let differs = load32(history, clamped) ^ word;
+    (differs as usize | (at ^ clamped)) == 0
+}
+
+/// `ZSTD_count_2segments` for a match that starts in the external segment,
+/// kept out of line so its loops do not share the extDict search loop's
+/// register allocation (about 1% fewer instructions in that loop).
+#[inline(never)]
+fn count_from_ext(
+    window: &super::mem::Window<'_>,
+    ip: u32,
+    m: u32,
+    end: u32,
+    prefix_start: u32,
+) -> usize {
+    window.count_2segments(ip, m, end, prefix_start, prefix_start)
 }
 
 /// `ZSTD_compressBlock_fast_extDict_generic` for one minimum match length,
@@ -540,6 +624,33 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
             load32(src, (idx - base) as usize)
         }
     };
+    // Candidates below the prefix are searched in the external segment
+    // from its lowest valid index on, the others in `src`. `locate` picks
+    // the segment holding `idx` and its offset there with a select (the
+    // reference's `idxBase` cmov): a probed entry is about as likely to sit
+    // in either segment, so a branch on it is mispredicted often. An entry
+    // below `dict_start_index` becomes a large offset, which the candidate
+    // check rejects like the reference's `idx >= dictStartIndex` test.
+    // Both segments hold a whole word, as `segment_matches` requires: an
+    // external segment too short for one (whose words would all straddle
+    // into the prefix) is replaced by `src` addressed from the prefix
+    // start, where every index below the prefix is out of range.
+    let ext_history = ext.slice(dict_start_index, prefix_start_index);
+    let (ext_segment, ext_origin) = if ext_history.len() >= 4 {
+        (ext_history, dict_start_index)
+    } else {
+        (src, prefix_start_index)
+    };
+    // Only the slice goes through the select. The origin is added as a
+    // masked difference: given a select of both, LLVM turned the origin's
+    // half back into a branch.
+    let ext_shift = base.wrapping_sub(ext_origin);
+    let locate = |idx: u32| {
+        let in_ext = idx < prefix_start_index;
+        let history = core::hint::select_unpredictable(in_ext, ext_segment, src);
+        let shift = ext_shift & 0u32.wrapping_sub(u32::from(in_ext));
+        (history, idx.wrapping_sub(base).wrapping_add(shift))
+    };
     let byte_any = |idx: u32| {
         if idx < prefix_start_index {
             ext.byte(idx)
@@ -552,13 +663,7 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
     // external segment.
     let count_any = |ip: usize, m: u32, start: u32| {
         if start < prefix_start_index {
-            window.count_2segments(
-                index(ip),
-                m,
-                end_index,
-                prefix_start_index,
-                prefix_start_index,
-            )
+            count_from_ext(&window, index(ip), m, end_index, prefix_start_index)
         } else {
             count_slices_simd(simd, &src[ip..], &src[(m - base) as usize..])
         }
@@ -615,12 +720,8 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
                 }
             }
             {
-                let mval = if idx >= dict_start_index {
-                    read_any(idx)
-                } else {
-                    read32(ip0) ^ 1
-                };
-                if read32(ip0) == mval {
+                let (history, at) = locate(idx);
+                if segment_matches(history, at, read32(ip0)) {
                     break Found::Offset;
                 }
             }
@@ -633,12 +734,8 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
             current0 = index(ip0);
             table[hash0 & mask] = current0;
             {
-                let mval = if idx >= dict_start_index {
-                    read_any(idx)
-                } else {
-                    read32(ip0) ^ 1
-                };
-                if read32(ip0) == mval {
+                let (history, at) = locate(idx);
+                if segment_matches(history, at, read32(ip0)) {
                     break Found::Offset;
                 }
             }
@@ -658,7 +755,7 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
             }
         };
 
-        let (offcode, mut m_length, mut match0): (u32, usize, u32);
+        let (offcode, mut m_length, match0): (u32, usize, u32);
         match found {
             Found::Rep(rep_index) => {
                 let back = usize::from(src[ip0 - 1] == byte_any(rep_index - 1));
@@ -669,21 +766,21 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
             }
             Found::Offset => {
                 let offset = current0 - idx;
-                let low_match = if idx < prefix_start_index {
-                    dict_start_index
-                } else {
-                    prefix_start_index
-                };
-                match0 = idx;
                 offset_2 = offset_1;
                 offset_1 = offset;
                 offcode = offset_to_offbase(offset);
-                m_length = 4;
-                while ip0 > anchor && match0 > low_match && src[ip0 - 1] == byte_any(match0 - 1) {
+                // The match extends backwards within its own segment, down
+                // to the segment's lowest valid index (offset 0 there).
+                let (history, at) = locate(idx);
+                let mut at = at as usize;
+                let mut back = 0;
+                while ip0 > anchor && at > 0 && src[ip0 - 1] == history[at - 1] {
                     ip0 -= 1;
-                    match0 -= 1;
-                    m_length += 1;
+                    at -= 1;
+                    back += 1;
                 }
+                match0 = idx - back as u32;
+                m_length = back + 4;
             }
         }
 
@@ -1270,6 +1367,34 @@ pub(crate) mod tests {
         assert!(rep_index_ok(prefix_start, 0));
     }
 
+    #[test]
+    fn segment_candidates_match_only_whole_words_inside_the_history() {
+        let history = b"abcdefgh";
+        let word = |at: usize| u32::from_le_bytes(history[at..at + 4].try_into().unwrap());
+        assert!(segment_matches(history, 0, word(0)));
+        assert!(segment_matches(history, 4, word(4)));
+        assert!(!segment_matches(history, 4, word(3)));
+        // Offsets past the last whole word are clamped onto it and rejected
+        // even when the clamped word is the one sought.
+        assert!(!segment_matches(history, 5, word(4)));
+        assert!(!segment_matches(history, u32::MAX, word(4)));
+        assert!(segment_matches(&history[..4], 0, word(0)));
+    }
+
+    #[test]
+    fn ext_matches_continue_at_the_prefix_start() {
+        // Indices 10..14 are the external segment, 14.. the prefix.
+        let window = Window {
+            prefix: Mem::new(b"cdxyzabcdQ", 14),
+            ext: Mem::new(b"zzab", 10),
+        };
+        // "ab" at 12 continues as "cd" at 14; "abcd" at 19 matches four
+        // bytes, then 'Q' differs from 'x'.
+        assert_eq!(count_from_ext(&window, 19, 12, 24, 14), 4);
+        // A run ending inside the external segment stops there.
+        assert_eq!(count_from_ext(&window, 18, 10, 24, 14), 1);
+    }
+
     /// A dictionary over `bytes` from index `start`, with `ms`'s tables.
     fn dictionary<'a>(bytes: &'a [u8], start: u32, ms: &'a mut MatchState) -> DictMatchState<'a> {
         ms.window.dict_limit = start;
@@ -1341,6 +1466,73 @@ pub(crate) mod tests {
                 let size = compress_once_into(&mut engine, &requested, None, &input, 1, &mut dst)
                     .expect("compresses");
                 assert!(dst[..size] == expected[..], "{backend} level {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_inputs_take_the_compiled_in_widths_like_the_reference() {
+        // Up to 128 KiB the negative levels hash 5 bytes into 2^12 slots,
+        // up to 256 KiB into 2^13 and level 1 6 bytes into 2^14; a frame
+        // that starts the window takes those widths and its first index
+        // compiled in, in both of its blocks. A reused engine continues the
+        // window, so its second frame starts higher and takes the generic
+        // loop: both must write the reference's frames.
+        let inputs = [
+            corpus::text(100_000, 21),
+            corpus::text(200_000, 22),
+            corpus::binary(250_000, 23),
+            [corpus::random(70_000, 24), corpus::text(120_000, 25)].concat(),
+        ];
+        for level in [-5, -1, 1] {
+            let requested = RequestedParams {
+                compression_level: level,
+                ..RequestedParams::default()
+            };
+            for input in &inputs {
+                let expected = oracle::compress(input, level);
+                for backend in Backend::available() {
+                    let mut engine = Engine::with_backend(backend);
+                    for frame in 0..2 {
+                        let mut dst = vec![0u8; compress_bound(input.len()).expect("bound")];
+                        let size = compress_once_into(
+                            &mut engine,
+                            &requested,
+                            None,
+                            input,
+                            frame,
+                            &mut dst,
+                        )
+                        .expect("compresses");
+                        assert!(
+                            dst[..size] == expected[..],
+                            "{backend} level {level} {} bytes frame {frame}",
+                            input.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wild_literal_copies_store_what_the_shared_helper_stores() {
+        // Runs up to 16 bytes take the chunk while it fits before the end
+        // of `src`, longer runs and runs near the end the exact copy.
+        let src: Vec<u8> = (0..64u8).map(|byte| byte.wrapping_mul(37)).collect();
+        for anchor in 0..src.len() {
+            for lit_length in 0..=(src.len() - anchor).min(40) {
+                let mut wild = SeqStore::default();
+                let mut shared = SeqStore::default();
+                wild.reserve(1 << 10, 4);
+                shared.reserve(1 << 10, 4);
+                wild.literals.push(0xAA);
+                shared.literals.push(0xAA);
+                store_seq_wild(&mut wild, &src, anchor, lit_length, 7, 5);
+                shared.store_seq_from(&src, anchor, lit_length, 7, 5);
+                assert_eq!(wild.literals, shared.literals, "{anchor} {lit_length}");
+                assert_eq!(wild.literals[1..], src[anchor..anchor + lit_length]);
+                assert_eq!(wild.sequences, shared.sequences, "{anchor} {lit_length}");
             }
         }
     }

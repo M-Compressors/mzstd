@@ -154,13 +154,19 @@ stateDiagram-v2
 
 - `begin_frame` accepts a frame only with a declared size that fits in the
   rest of `dst`, as `SliceOutput` does, and records `frame_end`.
-- `reserve(block_max)` zeroes up to
-  `min(filled + block_max + WILDCOPY_OVERLENGTH, frame_end)` and returns the
-  filled prefix up to there. Each byte is zeroed at most once, and only inside
-  a frame whose size is declared, so on success nothing past `written` has
-  been written. The cut is at most a block plus the copies' overlength, where
-  `SliceOutput` hands over the whole frame; decoded bytes are the same, and a
-  block that would pass `frame_end` fails `OutputFull` either way.
+- `reserve(block_max)` zeroes nothing: it bounds the block's room at
+  `min(filled + block_max + WILDCOPY_OVERLENGTH, frame_end)` and hands the
+  block itself over as its `BlockOutput`. The sequence loop then extends
+  the zeroed prefix on demand (`grow`, 4 KiB at a time, never past that
+  bound) as it reaches the prefix's end, and the block's trailing literals
+  are written through `put`. Each byte is zeroed at most once, and only
+  inside a frame whose size is declared, so on success nothing past
+  `written` has been written. The cut is at most a block plus the copies'
+  overlength, where `SliceOutput` hands over the whole frame; decoded
+  bytes are the same, and a block that would pass `frame_end` fails
+  `OutputFull` either way. Unlike `VecOutput`, it cannot append long
+  sequences without zeroing them first: `BorrowedBuf` cannot read its
+  filled part while appending to it.
 - `place` writes raw and RLE blocks in one pass: bytes already zeroed for an
   earlier `reserve` are overwritten through `filled_mut`, the rest is
   appended (`BorrowedCursor::append` or `append_fill` with the run byte). A
@@ -224,10 +230,12 @@ was unchanged from before this path existed (2.84 ms → 2.81 ms).
 
 ## Known gaps
 
-- `decompress_to_uninit` zeroes every compressed block's output before
-  decoding into it, so those bytes are written twice. Safe code cannot hand
-  the decoder memory it has not initialized. Raw and RLE blocks are written
-  once.
+- `decompress_to_uninit` zeroes compressed blocks' output, 4 KiB at a
+  time just ahead of the sequence loop, before decoding into it, so those
+  bytes are written twice. Safe code cannot hand the decoder memory it has
+  not initialized, and `BorrowedBuf` cannot read its filled part while
+  appending, so the appends `decompress` uses for long sequences are not
+  available here. Raw and RLE blocks are written once.
 - Through the C ABI (`mzstd-ffi/benches/one_shot.rs`, same host), a 64-byte frame at level -5 decodes in 30 ns instead of
   25 ns, from the `BorrowedBuf` bookkeeping; mbrotli zeroes destinations of
   at most 1 KiB instead, which mzstd does not, to keep "nothing past the

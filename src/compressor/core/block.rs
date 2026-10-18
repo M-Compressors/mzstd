@@ -118,7 +118,11 @@ pub(crate) fn build_seq_store(
     engine.seq_store.reset();
     let ms = &mut engine.ms;
     ms.backend = engine.backend;
-    ms.opt.literal_compression = engine.applied.literal_compression;
+    // Only the optimal parser reads it, and its strategies allocate the
+    // state when the frame begins.
+    if let Some(opt) = ms.opt.get_mut() {
+        opt.literal_compression = engine.applied.literal_compression;
+    }
 
     // Limited update after a very long match.
     let curr = start;

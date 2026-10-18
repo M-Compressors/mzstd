@@ -91,21 +91,22 @@ python3 benchmarks/comparison/level_docs.py \
 python3 benchmarks/comparison/plot.py \
   --csv docs/benchmarks/encoder-comparison.csv \
   --output docs/benchmarks/encoders/charts \
-  --subtitle 'i7-13700KF; mzstd 0.2.5; 20 samples; 1 core; 2026-10-15'
+  --subtitle 'i7-13700KF; mzstd 0.2.7; 20 samples; 1 core; 2026-10-18'
 ```
 
 `level_docs.py` writes the index, 24 level pages and their detailed charts.
 `plot.py` writes `overview.svg`, `throughput.svg` and `size.svg` into the same
 charts directory. All eight corpora contribute to the medians. The published
-encoder CSV is `enc-20261015c` (2026-10-15), with its
-[size manifest](benchmarks/encoder-comparison-2026-10-15/sizes.csv) and
-[raw Criterion samples](benchmarks/encoder-comparison-2026-10-15/criterion-samples.json.gz).
+encoder CSV is `enc-20261018` (2026-10-18), with its
+[size manifest](benchmarks/encoder-comparison-2026-10-18/sizes.csv) and
+[raw Criterion samples](benchmarks/encoder-comparison-2026-10-18/criterion-samples.json.gz).
 It uses 20 samples, 0.2 s warmup and 0.5 s requested measurement on CPU 2,
 beside the decoder sweep on CPU 6; see the
 [recorded command and limits](benchmarks/encoder-comparison.md).
-The latest decoder CSV is `dec-20261015c` (2026-10-15), with its
-[size manifest](benchmarks/decoder-comparison-2026-10-15/sizes.csv) and
-[raw Criterion samples](benchmarks/decoder-comparison-2026-10-15/criterion-samples.json.gz). Each
+The latest decoder CSV is `dec-20261018` (2026-10-18), with its
+[size manifest](benchmarks/decoder-comparison-2026-10-18/sizes.csv) and
+[raw Criterion samples](benchmarks/decoder-comparison-2026-10-18/criterion-samples.json.gz),
+recorded with the same sampling on CPU 6. Each
 environment record identifies the measured sources; regenerating charts reuses
 those measurements and does not rerun the benchmark. When publishing a fresh
 run, update the CSV, archived manifest and environment record together before

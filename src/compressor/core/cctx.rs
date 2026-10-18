@@ -247,10 +247,25 @@ impl RequestedParams {
 
 /// Entropy tables and repeat offsets a block inherits
 /// (`ZSTD_compressedBlockState_t`).
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BlockState {
     pub(crate) entropy: Tables,
     pub(crate) rep: [u32; REP_NUM],
+}
+
+impl Clone for BlockState {
+    fn clone(&self) -> Self {
+        Self {
+            entropy: self.entropy.clone(),
+            rep: self.rep,
+        }
+    }
+
+    /// Field by field, so written tables are copied into place.
+    fn clone_from(&mut self, source: &Self) {
+        self.entropy.clone_from(&source.entropy);
+        self.rep = source.rep;
+    }
 }
 
 impl BlockState {
@@ -302,8 +317,16 @@ pub(crate) struct Engine {
 impl Engine {
     /// A context with no frame begun and no tables allocated, on the
     /// detected backend.
+    #[cfg(any(test, not(feature = "no_std")))]
     pub(crate) fn new() -> Self {
+        Self::with_backend(Backend::default())
+    }
+
+    /// A context with no frame begun whose kernels run on `backend`.
+    pub(crate) fn with_backend(backend: Backend) -> Self {
         let applied = RequestedParams::default().resolve(CONTENT_SIZE_UNKNOWN);
+        let mut ms = MatchState::empty(applied.cparams, applied.use_row_match_finder);
+        ms.backend = backend;
         Self {
             applied,
             stage: Stage::Created,
@@ -317,22 +340,12 @@ impl Engine {
             seq_store: SeqStore::default(),
             prev: Box::default(),
             next: Box::default(),
-            ms: MatchState::empty(applied.cparams, applied.use_row_match_finder),
+            ms,
             ldm: LdmState::default(),
             ldm_store: RawSeqStore::default(),
-            backend: Backend::default(),
+            backend,
             dict_id: 0,
         }
-    }
-
-    /// A context with no frame begun whose kernels run on `backend`.
-    pub(crate) fn with_backend(backend: Backend) -> Self {
-        let mut engine = Self {
-            backend,
-            ..Self::new()
-        };
-        engine.ms.backend = backend;
-        engine
     }
 
     /// Starts a frame (`ZSTD_resetCCtx_internal` without dictionaries).
@@ -871,6 +884,28 @@ pub(crate) fn rle_compress_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_states_start_without_tables_and_copy_field_by_field() {
+        let engine = Engine::new();
+        assert_eq!(engine.prev.entropy.heap_bytes(), 0);
+        assert_eq!(engine.next.entropy.heap_bytes(), 0);
+        assert_eq!(engine.ms.opt.heap_bytes(), 0);
+
+        let mut source = BlockState {
+            rep: [7, 8, 9],
+            ..BlockState::default()
+        };
+        source.entropy.fse.offcode.table_log = 5;
+        source.entropy.fse.offcode_repeat = FseRepeat::Valid;
+        let copy = source.clone();
+        assert_eq!(copy.rep, source.rep);
+        assert_eq!(copy.entropy, source.entropy);
+        let mut target = BlockState::default();
+        target.clone_from(&source);
+        assert_eq!(target.rep, [7, 8, 9]);
+        assert_eq!(target.entropy, source.entropy);
+    }
 
     #[test]
     fn compress_bound_matches_the_reference_formula() {

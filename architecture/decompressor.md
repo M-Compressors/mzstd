@@ -481,8 +481,9 @@ Invariants each layer relies on:
   zero last byte is rejected); streams are valid only when consumed
   exactly. `BitContainer` (Huffman and sequence streams) is refilled where
   the reference refills, and once reads pass the start its consumed count
-  stays above 64, so such streams are rejected; `ReverseBitReader`
-  (Huffman weights) reads zeros past the start and remembers it. Reads are
+  stays above 64, so such streams are rejected; the Huffman weight decoder
+  reads zeros past the start through the same container and checks
+  `overflowed` (`BIT_DStream_overflow`) as the reference's FSE decoder does. Reads are
   at most 56 bits (the widest is a 31-bit offset).
 - **FSE.** `read_distribution` accepts accuracy logs `5..=15` and requires
   the probabilities to sum exactly to the table size with no symbol above
@@ -568,7 +569,9 @@ reference's, with these deliberate exceptions:
   front only up to 32 bytes per unread input byte, and grow with the output
   beyond that ([output paths](decoder-performance.md#output-paths)).
 - **Uninitialized output** has no `decompress_into` variant, and the
-  one-shot path zeroes compressed blocks' output before decoding into it
-  ([uninitialized output](decoder-uninit-output.md#known-gaps)). There is
+  one-shot path zeroes compressed blocks' output, 4 KiB at a time just
+  ahead of the sequence loop, before decoding into it
+  ([uninitialized output](decoder-uninit-output.md#known-gaps)).
+  `decompress` zeroes only the room of sequences shorter than 1 KiB. There is
   no exact-size output contract, unlike mbrotli.
 - **Legacy formats** (zstd v0.x) are not decoded.

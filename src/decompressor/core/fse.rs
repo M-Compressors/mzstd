@@ -14,7 +14,7 @@
 
 use alloc::boxed::Box;
 
-use super::bits::{ForwardBitReader, ReverseBitReader};
+use super::bits::{BitContainer, ForwardBitReader};
 use crate::decompressor::InvalidDataKind;
 use crate::shared::format::{MAX_LIT, highbit32};
 
@@ -90,6 +90,8 @@ pub(crate) struct FseTable {
 pub(crate) const SEQ_TABLE_LOG_MAX: u32 = 9;
 /// Rows of the largest [`SeqTable`]; smaller tables use a prefix.
 pub(crate) const SEQ_TABLE_SIZE: usize = 1 << SEQ_TABLE_LOG_MAX;
+/// Room for the largest sequence alphabet (match lengths, 53 codes).
+const SEQ_SYMBOLS: usize = 64;
 /// Masks a state into [`SEQ_TABLE_SIZE`].
 const SEQ_STATE_MASK: usize = SEQ_TABLE_SIZE - 1;
 
@@ -246,30 +248,77 @@ impl Default for SeqTable {
 }
 
 /// Spreads a distribution over `1 << table_log` cells (RFC 8878 section
-/// 4.1.1.1), writing each cell's symbol into `symbols`, and leaves in `next`
-/// the first state of each symbol.
-fn spread(counts: &[i16], table_log: u32, symbols: &mut [u8], next: &mut [u16; MAX_SYMBOLS]) {
+/// 4.1.1.1), at most `N`, writing each cell's symbol into `symbols`, and
+/// leaves in `next` the first state of each symbol: the reference's
+/// `ZSTD_buildFSETable_body`. `M` is `N + 8`, the room the fast path's
+/// eight-byte stores need.
+///
+/// Without "less than one" symbols, which the reference's encoder avoids
+/// for small blocks, the symbols are first laid down in order eight at a
+/// time and then scattered with a fixed step, which needs no per-cell
+/// tests; otherwise each cell skips the cells those symbols hold.
+#[inline(always)]
+fn spread<const N: usize, const M: usize>(
+    counts: &[i16],
+    table_log: u32,
+    symbols: &mut [u8; N],
+    next: &mut [u16; MAX_SYMBOLS],
+) {
+    const { assert!(N.is_power_of_two() && M == N + 8) };
     let size = 1usize << table_log;
+    debug_assert!(size <= N);
+    // Every index below is masked into the table, which changes nothing
+    // for the distributions `read_distribution` accepts (they fill the
+    // table exactly) and spares the bounds checks.
+    let mask = (size - 1) & (N - 1);
+    let step = (size >> 1) + (size >> 3) + 3;
     // "Less than one" symbols take single cells from the end.
     let mut high = size;
-    for (symbol, &count) in counts.iter().enumerate() {
+    for ((symbol, &count), next) in counts.iter().enumerate().zip(next.iter_mut()) {
         if count == -1 {
             high -= 1;
-            symbols[high] = symbol as u8;
-            next[symbol] = 1;
+            symbols[high & (N - 1)] = symbol as u8;
+            *next = 1;
         } else {
-            next[symbol] = count.max(0) as u16;
+            *next = count.max(0) as u16;
         }
     }
-    let step = (size >> 1) + (size >> 3) + 3;
-    let mask = size - 1;
-    let mut position = 0;
-    for (symbol, &count) in counts.iter().enumerate() {
-        for _ in 0..count.max(0) {
-            symbols[position] = symbol as u8;
-            position = (position + step) & mask;
-            while position >= high {
+    if high == size {
+        let mut laid = [0u8; M];
+        let mut position = 0usize;
+        let mut pattern = 0u64;
+        for &count in counts {
+            let count = count.max(0) as usize;
+            let mut offset = 0;
+            loop {
+                // A symbol without cells after the last cell writes into
+                // the slack, as the reference's does.
+                let at = (position + offset).min(N);
+                laid[at..at + 8].copy_from_slice(&pattern.to_le_bytes());
+                offset += 8;
+                if offset >= count {
+                    break;
+                }
+            }
+            position += count;
+            pattern = pattern.wrapping_add(0x0101_0101_0101_0101);
+        }
+        let mut position = 0;
+        // Tables have at least 32 cells, so they pair up.
+        for &[first, second] in laid[..size].as_chunks::<2>().0 {
+            symbols[position & mask] = first;
+            symbols[(position + step) & mask] = second;
+            position = (position + 2 * step) & mask;
+        }
+    } else {
+        let mut position = 0;
+        for (symbol, &count) in counts.iter().enumerate() {
+            for _ in 0..count.max(0) {
+                symbols[position] = symbol as u8;
                 position = (position + step) & mask;
+                while position >= high {
+                    position = (position + step) & mask;
+                }
             }
         }
     }
@@ -278,13 +327,14 @@ fn spread(counts: &[i16], table_log: u32, symbols: &mut [u8], next: &mut [u16; M
 /// The bit count and next-state base of a cell whose symbol's state
 /// counter reads `next`, in a table of `1 << table_log` cells.
 const fn transition(next: u16, table_log: u32) -> (u8, u16) {
-    // Every placed symbol has a non-zero count; `max(1)` only keeps the
-    // arithmetic total for a table nothing else would accept.
-    let state = if next == 0 { 1 } else { next as u32 };
-    let nb_bits = table_log - highbit32(state);
+    // Every placed symbol has a non-zero count; the low bit, which moves
+    // no other count's top bit, only keeps the arithmetic total for a
+    // table nothing else would accept.
+    let state = next as u32;
+    let nb_bits = table_log.wrapping_sub(highbit32(state | 1)) & 31;
     (
         nb_bits as u8,
-        ((state << nb_bits) - (1u32 << table_log)) as u16,
+        (state << nb_bits).wrapping_sub(1u32 << table_log) as u16,
     )
 }
 
@@ -370,7 +420,12 @@ impl FseTable {
         let size = 1usize << table_log;
         let mut symbols = [0u8; FSE_TABLE_SIZE];
         let mut next = [0u16; MAX_SYMBOLS];
-        spread(counts, table_log, &mut symbols[..size], &mut next);
+        spread::<FSE_TABLE_SIZE, { FSE_TABLE_SIZE + 8 }>(
+            counts,
+            table_log,
+            &mut symbols,
+            &mut next,
+        );
         let mut entries = [FseEntry::default(); FSE_TABLE_SIZE];
         for (entry, &symbol) in entries.iter_mut().zip(&symbols[..size]) {
             let next_state = &mut next[usize::from(symbol)];
@@ -394,20 +449,18 @@ impl FseTable {
     }
 
     /// The row for `state`. States come from this table's own transitions,
-    /// so they are always in range; an out-of-range state yields row zero.
+    /// so they are always in range; the mask only spares the bounds check.
+    #[inline(always)]
     pub(crate) fn entry(&self, state: usize) -> FseEntry {
-        self.entries.get(state).copied().unwrap_or_default()
+        self.entries[state & (FSE_TABLE_SIZE - 1)]
     }
 
-    /// Reads an initial state.
-    pub(crate) fn initial_state(&self, bits: &mut ReverseBitReader<'_>) -> usize {
-        bits.read(self.log()) as usize
-    }
-
-    /// Advances `state` past the symbol it decoded.
-    pub(crate) fn next_state(&self, state: usize, bits: &mut ReverseBitReader<'_>) -> usize {
-        let entry = self.entry(state);
-        usize::from(entry.new_state) + bits.read(u32::from(entry.nb_bits)) as usize
+    /// Decodes the symbol of `state` and advances it past the symbol.
+    #[inline(always)]
+    fn decode(&self, state: &mut usize, bits: &mut BitContainer) -> u8 {
+        let entry = self.entry(*state);
+        *state = usize::from(entry.new_state) + bits.read(u32::from(entry.nb_bits)) as usize;
+        entry.symbol
     }
 }
 
@@ -426,18 +479,28 @@ impl SeqTable {
         let size = 1usize << table_log;
         let mut symbols = [0u8; SEQ_TABLE_SIZE];
         let mut next = [0u16; MAX_SYMBOLS];
-        spread(counts, table_log, &mut symbols[..size], &mut next);
+        spread::<SEQ_TABLE_SIZE, { SEQ_TABLE_SIZE + 8 }>(
+            counts,
+            table_log,
+            &mut symbols,
+            &mut next,
+        );
+        // Each symbol's baseline and extra bits, by symbol: alphabets have
+        // at most 53 symbols, and the spread only places described ones.
+        let mut symbol_rows = [SeqRow::default(); SEQ_SYMBOLS];
+        for ((row, &base), &extra) in symbol_rows.iter_mut().zip(bases).zip(extra_bits) {
+            *row = SeqRow::new(base, 0, extra, 0);
+        }
         for (row, &symbol) in self.rows.iter_mut().zip(&symbols[..size]) {
             let symbol = usize::from(symbol);
             let next_state = &mut next[symbol];
             let (nb_bits, state) = transition(*next_state, table_log);
-            *row = SeqRow::new(
-                bases.get(symbol).copied().unwrap_or_default(),
-                state,
-                extra_bits.get(symbol).copied().unwrap_or_default(),
-                nb_bits,
-            );
             *next_state += 1;
+            *row = SeqRow {
+                next_state: state,
+                nb_bits: BitCount::new(nb_bits),
+                ..symbol_rows[symbol & (SEQ_SYMBOLS - 1)]
+            };
         }
         self.log = table_log;
     }
@@ -483,11 +546,14 @@ pub(crate) fn seq_row(rows: &[SeqRow; SEQ_TABLE_SIZE], state: usize) -> &SeqRow 
 impl SeqTable {}
 
 /// Decodes an FSE-compressed Huffman weight series into `weights`, returning
-/// how many weights it holds.
+/// how many weights it holds: the reference's `FSE_decompress_wksp`.
 ///
-/// Two states share one table and alternate; decoding stops once a state
-/// update reads past the stream start, after emitting the other state's
-/// symbol, exactly as the reference `FSE_decompress_wksp` does.
+/// Two states share one table and alternate. While a whole word can be
+/// refilled and four more weights fit, four symbols decode per refill with
+/// no checks: they read at most 24 bits of the 57 a refill provides. Then
+/// each symbol is followed by a refill, and decoding stops once a state
+/// update read past the stream start, after emitting the other state's
+/// symbol, exactly as the reference does.
 pub(crate) fn decode_weights(
     src: &[u8],
     weights: &mut [u8; MAX_WEIGHTS + 1],
@@ -499,24 +565,30 @@ pub(crate) fn decode_weights(
     }
     let table = FseTable::from_distribution(distribution.counts(), distribution.table_log);
     let stream = src.get(used..).ok_or(invalid)?;
-    let mut bits = ReverseBitReader::new(stream).ok_or(invalid)?;
-    let mut states = [
-        table.initial_state(&mut bits),
-        table.initial_state(&mut bits),
-    ];
+    let mut bits = BitContainer::new(stream).ok_or(invalid)?;
+    let log = table.log();
+    let mut states = [bits.read(log) as usize, bits.read(log) as usize];
     if bits.overflowed() {
         return Err(invalid);
     }
+    bits.reload(stream);
     let capacity = MAX_WEIGHTS;
     let mut count = 0;
+    // `&`, not `&&`: the reference refills before it tests the room.
+    while bits.reload(stream) & (count + 3 < capacity) {
+        for (turn, weight) in [0, 1, 0, 1].into_iter().zip(&mut weights[count..count + 4]) {
+            *weight = table.decode(&mut states[turn], &mut bits);
+        }
+        count += 4;
+    }
     let mut turn = 0;
     loop {
         if count + 2 > capacity {
             return Err(invalid);
         }
-        weights[count] = table.entry(states[turn]).symbol;
+        weights[count] = table.decode(&mut states[turn], &mut bits);
         count += 1;
-        states[turn] = table.next_state(states[turn], &mut bits);
+        bits.reload(stream);
         if bits.overflowed() {
             weights[count] = table.entry(states[1 - turn]).symbol;
             return Ok(count + 1);
@@ -646,6 +718,88 @@ mod tests {
         }
     }
 
+    /// The spread by its definition: one cell at a time, skipping the
+    /// cells of "less than one" symbols.
+    fn naive_spread(counts: &[i16], table_log: u32) -> (Vec<u8>, Vec<u16>) {
+        let size = 1usize << table_log;
+        let mut symbols = alloc::vec![0u8; size];
+        let mut next = alloc::vec![0u16; MAX_SYMBOLS];
+        let mut high = size;
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count == -1 {
+                high -= 1;
+                symbols[high] = symbol as u8;
+                next[symbol] = 1;
+            } else {
+                next[symbol] = count as u16;
+            }
+        }
+        let step = (size >> 1) + (size >> 3) + 3;
+        let mut position = 0;
+        for (symbol, &count) in counts.iter().enumerate() {
+            for _ in 0..count.max(0) {
+                symbols[position] = symbol as u8;
+                position = (position + step) & (size - 1);
+                while position >= high {
+                    position = (position + step) & (size - 1);
+                }
+            }
+        }
+        (symbols, next)
+    }
+
+    /// A distribution of `symbols` symbols filling `1 << table_log` cells,
+    /// with `low` "less than one" symbols and trailing zeros.
+    fn distribution(table_log: u32, symbols: usize, low: usize, seed: u64) -> Vec<i16> {
+        let mut counts = alloc::vec![0i16; symbols];
+        let mut left = (1i32 << table_log) - low as i32;
+        let mut state = seed;
+        for (index, count) in counts.iter_mut().enumerate() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if index < low {
+                *count = -1;
+            } else if index + 3 < symbols && left > 0 {
+                let take = ((state >> 33) as i32 % 40).min(left);
+                *count = take as i16;
+                left -= take;
+            }
+        }
+        // The last described symbol before the trailing zeros takes the rest.
+        let last = symbols.saturating_sub(3).max(low);
+        counts[last] += left as i16;
+        counts
+    }
+
+    #[test]
+    fn both_spreads_place_symbols_by_their_definition() {
+        for table_log in 5..=SEQ_TABLE_LOG_MAX {
+            for (low, seed) in [(0, 1), (0, 2), (1, 3), (4, 4), (0, 5)] {
+                for symbols in [8, 36, 53] {
+                    let counts = distribution(table_log, symbols, low, seed);
+                    let mut cells = [0u8; SEQ_TABLE_SIZE];
+                    let mut next = [0u16; MAX_SYMBOLS];
+                    spread::<SEQ_TABLE_SIZE, { SEQ_TABLE_SIZE + 8 }>(
+                        &counts, table_log, &mut cells, &mut next,
+                    );
+                    let (expected, expected_next) = naive_spread(&counts, table_log);
+                    let size = 1 << table_log;
+                    assert_eq!(&cells[..size], &expected[..], "log {table_log} low {low}");
+                    assert_eq!(&next[..], &expected_next[..]);
+                }
+            }
+        }
+        // A full table followed by zero-probability symbols.
+        let mut counts = alloc::vec![0i16; 40];
+        counts[..32].fill(16);
+        let (expected, _) = naive_spread(&counts, 9);
+        let mut cells = [0u8; SEQ_TABLE_SIZE];
+        let mut next = [0u16; MAX_SYMBOLS];
+        spread::<SEQ_TABLE_SIZE, { SEQ_TABLE_SIZE + 8 }>(&counts, 9, &mut cells, &mut next);
+        assert_eq!(&cells[..], &expected[..]);
+    }
+
     #[test]
     fn an_rle_sequence_table_reads_no_bits() {
         let mut table = SeqTable::default();
@@ -676,6 +830,7 @@ mod tests {
                 (u32::from(entry.nb_bits), usize::from(entry.new_state))
             );
         }
+        // States past a small table wrap into its unused rows.
         assert_eq!(
             FseTable::from_distribution(&[32], 5).entry(99),
             FseEntry::default()

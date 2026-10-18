@@ -1,19 +1,21 @@
-# Compression comparison — 2026-10-15 (mzstd 0.2.5)
+# Compression comparison — 2026-10-18 (mzstd 0.2.7)
 
 [Benchmark index](README.md) · [Results by level](encoders/README.md)
 
-The [384-row CSV](encoder-comparison.csv) records mzstd 0.2.5 (the working
-tree on `39d1ae4` that became this release) against zstd 1.5.7, under the
-Criterion baseline `enc-20261015c`. The median speed relative to C is
-**1.099×** over all 192 dataset/level pairs, and mzstd has the lower mean
-latency in **157** of them. The fastest levels gained the most: the level
-medians at -5 and -1 rose from 1.08× and 1.13× to 1.21×. Alice text at
-levels -5 to 1 measures 0.89–0.94×, cyclic Alice at 1 MiB 0.97–1.06×.
+The [384-row CSV](encoder-comparison.csv) records mzstd 0.2.7 (the working
+tree on `eb10fd0` that becomes this release) against zstd 1.5.7, under the
+Criterion baseline `enc-20261018`. The median speed relative to C is
+**1.112×** over all 192 dataset/level pairs, and mzstd has the lower mean
+latency in **166** of them. The same sweep of the tree before this
+release's changes (`enc-before`, same host, settings and day) measured
+1.086× and 159 pairs. The fastest levels stay the strongest (1.24× at
+levels -5 and -1); Alice text at levels -5 to 1 rose from 0.87-0.89× to
+0.92-0.94×, and at levels 2 and 3 to 0.98× and 1.03×.
 
 The [environment record](encoder-comparison-environment.json) identifies the
 measured source files and binary by SHA-256. The
-[size manifest](encoder-comparison-2026-10-15/sizes.csv) and
-[raw Criterion samples and estimates](encoder-comparison-2026-10-15/criterion-samples.json.gz)
+[size manifest](encoder-comparison-2026-10-18/sizes.csv) and
+[raw Criterion samples and estimates](encoder-comparison-2026-10-18/criterion-samples.json.gz)
 are archived with this run. The [changelog](../../CHANGELOG.md) describes the
 encoder changes.
 
@@ -29,33 +31,33 @@ Higher speed and lower output are better.
 
 | Level | mzstd median speed / C ↑ | mzstd median output / C ↓ |
 | ---: | ---: | ---: |
-| -5 | 1.213× | 1.000× |
-| -1 | 1.210× | 1.000× |
-| 1 | 1.131× | 1.000× |
-| 2 | 1.090× | 1.000× |
-| 3 | 1.037× | 1.000× |
-| 4 | 0.996× | 1.000× |
-| 5 | 1.072× | 1.000× |
-| 6 | 1.087× | 1.000× |
-| 7 | 1.086× | 1.000× |
-| 8 | 1.095× | 1.000× |
-| 9 | 1.104× | 1.000× |
-| 10 | 1.124× | 1.000× |
-| 11 | 1.058× | 1.000× |
-| 12 | 1.062× | 1.000× |
-| 13 | 1.074× | 1.000× |
-| 14 | 1.037× | 1.000× |
-| 15 | 1.014× | 1.000× |
-| 16 | 1.090× | 1.000× |
-| 17 | 1.093× | 1.000× |
-| 18 | 1.106× | 1.000× |
+| -5 | 1.239× | 1.000× |
+| -1 | 1.245× | 1.000× |
+| 1 | 1.148× | 1.000× |
+| 2 | 1.142× | 1.000× |
+| 3 | 1.100× | 1.000× |
+| 4 | 1.040× | 1.000× |
+| 5 | 1.095× | 1.000× |
+| 6 | 1.115× | 1.000× |
+| 7 | 1.109× | 1.000× |
+| 8 | 1.122× | 1.000× |
+| 9 | 1.128× | 1.000× |
+| 10 | 1.095× | 1.000× |
+| 11 | 1.074× | 1.000× |
+| 12 | 1.075× | 1.000× |
+| 13 | 1.078× | 1.000× |
+| 14 | 1.048× | 1.000× |
+| 15 | 1.071× | 1.000× |
+| 16 | 1.116× | 1.000× |
+| 17 | 1.107× | 1.000× |
+| 18 | 1.110× | 1.000× |
 | 19 | 1.114× | 1.000× |
-| 20 | 1.123× | 1.000× |
-| 21 | 1.132× | 1.000× |
-| 22 | 1.104× | 1.000× |
+| 20 | 1.113× | 1.000× |
+| 21 | 1.116× | 1.000× |
+| 22 | 1.111× | 1.000× |
 
-The unrounded overall median is **1.098681×**. mzstd has a lower mean latency
-in **157 of 192** pairs; in 145 of those, its individual 95% confidence interval
+The unrounded overall median is **1.112091×**. mzstd has a lower mean latency
+in **166 of 192** pairs; in 160 of those, its individual 95% confidence interval
 for mean latency lies wholly below C's. These intervals have no adjustment for
 multiple comparisons.
 
@@ -63,27 +65,27 @@ The medians over all 24 levels for each dataset show the workload differences:
 
 | Dataset | mzstd median speed / C ↑ |
 | --- | ---: |
-| empty | 2.437× |
-| tiny-text | 1.609× |
-| alice29 | 0.965× |
-| text-1m | 1.015× |
-| binary-64k | 1.105× |
-| random-64k | 1.053× |
-| random-1m | 1.061× |
-| repeated-1m | 1.133× |
+| empty | 4.340× |
+| tiny-text | 2.096× |
+| alice29 | 1.021× |
+| text-1m | 1.041× |
+| binary-64k | 1.107× |
+| random-64k | 1.071× |
+| random-1m | 1.048× |
+| repeated-1m | 1.182× |
 
 Text results at selected levels:
 
 | Dataset | Level | mzstd, MiB/s ↑ | C, MiB/s ↑ | Speed / C ↑ | Frame bytes, both |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| alice29 | 1 | 358.88 | 402.82 | 0.891× | 59,657 |
-| alice29 | 3 | 283.78 | 298.26 | 0.951× | 56,970 |
-| alice29 | 9 | 54.29 | 57.56 | 0.943× | 52,188 |
-| alice29 | 19 | 5.83 | 5.39 | 1.081× | 49,211 |
-| text-1m | 1 | 2661.05 | 2510.61 | 1.060× | 61,206 |
-| text-1m | 3 | 1722.21 | 1756.34 | 0.981× | 55,878 |
-| text-1m | 9 | 395.20 | 396.17 | 0.998× | 52,381 |
-| text-1m | 19 | 37.37 | 33.74 | 1.107× | 49,285 |
+| alice29 | 1 | 383.45 | 417.42 | 0.919× | 59,657 |
+| alice29 | 3 | 300.61 | 292.42 | 1.028× | 56,970 |
+| alice29 | 9 | 55.49 | 57.12 | 0.972× | 52,188 |
+| alice29 | 19 | 5.86 | 5.45 | 1.077× | 49,211 |
+| text-1m | 1 | 2718.64 | 2518.65 | 1.079× | 61,206 |
+| text-1m | 3 | 1911.37 | 1786.20 | 1.070× | 55,878 |
+| text-1m | 9 | 422.75 | 430.27 | 0.983× | 52,381 |
+| text-1m | 19 | 38.83 | 34.93 | 1.112× | 49,285 |
 
 Every mzstd frame passed byte-for-byte comparison with zstd and decoded back
 to the original input through zstd before timing. The
@@ -92,26 +94,24 @@ to the original input through zstd before timing. The
 
 ## Regression checks
 
-Every case was compared with the previous publication (`enc-20261014-fix`).
-Cases whose speed relative to C fell by more than 5% were rerun as separate
-processes, the previous release's profile driver against this release's,
-nine interleaved pairs each on an idle CPU 4:
+Every case was compared with the sweep of the tree before this release's
+changes (`enc-before`, run the same day with the same settings). Cases
+whose own time rose by more than 3% in the sweep were rerun as separate
+processes, the previous tree's profile driver against this release's, nine
+interleaved pairs each on an idle CPU 2:
 
-| Cases | Sweep change vs previous run | Paired time, this release / previous | Verdict |
+| Cases | Sweep: this release / previous time | Paired: this release / previous time | Verdict |
 | --- | ---: | ---: | --- |
-| alice29 l12, l14 | -5.3%, -5.6% | +0.4%, -0.9% | noise |
-| text-1m l10, l16 | -7.8%, -8.6% | -0.0%, +0.5% | noise |
-| repeated-1m l-1 | -15.2% | -0.2% | noise |
-| empty l12 | -12.0% | +1.5% | noise |
-| random-64k l3 | -7.5% | +0.3% | noise |
+| random-1m l-5, l-1 | +14%, +18% | -18%, -22% | faster |
+| random-1m l2, l13-l15, l19, l20 | +4% to +13% | -0.5% to +0.8% | noise |
+| binary-64k l13, l14 | +4%, +7% | +1.1%, +0.5% | noise |
+| alice29 l18 | +5% | -0.1% | noise |
 
-The same paired runs time Alice at level 1 2.0% faster than the previous
-release (nine of nine pairs), matching its sweep change of +2.1%.
-
-The first sweep of this release's tree measured cold 64 KiB inputs 25-31%
-slower at levels -5 to 1: a sequence store kept initialized at full
-capacity paid for that initialization on every cold call. It was removed
-before release, and the sweep above measured the released tree.
+The same paired runs time Alice 5.0% faster at level 1, 6.5% at level 3
+and 1.4% at level 9, 1 MiB of text 5.5% faster at level 4 and 2.7% at
+level 9. The 1 MiB inputs' cold timings depend on the allocator state the
+long-running Criterion process has reached, which moves them by 5-15%
+between sweeps.
 
 ## Measurement contract
 
@@ -168,9 +168,9 @@ time. The median describes this corpus, not a production workload distribution.
 Cold APIs include allocation and allocator state; timings include the effects
 of glibc's changing mmap and trim thresholds within a process.
 
-The previous published encoder sweep (`parity-final-20261014`, median
-1.000×) measured the tree before these changes with the same sampling. The
-change between the two runs is consistent with paired, process-per-case
+The previous tree's sweep (`enc-before`, median 1.086×) was run earlier
+the same day with the same sampling, while nothing else ran. The change
+between the two runs is consistent with paired, process-per-case
 measurements of the same binaries, but the two sweeps are not a controlled
 before/after experiment.
 

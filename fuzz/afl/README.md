@@ -26,8 +26,9 @@ campaign; `cargo afl system-config` makes them (it runs `sudo`).
 | `src/targets.rs` | Target bodies, shared by AFL and the regression replay |
 | `src/bin/` | Thin `afl::fuzz!` adapters |
 | `tests/regressions.rs` | Committed corpus replay |
+| `tests/benchmark_corpora.rs` | The comparison benchmark's 8 inputs at its 24 levels through `differential_c` and `decode_roundtrip` |
 | `regressions/<target>/` | Boundary cases and minimised findings, `*.bin` |
-| `prepare-seeds.sh` | Builds `seeds/params` and `seeds/frames` from the vendored zstd test data |
+| `prepare-seeds.sh` | Builds `seeds/params` and `seeds/frames` from the vendored zstd test data and the benchmark text |
 | `campaign.sh` | Runs targets in parallel for a fixed time |
 | `seeds/`, `findings/` | Local artifacts, never committed |
 

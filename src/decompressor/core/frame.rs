@@ -11,7 +11,7 @@
 use ::core::ops::Range;
 
 use super::BlockError;
-use super::block::{BlockDecoder, BlockHeader};
+use super::block::{BlockDecoder, BlockHeader, BlockOutput};
 use super::dictionary::DictView;
 use super::sequences::BlockContext;
 use crate::Backend;
@@ -216,10 +216,10 @@ impl FrameDecoder {
     /// one window of it, and the frame's first window is then still in
     /// `out` from `history.start`.
     ///
-    /// Callers that grow their buffer give it room for
+    /// Callers that grow their buffer let `out` grow to
     /// [`Self::block_max`] bytes plus
-    /// [`WILDCOPY_OVERLENGTH`](super::copy::WILDCOPY_OVERLENGTH); a block that
-    /// does not fit a caller-sized buffer fails with
+    /// [`WILDCOPY_OVERLENGTH`](super::copy::WILDCOPY_OVERLENGTH) past the
+    /// history; a block that does not fit a caller-sized buffer fails with
     /// [`DecodeError::OutputTooSmall`].
     #[cfg_attr(all(feature = "hotpath", not(feature = "no_std")), hotpath::measure)]
     pub(crate) fn decode_block(
@@ -227,7 +227,7 @@ impl FrameDecoder {
         backend: Backend,
         block: &BlockHeader,
         content: &[u8],
-        out: &mut [u8],
+        out: &mut dyn BlockOutput,
         history: Range<usize>,
         dictionary: Option<DictView<'_>>,
     ) -> Result<usize, DecodeError> {
@@ -254,7 +254,7 @@ impl FrameDecoder {
                 BlockError::Invalid(kind) => DecodeError::from(kind),
                 BlockError::OutputFull => DecodeError::OutputTooSmall { written: op },
             })?;
-        self.account_block(block, &out[op..end])?;
+        self.account_block(block, &out.buffer()[op..end])?;
         Ok(end)
     }
 
@@ -430,7 +430,7 @@ mod tests {
                 Backend::default(),
                 &block,
                 &content,
-                &mut buffer,
+                &mut buffer.as_mut_slice(),
                 0..0,
                 Some(view),
             )
@@ -448,7 +448,7 @@ mod tests {
                 Backend::default(),
                 &block,
                 &content,
-                &mut buffer,
+                &mut buffer.as_mut_slice(),
                 0..0,
                 Some(view),
             )
@@ -466,7 +466,7 @@ mod tests {
                 Backend::default(),
                 &raw,
                 &filler,
-                &mut buffer,
+                &mut buffer.as_mut_slice(),
                 0..end,
                 Some(view),
             )
@@ -477,7 +477,7 @@ mod tests {
                 Backend::default(),
                 &block,
                 &content,
-                &mut buffer,
+                &mut buffer.as_mut_slice(),
                 end..end,
                 Some(view),
             )
@@ -504,7 +504,7 @@ mod tests {
             Backend::default(),
             block,
             content,
-            &mut buffer,
+            &mut buffer.as_mut_slice(),
             0..start,
             None,
         )?;
