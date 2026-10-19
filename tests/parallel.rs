@@ -3,10 +3,13 @@
 //! Parallel frames decode, and do not depend on scheduling.
 
 use mzstd::compressor::parallel::{
-    ParallelCompressor, ParallelConfig, ParallelEncodeError, SegmentSize, TaskCount,
+    ArcBytesSource, FileSource, ParallelCompressor, ParallelConfig, ParallelEncodeError,
+    RandomAccessSource, SeekSource, SegmentSize, SourceIdentity, TaskCount,
 };
 use mzstd::{Compressor, ConfigError, EncoderConfig, Level, Parameter};
+use std::io::{self, Cursor};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zstd_ffi::corpus;
 
 fn compressor(level: i32, checksum: bool) -> ParallelCompressor {
@@ -231,4 +234,337 @@ fn batches_with_leaked_tasks_report_invalid_state() {
         error.to_string(),
         "the batch cannot be assembled: a task never reported"
     );
+}
+
+/// Runs every task of a source batch on its own detached thread, in reverse
+/// order, and assembles the frame.
+fn detached(
+    compressor: &mut ParallelCompressor,
+    source: Arc<dyn RandomAccessSource>,
+    tasks: usize,
+) -> Result<Vec<u8>, ParallelEncodeError> {
+    let mut batch = compressor
+        .prepare_source::<dyn RandomAccessSource, _>(source, TaskCount::try_from(tasks).unwrap())?;
+    let workers: Vec<_> = batch
+        .take_tasks()
+        .into_iter()
+        .rev()
+        .map(|task| std::thread::spawn(move || task.run()))
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    batch.finish()
+}
+
+#[test]
+fn sources_compress_to_the_slice_frame() {
+    // Three segments and a short fourth; under one segment; empty.
+    for len in [3 * (256 << 10) + 1000, 100_000, 0] {
+        let input = corpus::mixed(len, 20);
+        let mut compressor = compressor(3, true);
+        let expected = compressor.compress(&input).unwrap();
+        let bytes = ArcBytesSource::from(Arc::<[u8]>::from(input.as_slice()));
+        assert_eq!(bytes.as_ref(), input.as_slice());
+        let seek = SeekSource::from(Cursor::new(input.clone()));
+        assert_eq!(seek.len().unwrap(), len as u64);
+        assert!(seek.identity().is_none());
+        assert_eq!(seek.is_empty().unwrap(), len == 0);
+        let sources: [Arc<dyn RandomAccessSource>; 2] = [Arc::new(bytes), Arc::new(seek)];
+        for source in sources {
+            for tasks in [1, 3] {
+                assert_eq!(
+                    detached(&mut compressor, Arc::clone(&source), tasks).unwrap(),
+                    expected,
+                    "{len} bytes, {tasks} tasks"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prepare_source_accepts_owned_shared_converted_and_erased_sources() {
+    struct Converted(Vec<u8>);
+    impl From<Converted> for Arc<SeekSource<Cursor<Vec<u8>>>> {
+        fn from(value: Converted) -> Self {
+            Arc::new(SeekSource::from(Cursor::new(value.0)))
+        }
+    }
+    let input = corpus::text(600_000, 21);
+    let mut compressor = compressor(1, false);
+    let expected = compressor.compress(&input).unwrap();
+    let tasks = TaskCount::try_from(2).unwrap();
+
+    let owned = SeekSource::from(Cursor::new(input.clone()));
+    let batch = compressor.prepare_source(owned, tasks).unwrap();
+    assert_eq!(batch.finish().unwrap(), expected);
+
+    let converted = Converted(input.clone());
+    let batch = compressor
+        .prepare_source::<SeekSource<Cursor<Vec<u8>>>, _>(converted, tasks)
+        .unwrap();
+    assert_eq!(batch.finish().unwrap(), expected);
+
+    let shared = Arc::new(ArcBytesSource::from(Arc::<[u8]>::from(input.as_slice())));
+    let batch = compressor
+        .prepare_source::<ArcBytesSource, _>(Arc::clone(&shared), tasks)
+        .unwrap();
+    assert!(format!("{batch:?}").contains("Source"));
+    assert_eq!(batch.finish().unwrap(), expected);
+    // Finishing released every task's handle.
+    assert_eq!(Arc::strong_count(&shared), 1);
+
+    let erased: Arc<dyn RandomAccessSource> = shared;
+    let batch = compressor
+        .prepare_source::<dyn RandomAccessSource, _>(erased, tasks)
+        .unwrap();
+    assert_eq!(batch.finish().unwrap(), expected);
+}
+
+/// A scratch file removed when dropped.
+struct ScratchFile(std::path::PathBuf);
+
+impl ScratchFile {
+    fn new(name: &str, bytes: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(format!("mzstd-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn file_sources_compress_to_the_slice_frame() {
+    let input = corpus::mixed(700_000, 22);
+    let file = ScratchFile::new("file-source", &input);
+    let mut compressor = compressor(5, true);
+    let expected = compressor.compress(&input).unwrap();
+    let source = FileSource::open(&file.0).unwrap();
+    assert_eq!(source.len().unwrap(), input.len() as u64);
+    assert!(source.identity().is_some());
+    let mut tail = [0; 4];
+    assert_eq!(
+        source
+            .read_exact_at(input.len() as u64 - 2, &mut tail)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        detached(&mut compressor, Arc::new(source), 3).unwrap(),
+        expected
+    );
+    let handle = std::fs::File::open(&file.0).unwrap();
+    let source = FileSource::try_from(handle).unwrap();
+    assert_eq!(
+        detached(&mut compressor, Arc::new(source), 1).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn file_sources_must_be_regular_files() {
+    let error = FileSource::open(std::env::temp_dir()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "a parallel source must be a regular file"
+    );
+    assert!(FileSource::open(std::env::temp_dir().join("mzstd-missing-source")).is_err());
+}
+
+#[test]
+fn a_rewritten_file_fails_its_batch() {
+    let input = corpus::text(300_000, 23);
+    let file = ScratchFile::new("rewritten", &input);
+    let mut compressor = compressor(1, false);
+    let batch = compressor
+        .prepare_source(FileSource::open(&file.0).unwrap(), TaskCount::ONE)
+        .unwrap();
+    std::fs::write(&file.0, corpus::text(300_001, 24)).unwrap();
+    let mut out = b"kept".to_vec();
+    assert_eq!(
+        batch.finish_into(&mut out),
+        Err(ParallelEncodeError::SourceChanged)
+    );
+    assert_eq!(out, b"kept");
+}
+
+/// A source of `len` ones whose reads fail or panic on request.
+struct FaultSource {
+    len: AtomicU64,
+    fail: AtomicBool,
+    panic: bool,
+    version: AtomicU64,
+}
+
+impl FaultSource {
+    fn new(len: u64) -> Self {
+        Self {
+            len: AtomicU64::new(len),
+            fail: AtomicBool::new(false),
+            panic: false,
+            version: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RandomAccessSource for FaultSource {
+    fn len(&self) -> io::Result<u64> {
+        match self.len.load(Ordering::Relaxed) {
+            u64::MAX => Err(io::Error::new(io::ErrorKind::NotFound, "no length")),
+            len => Ok(len),
+        }
+    }
+
+    fn read_exact_at(&self, _: u64, dst: &mut [u8]) -> io::Result<()> {
+        assert!(!self.panic, "injected source panic");
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        }
+        dst.fill(1);
+        Ok(())
+    }
+
+    fn identity(&self) -> Option<SourceIdentity> {
+        let version = self.version.load(Ordering::Relaxed);
+        Some(SourceIdentity::from(version.to_le_bytes().to_vec()))
+    }
+}
+
+#[test]
+fn a_source_without_a_length_cannot_be_prepared() {
+    let mut compressor = compressor(1, false);
+    let error = compressor
+        .prepare_source(FaultSource::new(u64::MAX), TaskCount::ONE)
+        .unwrap_err();
+    let ParallelEncodeError::SourceMetadata(cause) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(cause.as_ref().kind(), io::ErrorKind::NotFound);
+    assert_eq!(io::Error::from(error).kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn source_read_failures_fail_the_batch_with_their_segment() {
+    let mut compressor = compressor(1, false);
+    // Three segments over two tasks, then the serial fallback.
+    for len in [3 * (256 << 10), 1000] {
+        let source = FaultSource::new(len);
+        source.fail.store(true, Ordering::Relaxed);
+        let mut batch = compressor
+            .prepare_source(source, TaskCount::try_from(2).unwrap())
+            .unwrap();
+        let tasks = batch.take_tasks();
+        assert_eq!(tasks.len(), if len > 1000 { 2 } else { 1 });
+        tasks.into_iter().rev().for_each(|task| task.run());
+        let mut out = b"kept".to_vec();
+        let error = batch.finish_into(&mut out).unwrap_err();
+        let ParallelEncodeError::BatchFailed(cause) = &error else {
+            panic!("{error:?}");
+        };
+        // Results are reported in task order: the first task's first segment.
+        let ParallelEncodeError::SourceRead { segment, source } = &**cause else {
+            panic!("{cause:?}");
+        };
+        assert_eq!(*segment, 0);
+        assert_eq!(source.as_ref().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            io::Error::from(error).kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(out, b"kept");
+    }
+}
+
+#[test]
+fn a_panicking_source_fails_its_task() {
+    let mut compressor = compressor(1, false);
+    let mut source = FaultSource::new(3 * (256 << 10));
+    source.panic = true;
+    let mut batch = compressor.prepare_source(source, TaskCount::ONE).unwrap();
+    let task = batch.take_tasks().pop().unwrap();
+    assert!(std::thread::spawn(move || task.run()).join().is_err());
+    assert_eq!(
+        batch.finish(),
+        Err(ParallelEncodeError::BatchFailed(Arc::new(
+            ParallelEncodeError::TaskPanicked { segment: 0 }
+        )))
+    );
+}
+
+#[test]
+fn a_source_that_changes_before_finishing_fails_the_batch() {
+    let mut compressor = compressor(1, true);
+    for change in [
+        |source: &FaultSource| source.len.store(1, Ordering::Relaxed),
+        |source: &FaultSource| source.version.store(1, Ordering::Relaxed),
+        |source: &FaultSource| source.len.store(u64::MAX, Ordering::Relaxed),
+    ] {
+        for len in [3 * (256 << 10), 1000] {
+            let source = Arc::new(FaultSource::new(len));
+            let mut batch = compressor
+                .prepare_source::<FaultSource, _>(Arc::clone(&source), TaskCount::ONE)
+                .unwrap();
+            batch.take_tasks().into_iter().for_each(|task| task.run());
+            change(&source);
+            let mut out = b"kept".to_vec();
+            let error = batch.finish_into(&mut out).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ParallelEncodeError::SourceChanged | ParallelEncodeError::SourceMetadata(_)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(out, b"kept");
+        }
+    }
+    assert_eq!(
+        io::Error::from(ParallelEncodeError::SourceChanged).kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn a_checksum_read_failure_leaves_the_output_untouched() {
+    let mut compressor = compressor(1, true);
+    let source = Arc::new(FaultSource::new(3 * (256 << 10)));
+    let mut batch = compressor
+        .prepare_source::<FaultSource, _>(Arc::clone(&source), TaskCount::ONE)
+        .unwrap();
+    batch.take_tasks().into_iter().for_each(|task| task.run());
+    // The tasks have read their segments; the checksum reads them again.
+    source.fail.store(true, Ordering::Relaxed);
+    let mut out = b"kept".to_vec();
+    let error = batch.finish_into(&mut out).unwrap_err();
+    assert!(
+        matches!(error, ParallelEncodeError::SourceRead { segment: 0, .. }),
+        "{error:?}"
+    );
+    assert_eq!(out, b"kept");
+}
+
+#[test]
+fn array_sources_reject_ranges_past_their_end() {
+    let source = ArcBytesSource::from(Arc::<[u8]>::from(&b"abc"[..]));
+    let mut two = [0; 2];
+    source.read_exact_at(1, &mut two).unwrap();
+    assert_eq!(&two, b"bc");
+    for (offset, len) in [(u64::MAX, 1), (2, 2), (4, 0)] {
+        assert_eq!(
+            source
+                .read_exact_at(offset, &mut vec![0; len])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+    source.read_exact_at(3, &mut []).unwrap();
 }

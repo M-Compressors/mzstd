@@ -3,7 +3,7 @@
 use std::mem::MaybeUninit;
 
 use mzstd::compressor::parallel::{
-    ParallelCompressor, ParallelConfig, ParallelEncoderStatus, SegmentSize, TaskCount,
+    ParallelCompressor, ParallelConfig, ParallelEncoderStatus, SeekSource, SegmentSize, TaskCount,
 };
 use mzstd::dictionary::{DecodeDictionary, DictionaryBuilder, DictionaryContent};
 use mzstd::io::FinishError;
@@ -180,8 +180,9 @@ pub fn compressor_lifecycle(data: &[u8]) {
     assert_eq!(frame_b, reused.compress(second.rest).expect("compression"));
 }
 
-/// Parallel frames decode and do not depend on the number of tasks; streams
-/// and their `std::io` adapters reproduce the batch frame.
+/// Parallel frames decode and do not depend on the number of tasks or on
+/// whether the batch reads a slice or a `SeekSource`; streams and their
+/// `std::io` adapters reproduce the batch frame.
 ///
 /// The control byte after the configuration picks the batch's task count
 /// (bits 0-2), the stream's window (bits 3-4), a mid-stream flush (bit 5) and
@@ -204,6 +205,21 @@ pub fn parallel(data: &[u8]) {
     for task in batch.take_tasks().into_iter().rev() {
         task.run();
     }
+    assert_eq!(batch.finish().expect("parallel compression"), one);
+    // A source batch reads the same bytes on detached threads.
+    let source = SeekSource::from(std::io::Cursor::new(input.to_vec()));
+    let mut batch = compressor
+        .prepare_source(source, tasks)
+        .expect("in-memory source");
+    let workers: Vec<_> = batch
+        .take_tasks()
+        .into_iter()
+        .rev()
+        .map(|task| std::thread::spawn(move || task.run()))
+        .collect();
+    workers
+        .into_iter()
+        .for_each(|worker| worker.join().expect("task"));
     assert_eq!(batch.finish().expect("parallel compression"), one);
     let restored = oracle::decompress_stream(&one, 1 << 12, Some(31)).expect("reference decoding");
     assert_eq!(restored, input);

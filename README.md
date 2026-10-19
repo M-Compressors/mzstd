@@ -94,7 +94,7 @@ either for a whole input at once or for input that arrives in chunks. It require
 | Drive input/output incrementally | `start` → `EncoderSession` | `start` → `DecoderSession` |
 | Same, with the session owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
 | Any of the above with a dictionary | `compress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` | `decompress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` |
-| Split one known input across your threads | `ParallelCompressor::prepare_slice` → `ScopedParallelBatch` | — |
+| Split one known input across your threads | `ParallelCompressor::prepare_slice` / `prepare_source` → `ScopedParallelBatch` | — |
 | Stream chunked input across your threads | `ParallelCompressor::start` → `ParallelEncoderSession` + `ParallelTaskQueue` | — |
 | Same, with the session owning the compressor | `ParallelCompressor::into_session` → `ParallelEncoderSessionOwned` | — |
 | Push or pull through `std::io` across your threads | `ParallelCompressor::writer`, `ParallelCompressor::reader` | — |

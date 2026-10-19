@@ -12,10 +12,12 @@ frame nor the frame of zstd's multithreaded mode (ZSTDMT).
 
 ```mermaid
 graph TD
-    Public["parallel (public): SegmentSize, TaskCount, ParallelConfig, ParallelCompressor, ScopedParallelBatch"] --> PCore["parallel::core (private): FramePlan, compress_segment, compress_serial, EnginePool"]
+    Public["parallel (public): SegmentSize, TaskCount, ParallelConfig, ParallelCompressor, ScopedParallelBatch, OwnedParallelBatch"] --> PCore["parallel::core (private): FramePlan, compress_segment, compress_serial, EnginePool"]
+    Source["parallel::source (public): RandomAccessSource, ArcBytesSource, SeekSource, FileSource, SourceIdentity"] --> PSource["parallel::core::source (private): Input, SharedSource, SeekReader"]
+    Public --> PSource
     Session["parallel::session (public): ParallelEncoderSession(Owned), ParallelTaskQueue, OwnedParallelTask, statuses"] --> Stream["parallel::core::stream (private): Stream, Shared queue, StreamTask, Sink"]
     IO["parallel::io (public): ParallelEncoderWriter, ParallelEncoderReader"] --> Session
-    Error["parallel::error (public): ParallelEncodeError, io::Error conversion"]
+    Error["parallel::error (public): ParallelEncodeError, SourceIoError, io::Error conversion"]
     Stream --> PCore
     PCore --> Engine[compressor::core::cctx::Engine]
     PCore --> Serial[compressor::core::compress_once_into]
@@ -28,7 +30,11 @@ graph TD
 | `TaskCount` | 1 to 65536: how many tasks a slice batch is cut into, or a stream's window. |
 | `ParallelConfig` | The segment size. |
 | `ParallelCompressor` | An `EncoderConfig`, a `ParallelConfig` and a pool of idle engines shared with its tasks. |
-| `ScopedParallelBatch` / `ScopedParallelTask` | A whole input borrowed for a scope; each task compresses a run of consecutive segments. |
+| `ScopedParallelBatch` / `ScopedParallelTask` | A whole input, borrowed for a scope or read from a source; each task compresses a run of consecutive segments. |
+| `OwnedParallelBatch` | `ScopedParallelBatch<'static>`, from `prepare_source`: its tasks own a shared source handle and run on detached threads. |
+| `RandomAccessSource` | `len`, `read_exact_at(offset, dst)` and an optional `identity`; `Send + Sync + 'static`. |
+| `ArcBytesSource` / `SeekSource` / `FileSource` | Shared immutable bytes; a `Read + Seek` reader behind a mutex; a regular file read with positional reads. |
+| `SourceIdentity` / `SourceIoError` | A source's version token; a source's `io::Error`, shared so `ParallelEncodeError` stays `Clone + Eq`. |
 | `ParallelEncoderSession` / `ParallelEncoderSessionOwned` | Input that arrives in chunks; borrows or owns the compressor and wraps one `core::Stream`. |
 | `ParallelTaskQueue` / `OwnedParallelTask` / `ParallelTasks` | The stream's queue handle, its `'static` tasks and the blocking iterator over them. |
 | `ParallelEncoderStatus` / `ParallelProgress` | What one `process` call did and what the session needs next. |
@@ -117,7 +123,11 @@ as the previous segment's output.
 
 ## Scoped batches
 
-`prepare_slice(input, tasks)` plans a whole borrowed input:
+`prepare_slice(input, tasks)` plans a whole borrowed input, and
+`prepare_source(source, tasks)` one read from a `RandomAccessSource` (see
+[sources](#sources)). Both go through one private `prepare` over a
+`core::Input` (`Slice(&[u8])` or `Source(Arc<dyn RandomAccessSource>)`) and
+its length:
 
 ```mermaid
 flowchart TD
@@ -136,6 +146,65 @@ first failing slot becomes `BatchFailed(cause)` and leaves `out` untouched. A
 slot count short of the task count (a task leaked with `mem::forget`) is
 `InvalidState`. `compress` is `prepare_slice` with one task, run on the
 calling thread by `finish`.
+
+For a source, `finish` then checks that the source's length and identity
+still equal those recorded at planning (`SourceChanged`, or
+`SourceMetadata` when the length cannot be read), and, for a frame with a
+checksum, reads the source once more in segment-sized chunks to hash it.
+Both happen before `out` is touched, so a failure leaves it as it was.
+
+## Sources
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Compressor as prepare_source
+    participant Input as core::Input::Source
+    participant Task
+    participant Source as RandomAccessSource
+    Caller->>Compressor: source.into() as Arc<S>
+    Compressor->>Input: Arc<SharedSource<S>> as Arc<dyn RandomAccessSource>
+    Input->>Source: len(), identity() — planning snapshot
+    Compressor-->>Caller: OwnedParallelBatch ('static tasks)
+    Caller->>Task: run on any thread
+    loop each segment of the task
+        Task->>Source: read_exact_at(segment start − overlap, buffer)
+        Task->>Task: compress_segment(overlap + segment)
+    end
+    Caller->>Compressor: finish
+    Compressor->>Source: len(), identity() — equal to the snapshot?
+    opt checksum
+        Compressor->>Source: read_exact_at per segment, into XXH64
+    end
+```
+
+`prepare_source<S: RandomAccessSource + ?Sized, T: Into<Arc<S>>>` converts
+the argument once. The private `SharedSource<S>` bridge lets an unsized `S`
+(`dyn RandomAccessSource`) become the batch's
+`Arc<dyn RandomAccessSource>`; tasks clone that handle, never the bytes. An
+`Arc` argument or a custom conversion may need `S` named, because
+`Into<Arc<S>>` admits more than one target.
+
+A task reads each segment together with its overlap into one buffer, grown
+with `Vec::resize` and reused across the task's segments, so a source batch
+holds at most one overlap plus one segment per running task. The serial
+fallback reads the whole (at most one-segment) source. A read failure is
+`SourceRead { segment }`, reported as the task's result; a panic inside the
+source unwinds the task like any other (`TaskPanicked`). The frame is
+byte-identical to `prepare_slice` over the same bytes.
+
+- `ArcBytesSource` wraps `Arc<[u8]>`; a range past the end is
+  `UnexpectedEof`.
+- `SeekSource<R>` (`R: Read + Seek + Send`, not `Sync`) holds the reader in
+  `core::SeekReader`'s mutex: `len` seeks to the end, and each read seeks to
+  its absolute offset and `read_exact`s under one lock, so tasks never see a
+  cursor another task moved. A panic inside the reader poisons the mutex and
+  later calls fail with an I/O error. It has no identity.
+- `FileSource` reads with `FileExt::read_at` (Unix) or `seek_read`
+  (Windows), retrying `Interrupted` and short reads; other platforms return
+  `Unsupported`. It accepts regular files only. Its identity is the length,
+  modification time and, on Unix, device, inode and change time — it catches
+  most rewrites but not every in-place write.
 
 ## Streaming sessions
 
@@ -324,13 +393,19 @@ sequenceDiagram
 | `TaskQueueClosed` | Every queue handle was dropped and the stream had a task to queue. |
 | `TaskAbandoned { segment }` | A task was dropped without running. |
 | `TaskPanicked { segment }` | A task unwound while running. |
+| `SourceMetadata(SourceIoError)` | A source's length could not be read, at `prepare_source` or at `finish`. |
+| `SourceRead { segment, source }` | A source read failed in a task (inside `BatchFailed`) or while hashing for the checksum. |
+| `SourceChanged` | A source's length or identity differs at `finish` from planning. |
 
 `From<ParallelEncodeError> for io::Error` takes the kind of the root cause
 through `StreamFailed` and `BatchFailed` (`InvalidInput` for size mismatches
-and `Bound`, `WriteZero` for `OutputTooSmall`, `Other` otherwise) and keeps
+and `Bound`, `WriteZero` for `OutputTooSmall`, a source failure's own kind,
+`InvalidData` for `SourceChanged`, `Other` otherwise) and keeps
 the error as the source. It never produces `Interrupted` or `WouldBlock`,
 which `std::io` would retry. The wrapped cause's source in the chain is the
-`Arc<ParallelEncodeError>` itself.
+`Arc<ParallelEncodeError>` itself. `SourceIoError` is transparent: it
+displays as its `io::Error`, which `AsRef` reaches, and two compare equal
+when their kinds and messages do.
 
 ## Invariants
 
@@ -361,6 +436,10 @@ which `std::io` would retry. The wrapped cause's source in the chain is the
   earlier input, which can cost more than compressing the segment.
 - The parallel compressor takes no dictionary.
 - A stream copies its input into segments, and each part's blocks through
-  the caller's buffer; the batch reads its slice in place.
+  the caller's buffer; the batch reads its slice in place, and a source
+  batch copies each segment and its overlap into a per-task buffer.
+- A source batch with a checksum reads the source twice. Length and
+  identity checks cannot prove a source unchanged, and there is no option to
+  skip them (mbrotli's `SourceConsistency`).
 - A task held by the caller and never run or dropped blocks `wait` forever.
 - There is no `wait` with a timeout.

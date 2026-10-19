@@ -22,7 +22,7 @@ graph TD
     Dict --> ECore
     Encode --> Cfg[config + internal lowering]
     Encode --> ECore["compressor::core (private): engine, match finders, entropy, streaming"]
-    Encode --> Par["parallel (std): batches, sessions, io adapters + parallel::core (private): segments, stream"]
+    Encode --> Par["parallel (std): batches, random-access sources, sessions, io adapters + parallel::core (private): segments, inputs, stream"]
     Par --> ECore
     Decode --> DCore["decompressor::core (private): frames, blocks, entropy, history"]
     ECore --> Shared["shared (private): format constants, XXH64"]
@@ -51,7 +51,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding, streaming and output destinations (slice, Vec, uninitialized memory). |
 | [Optimal parser](optimal-parser.md) | btopt/btultra/btultra2 and LDM: per-block SIMD dispatch, the shared binary-tree walk, match-length kernels, price tables. |
 | [Dictionaries](dictionaries.md) | Raw and Zstandard-format dictionaries on the encoder side: `PreparedDictionary` (CDict), parameter modes, attach / copy / load at frame start, the dictionary segment, dictMatchState finders, entropy loading; the decoder side is in [decompressor](decompressor.md#dictionaries). |
-| [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches, windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
+| [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches over slices or random-access sources (`prepare_source`), windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration and compatibility with the reference decoder. |
 | [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed on demand a chunk at a time, the shared outcome mapping, the C ABI and their contract. |

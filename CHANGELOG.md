@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Parallel batches over random-access sources.**
+  `ParallelCompressor::prepare_source` plans a batch over a
+  `RandomAccessSource` instead of a borrowed slice, as mbrotli's does, and
+  returns an `OwnedParallelBatch` whose tasks are `'static`, so they run on
+  detached threads or any executor. Each task reads its segments and their
+  overlap into one reused buffer; the frame is byte-identical to
+  `prepare_slice` over the same bytes. `ArcBytesSource` (shared `Arc<[u8]>`),
+  `SeekSource` (any `Read + Seek + Send` reader behind a mutex) and
+  `FileSource` (positional reads of a regular file) implement the trait,
+  and `SourceIdentity` lets a source carry a version token. `finish` checks
+  that the source's length and identity are unchanged
+  (`ParallelEncodeError::SourceChanged`) and, for a frame with a checksum,
+  reads the source once more to hash it. Source failures are
+  `SourceMetadata` and `SourceRead { segment }`, carrying the `io::Error`
+  in a `SourceIoError` so the error stays `Clone + Eq`.
+
 ## [v0.2.7](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.7) - 2026-10-18
 
 - **Faster Huffman tables for small inputs.** The literal table's sort

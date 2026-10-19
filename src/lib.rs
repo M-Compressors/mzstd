@@ -39,7 +39,7 @@
 //! | Push input through `std::io::Write` | [`Compressor::writer`][compressor-writer] | [`Decompressor::writer`][decompressor-writer] |
 //! | Drive input/output incrementally | [`start`][compressor-start] → [`EncoderSession`] | [`start`][decompressor-start] → [`DecoderSession`] |
 //! | Same, with the session owning the codec | [`into_session`][compressor-into-session] → [`EncoderSessionOwned`] | [`into_session`][decompressor-into-session] → [`DecoderSessionOwned`] |
-//! | Split one known input across your threads | [`prepare_slice`][parallel-prepare-slice] → [`ScopedParallelBatch`] | — |
+//! | Split one known input across your threads | [`prepare_slice`][parallel-prepare-slice] / [`prepare_source`][parallel-prepare-source] → [`ScopedParallelBatch`] | — |
 //! | Stream chunked input across your threads | [`start`][parallel-start] → [`ParallelEncoderSession`] + [`ParallelTaskQueue`] | — |
 //! | Same, with the session owning the compressor | [`into_session`][parallel-into-session] → [`ParallelEncoderSessionOwned`] | — |
 //! | Push or pull through `std::io` across your threads | [`writer`][parallel-writer], [`reader`][parallel-reader] | — |
@@ -144,6 +144,7 @@
 [compressor-writer]: crate::Compressor::writer
 [`ParallelCompressor`]: crate::compressor::parallel::ParallelCompressor
 [parallel-prepare-slice]: crate::compressor::parallel::ParallelCompressor::prepare_slice
+[parallel-prepare-source]: crate::compressor::parallel::ParallelCompressor::prepare_source
 [`ScopedParallelBatch`]: crate::compressor::parallel::ScopedParallelBatch
 [parallel-start]: crate::compressor::parallel::ParallelCompressor::start
 [`ParallelEncoderSession`]: crate::compressor::parallel::ParallelEncoderSession
@@ -161,6 +162,7 @@
 [compressor-writer]: #select-only-the-codecs-you-need
 [`ParallelCompressor`]: #select-only-the-codecs-you-need
 [parallel-prepare-slice]: #select-only-the-codecs-you-need
+[parallel-prepare-source]: #select-only-the-codecs-you-need
 [`ScopedParallelBatch`]: #select-only-the-codecs-you-need
 [parallel-start]: #select-only-the-codecs-you-need
 [`ParallelEncoderSession`]: #select-only-the-codecs-you-need
