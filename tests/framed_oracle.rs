@@ -1,7 +1,7 @@
 //! Framed containers against zstd's own decoders: `ZSTD_decompress` sees
 //! the concatenated visible resources, and the contrib seekable decoder
 //! reads every range of them through the seek table.
-#![cfg(all(feature = "framed", feature = "compression"))]
+#![cfg(all(feature = "framed", feature = "compression", feature = "decompression"))]
 
 use mzstd::framing::*;
 use mzstd::{EncoderConfig, Level};
