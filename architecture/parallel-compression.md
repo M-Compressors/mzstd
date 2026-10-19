@@ -329,7 +329,17 @@ dropped (each publishes `TaskAbandoned`, outside the lock), executors' loops
 end, and a task taken before the close skips its work. Dropping the last
 handle closes the queue without cancelling: queued tasks report
 `TaskAbandoned`, and the next dispatch fails with `TaskQueueClosed`, so the
-session fails instead of waiting forever.
+session fails instead of waiting forever. Tasks executors took before the
+close remain theirs and must still be run or dropped; dropping every handle
+cannot resolve a task held forever.
+
+Stopping executors is not itself an error, and there is no timeout. If a
+needed task stays queued, or is held by an executor without being run or
+dropped, `wait` can block indefinitely. The blocking adapters wait the same
+way, so the reader's `read` and the writer's `write`, `flush`, `try_finish`
+and `finish` can block too. Executors must stay able to run until finishing
+returns, and a bounded pool must leave capacity for the tasks instead of
+filling every worker with callers waiting for them.
 
 A `StreamTask` publishes from `run`, or from `Drop` with `TaskAbandoned`
 (never ran) or `TaskPanicked` (unwound; its engine is dropped). `collect`

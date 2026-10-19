@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Clarified `ParallelTaskQueue` documentation.** Stopped executors can
+  leave `wait`, the blocking reader and writer and the writer's finishing
+  waiting indefinitely; dropping queue handles or tasks reports closure or
+  abandonment when the session observes it. Tasks executors already hold
+  must still be run or dropped.
 - **Parallel batches over random-access sources.**
   `ParallelCompressor::prepare_source` plans a batch over a
   `RandomAccessSource` instead of a borrowed slice, as mbrotli's does, and
