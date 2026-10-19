@@ -953,3 +953,135 @@ pub fn huf_read_ctable(src: &[u8]) -> Result<ReadHufTable, String> {
         values,
     })
 }
+
+/// What the contrib seekable decoder (`ZSTD_seekable`) reads from a
+/// seekable-format object: every frame's offsets, the decompressed size and
+/// a decoded range.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Seekable {
+    /// `(compressed offset, decompressed offset)` of every frame, in order.
+    pub frames: Vec<(u64, u64)>,
+    /// Decompressed size of the whole object.
+    pub decompressed_size: u64,
+    /// The decoded range that was requested.
+    pub data: Vec<u8>,
+}
+
+/// Owns one `ZSTD_seekable`.
+struct SeekableHandle(*mut ZSTD_seekable);
+
+impl Drop for SeekableHandle {
+    fn drop(&mut self) {
+        // SAFETY: created by `ZSTD_seekable_create` and freed once.
+        unsafe { ZSTD_seekable_free(self.0) };
+    }
+}
+
+/// Opens `src` with `ZSTD_seekable_initBuff` and decodes `len` bytes at
+/// decompressed `offset` with `ZSTD_seekable_decompress`; a range past the
+/// end is shortened, as the reference does.
+///
+/// # Errors
+///
+/// Returns the reference's error name when it rejects the seek table or a
+/// frame.
+///
+/// # Panics
+///
+/// Panics when the decoder cannot be allocated.
+pub fn seekable_decompress(src: &[u8], offset: u64, len: usize) -> Result<Seekable, String> {
+    // SAFETY: allocation only; a null result is checked.
+    let handle = SeekableHandle(unsafe { ZSTD_seekable_create() });
+    assert!(!handle.0.is_null(), "ZSTD_seekable_create failed");
+    // SAFETY: `src` outlives the handle, which is freed before returning.
+    check(unsafe { ZSTD_seekable_initBuff(handle.0, src.as_ptr().cast(), src.len()) })?;
+    // SAFETY: the handle holds a loaded seek table.
+    let count = unsafe { ZSTD_seekable_getNumFrames(handle.0) };
+    let mut frames = Vec::new();
+    let mut decompressed_size = 0;
+    for index in 0..count {
+        // SAFETY: `index` is below the frame count of the loaded table.
+        let (compressed, decompressed, size) = unsafe {
+            (
+                ZSTD_seekable_getFrameCompressedOffset(handle.0, index),
+                ZSTD_seekable_getFrameDecompressedOffset(handle.0, index),
+                ZSTD_seekable_getFrameDecompressedSize(handle.0, index),
+            )
+        };
+        frames.push((compressed, decompressed));
+        decompressed_size = decompressed + size as u64;
+    }
+    let mut data = vec![0u8; len];
+    let written = if len == 0 {
+        0
+    } else {
+        // SAFETY: `data` is valid for `len` bytes and the handle is loaded.
+        check(unsafe {
+            ZSTD_seekable_decompress(handle.0, data.as_mut_ptr().cast(), data.len(), offset)
+        })?
+    };
+    data.truncate(written);
+    Ok(Seekable {
+        frames,
+        decompressed_size,
+        data,
+    })
+}
+
+/// Owns one `ZSTD_seekable_CStream`.
+struct SeekableEncoder(*mut ZSTD_seekable_CStream);
+
+impl Drop for SeekableEncoder {
+    fn drop(&mut self) {
+        // SAFETY: created by `ZSTD_seekable_createCStream` and freed once.
+        unsafe { ZSTD_seekable_freeCStream(self.0) };
+    }
+}
+
+/// Compresses `input` into the contrib seekable format at `level`, cutting
+/// a frame every `max_frame` bytes, without seek table checksums
+/// (`ZSTD_seekable_compressStream`, then `ZSTD_seekable_endStream`).
+///
+/// # Errors
+///
+/// Returns the reference's error name when it rejects the parameters.
+///
+/// # Panics
+///
+/// Panics when the compressor cannot be allocated.
+pub fn seekable_compress(input: &[u8], level: i32, max_frame: u32) -> Result<Vec<u8>, String> {
+    // SAFETY: allocation only; a null result is checked.
+    let encoder = SeekableEncoder(unsafe { ZSTD_seekable_createCStream() });
+    assert!(!encoder.0.is_null(), "ZSTD_seekable_createCStream failed");
+    // SAFETY: the stream is live.
+    check(unsafe { ZSTD_seekable_initCStream(encoder.0, level, 0, max_frame) })?;
+    let frames = input.len() / max_frame.max(1) as usize + 1;
+    let mut output = vec![0u8; compress_bound(input.len()) + frames * 32 + 64];
+    let mut out = ZSTD_outBuffer {
+        dst: output.as_mut_ptr().cast(),
+        size: output.len(),
+        pos: 0,
+    };
+    let mut source = ZSTD_inBuffer {
+        src: input.as_ptr().cast(),
+        size: input.len(),
+        pos: 0,
+    };
+    while source.pos < source.size {
+        // SAFETY: both buffers describe live memory of the given sizes.
+        check(unsafe { ZSTD_seekable_compressStream(encoder.0, &mut out, &mut source) })?;
+    }
+    loop {
+        // SAFETY: as above.
+        let left = check(unsafe { ZSTD_seekable_endStream(encoder.0, &mut out) })?;
+        if left == 0 {
+            break;
+        }
+        if out.pos == out.size {
+            return Err(String::from("seekable output bound exceeded"));
+        }
+    }
+    let written = out.pos;
+    output.truncate(written);
+    Ok(output)
+}

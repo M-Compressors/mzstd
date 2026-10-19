@@ -30,6 +30,7 @@ flowchart TD
 | `decompression` | `mzstd::decompressor` and its root re-exports, and `mzstd::dictionary::{DecodeDictionary, DictionaryRef}`. Pulls in `borrowed-buf`, through which `decompress_to_uninit` zeroes its destination just ahead of the decoder without `unsafe`. |
 | `std` | `std::error::Error` for every error type, plus, unless `no_std` is also set, `mzstd::io` (reader and writer adapters, `FinishError`) and `compressor::parallel`. |
 | `no_std` | `#![no_std]` with `alloc`; it wins over `std`, so `--all-features` builds the alloc-only crate. One-shot calls, sessions, owned sessions and retention remain. `Backend::default()` is then the compile-time baseline level instead of the detected one. |
+| `framed` | `mzstd::framing` with either codec: its neutral types always; `FramedCompressor` and its sessions with `compression`; `FramedDecompressor` and its sessions with `decompression`. `FramedWriter`, `ResourceWriter`, `FramedEncoderReader`, `FramedReader` and `FramedSeekReader` also need std (not `no_std`). Enables no codec by itself and adds no dependency. |
 | `hotpath`, `hotpath-cpu`, `hotpath-alloc` | Turn on the `hotpath::measure` anchors at stage boundaries (one-shot compression, frame chunks, sequence building, entropy coding, LDM, parallel segments, and the decoder's frame, block, literal, Huffman and sequence stages). Ignored with `no_std`. |
 
 With neither codec enabled, the crate exposes nothing; `backend`,
@@ -60,6 +61,17 @@ graph LR
 numbers and sizes, the checksum size) are gated on `decompression`, so a
 compression-only build has no dead code.
 
+## Framed gates
+
+```mermaid
+flowchart TD
+    F[framed + either codec] --> Neutral["framing: DictionaryId, DictionaryReference, MetadataKind, MetadataField, core wire constants"]
+    F --> |compression| Enc["FramedCompressor, input, sessions"]
+    F --> |decompression| Dec["FramedDecompressor, sessions, types"]
+    Enc --> |std, not no_std| EncIo["FramedWriter, ResourceWriter, FramedEncoderReader"]
+    Dec --> |std, not no_std| DecIo["FramedReader, FramedSeekReader"]
+```
+
 ## Checks
 
 Clippy is clean with `-D warnings` for each of these configurations:
@@ -67,7 +79,9 @@ Clippy is clean with `-D warnings` for each of these configurations:
 - `--all-features` (alloc only), and the default features;
 - `std,compression` and `std,decompression`;
 - `no_std,compression` and `no_std,decompression`;
-- no codec at all.
+- no codec at all;
+- `std,compression,framed`, `std,decompression,framed`,
+  `no_std,compression,framed` and `no_std,decompression,framed`.
 
 `cargo doc` is clean in each configuration under
 `deny(rustdoc::broken_intra_doc_links)`. That works because the crate

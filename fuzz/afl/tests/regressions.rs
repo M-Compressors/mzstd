@@ -106,3 +106,45 @@ fn compress_dictionary() {
         mzstd_afl::targets::compress_dictionary,
     );
 }
+
+#[cfg(feature = "framed")]
+#[test]
+fn framed_encode() {
+    replay("framed_encode", mzstd_afl::framed_targets::framed_encode);
+}
+
+#[cfg(feature = "framed")]
+#[test]
+fn framed_decode() {
+    replay("framed_decode", mzstd_afl::framed_targets::framed_decode);
+}
+
+#[cfg(feature = "framed")]
+#[test]
+fn framed_roundtrip() {
+    replay(
+        "framed_roundtrip",
+        mzstd_afl::framed_targets::framed_roundtrip,
+    );
+}
+
+#[test]
+fn framed_targets_follow_feature_selection() {
+    let manifest = include_str!("../Cargo.toml");
+    for name in ["framed_decode", "framed_roundtrip", "framed_encode"] {
+        let entry = format!(
+            "name = \"{name}\"\npath = \"src/bin/{name}.rs\"\nrequired-features = [\"framed\"]"
+        );
+        assert!(
+            manifest.contains(&entry),
+            "{name} must require the framed feature"
+        );
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("regressions")
+                .join(name)
+                .is_dir(),
+            "{name} needs committed regressions"
+        );
+    }
+}

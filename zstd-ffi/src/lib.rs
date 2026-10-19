@@ -369,5 +369,65 @@ unsafe extern "C" {
     ) -> c_uint;
 }
 
+/// The contrib seekable-format decoder (`ZSTD_seekable`).
+#[repr(C)]
+pub struct ZSTD_seekable {
+    _private: [u8; 0],
+}
+
+/// The contrib seekable-format compressor (`ZSTD_seekable_CStream`).
+#[repr(C)]
+pub struct ZSTD_seekable_CStream {
+    _private: [u8; 0],
+}
+
+// `contrib/seekable_format/zstdseek_{compress,decompress}.c`, compiled with
+// the library.
+unsafe extern "C" {
+    pub fn ZSTD_seekable_createCStream() -> *mut ZSTD_seekable_CStream;
+    pub fn ZSTD_seekable_freeCStream(zcs: *mut ZSTD_seekable_CStream) -> usize;
+    pub fn ZSTD_seekable_initCStream(
+        zcs: *mut ZSTD_seekable_CStream,
+        compressionLevel: c_int,
+        checksumFlag: c_int,
+        maxFrameSize: c_uint,
+    ) -> usize;
+    pub fn ZSTD_seekable_compressStream(
+        zcs: *mut ZSTD_seekable_CStream,
+        output: *mut ZSTD_outBuffer,
+        input: *mut ZSTD_inBuffer,
+    ) -> usize;
+    pub fn ZSTD_seekable_endStream(
+        zcs: *mut ZSTD_seekable_CStream,
+        output: *mut ZSTD_outBuffer,
+    ) -> usize;
+    pub fn ZSTD_seekable_create() -> *mut ZSTD_seekable;
+    pub fn ZSTD_seekable_free(zs: *mut ZSTD_seekable) -> usize;
+    pub fn ZSTD_seekable_initBuff(
+        zs: *mut ZSTD_seekable,
+        src: *const c_void,
+        srcSize: usize,
+    ) -> usize;
+    pub fn ZSTD_seekable_decompress(
+        zs: *mut ZSTD_seekable,
+        dst: *mut c_void,
+        dstSize: usize,
+        offset: c_ulonglong,
+    ) -> usize;
+    pub fn ZSTD_seekable_getNumFrames(zs: *const ZSTD_seekable) -> c_uint;
+    pub fn ZSTD_seekable_getFrameDecompressedOffset(
+        zs: *const ZSTD_seekable,
+        frameIndex: c_uint,
+    ) -> c_ulonglong;
+    pub fn ZSTD_seekable_getFrameCompressedOffset(
+        zs: *const ZSTD_seekable,
+        frameIndex: c_uint,
+    ) -> c_ulonglong;
+    pub fn ZSTD_seekable_getFrameDecompressedSize(
+        zs: *const ZSTD_seekable,
+        frameIndex: c_uint,
+    ) -> usize;
+}
+
 pub mod corpus;
 pub mod oracle;

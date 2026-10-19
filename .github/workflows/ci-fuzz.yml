@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [differential_c, output_capacity, encoder_session, compressor_lifecycle, parallel, parameter_parsing, decompress, decode_streaming, decode_roundtrip]
+        target: [differential_c, output_capacity, encoder_session, compressor_lifecycle, parallel, parameter_parsing, decompress, decode_streaming, decode_roundtrip, framed_encode, framed_decode, framed_roundtrip]
     steps:
       - uses: actions/checkout@v4
         with:

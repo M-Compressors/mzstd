@@ -96,6 +96,16 @@ name = "decompress"
 harness = false
 required-features = ["decompression"]
 
+[[bench]]
+name = "framed_compress"
+harness = false
+required-features = ["compression", "decompression", "framed"]
+
+[[bench]]
+name = "framed_decompress"
+harness = false
+required-features = ["compression", "decompression", "framed"]
+
 [features]
 default = ["std", "compression", "decompression"]
 # Independently selectable public codecs and their private implementations.
@@ -118,6 +128,16 @@ std = ["branches?/std", "fearless_simd?/std", "thiserror?/std"]
 # Opt-in alloc-backed support; overrides std-only APIs and instrumentation.
 no_std = ["fearless_simd?/libm"]
 
+# Structured, seekable containers of Zstandard frames (`mzstd::framing`):
+# resources, metadata, padding, a central directory and a seek table in the
+# `contrib/seekable_format` layout. The container is this crate's own format,
+# so nothing behind this gate rests on byte identity with a pinned C
+# encoder: its Zstandard frames are byte-identical to `ZSTD_compress2`, and
+# whole containers are checked against zstd's own decoders (visible
+# resources with `ZSTD_decompress`, seeks with the contrib seekable decoder).
+# The API behind this gate may change in a patch release; the default
+# surface may not. It adds nothing without a codec.
+framed = []
 
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]

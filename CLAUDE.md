@@ -158,9 +158,9 @@ explicitly an upstream-vendor update.
 - Keep fuzz targets and seed corpora in a dedicated `fuzz/afl/` tree. Keep the
   fuzz package isolated from normal workspace builds if needed so ordinary
   `cargo test` and `cargo clippy` remain reliable.
-- Keep the fuzz package's `experimental` feature opt-in. Gate experimental
-  target binaries, bodies, helpers, and regression registry entries together.
-  Test both with and without `experimental`; dependency features must not
+- Keep the fuzz package's `framed` feature opt-in. Gate framed target
+  binaries, bodies, helpers, and regression registry entries together.
+  Test both with and without `framed`; dependency features must not
   silently enable it in the stable configuration.
 - Build targets with `cargo afl build`, then run them with
   `cargo afl fuzz -i <seeds> -o <findings> <target-binary>`.
@@ -198,8 +198,10 @@ After changing Rust code:
 2. Run `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
    and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 3. Run `cargo test --workspace --release --locked` and
-   `cargo test --workspace --all-features --release --locked` (`--all-features`
-   turns on `no_std`, which removes `io` and `parallel`, so both are needed;
+   `cargo test --workspace --all-features --release --locked` and
+   `cargo test --workspace --features framed --release --locked`
+   (`--all-features` turns on `no_std`, which removes `io`, `parallel` and the
+   framed std adapters, so all three are needed;
    the differential suites take over an hour without optimizations). After
    changing `compressor::core::window`, `cctx` or `match_state`, also run
    `MZSTD_OVERFLOW_CORRECT_FREQUENTLY=1 CARGO_TARGET_DIR=target-ocf cargo test --release --lib compressor::core`.
@@ -219,9 +221,9 @@ affect them. It is not exempt from the checks. After changing anything under
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --no-default-features -- -D warnings
-cargo clippy --all-targets --no-default-features --features experimental -- -D warnings
+cargo clippy --all-targets --no-default-features --features framed -- -D warnings
 cargo afl test --release --no-default-features
-cargo afl test --release --no-default-features --features experimental
+cargo afl test --release --no-default-features --features framed
 ```
 
 `cargo afl test` rather than `cargo test`: the fuzz binaries link AFL's

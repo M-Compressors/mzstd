@@ -67,6 +67,37 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! # Structured, seekable containers
+//!
+//! With the `framed` feature, the [`framing` module][framing-module] holds ordered
+//! resources, metadata, padding, a central directory and a footer in one
+//! container built only from Zstandard frames: visible resources are
+//! regular frames that any Zstandard decoder extracts, everything else lives
+//! in skippable frames, and a final seek table in zstd's
+//! `contrib/seekable_format` layout lets seekable decoders map offsets to
+//! frames. The [framed compressor][framed-compressor] writes containers;
+//! the [framed decompressor][framed-decompressor] validates and decodes them
+//! as events or as owned resources, and with `std` reads single resources
+//! through `Read + Seek`. The API mirrors mbrotli's framing API.
+//!
+//! ```
+//! # #[cfg(all(feature = "framed", feature = "compression", feature = "decompression"))]
+//! # {
+//! use mzstd::framing::{FramedCompressor, FramedDecompressor, FramedItem, FramedResource};
+//!
+//! let items = [
+//!     FramedItem::Resource(FramedResource::from(&b"first"[..])),
+//!     FramedItem::Resource(FramedResource::from(&b"second"[..])),
+//! ];
+//! let container = FramedCompressor::new(Default::default())?.compress(items.as_slice().into())?;
+//! let output = FramedDecompressor::new(Default::default())?.decompress(&container)?;
+//! assert_eq!(output.resources[1].data, b"second");
+//! // Any Zstandard decoder sees the visible resources, concatenated.
+//! assert_eq!(mzstd::Decompressor::default().decompress(&container)?, b"firstsecond");
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! # Select only the codecs you need
 //!
 //! The default feature set is `std`, `compression`, and `decompression`. Disable default
@@ -77,10 +108,42 @@
 //! ```
 //!
 //! A disabled codec has no module and no re-exports. The `std::io` adapters
-//! and parallel compression need `std`.
+//! and parallel compression need `std`. `framed` adds the container APIs for
+//! whichever codecs are enabled; its `std::io` adapters and seek reader need
+//! `std`.
 //!
 //! [rfc]: https://www.rfc-editor.org/rfc/rfc8878
 // Resolve available APIs locally; unavailable APIs link to feature selection.
+#![cfg_attr(
+    all(
+        feature = "framed",
+        any(feature = "compression", feature = "decompression")
+    ),
+    doc = "[framing-module]: crate::framing"
+)]
+#![cfg_attr(
+    not(all(
+        feature = "framed",
+        any(feature = "compression", feature = "decompression")
+    )),
+    doc = "[framing-module]: #select-only-the-codecs-you-need"
+)]
+#![cfg_attr(
+    all(feature = "framed", feature = "compression"),
+    doc = "[framed-compressor]: crate::framing::FramedCompressor"
+)]
+#![cfg_attr(
+    not(all(feature = "framed", feature = "compression")),
+    doc = "[framed-compressor]: #select-only-the-codecs-you-need"
+)]
+#![cfg_attr(
+    all(feature = "framed", feature = "decompression"),
+    doc = "[framed-decompressor]: crate::framing::FramedDecompressor"
+)]
+#![cfg_attr(
+    not(all(feature = "framed", feature = "decompression")),
+    doc = "[framed-decompressor]: #select-only-the-codecs-you-need"
+)]
 #![cfg_attr(
     feature = "compression",
     doc = r#"
@@ -231,6 +294,25 @@ pub use compressor::{
 
 #[cfg(feature = "decompression")]
 pub mod decompressor;
+
+#[cfg(all(
+    feature = "framed",
+    any(feature = "compression", feature = "decompression")
+))]
+pub mod framing;
+#[cfg(all(feature = "framed", feature = "compression"))]
+pub use compressor::framing::{
+    FramedCompressor, FramedCompressorBuilder, FramedEncodeConfig, FramedEncodeError,
+    FramedEncodeFailure, FramedEncodeLocation, FramedEncodeOperation, FramedEncodeProgress,
+    FramedEncodeStreamConfig, FramedEncoderSession, FramedEncoderSessionOwned, FramedEncoderStatus,
+    FramedResourceSession,
+};
+#[cfg(all(feature = "framed", feature = "decompression"))]
+pub use decompressor::framing::{
+    FramedDecodeConfig, FramedDecodeError, FramedDecodeFailure, FramedDecodeLimits,
+    FramedDecodeStreamConfig, FramedDecoderSession, FramedDecoderSessionOwned, FramedDecompressor,
+    FramedOutput,
+};
 
 #[cfg(feature = "decompression")]
 pub use decompressor::{

@@ -12,6 +12,9 @@ use zstd_ffi::*;
 
 pub mod targets;
 
+#[cfg(feature = "framed")]
+pub mod framed_targets;
+
 /// Largest payload any target compresses.
 ///
 /// Long inputs stop adding coverage quickly while slowing every iteration;

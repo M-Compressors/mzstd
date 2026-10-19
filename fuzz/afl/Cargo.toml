@@ -16,12 +16,27 @@ path = "../../zstd-ffi"
 
 [features]
 default = []
-# Opt-in targets for surfaces still marked experimental. None exist yet; the
-# flag is kept so the stable and experimental configurations are both checked.
-experimental = []
+# Opt-in targets for mzstd's framed containers; the stable configuration
+# builds and replays without them.
+framed = ["mzstd/framed"]
 
 [profile.release]
 debug = true
 codegen-units = 1
 
 [workspace]
+
+[[bin]]
+name = "framed_encode"
+path = "src/bin/framed_encode.rs"
+required-features = ["framed"]
+
+[[bin]]
+name = "framed_decode"
+path = "src/bin/framed_decode.rs"
+required-features = ["framed"]
+
+[[bin]]
+name = "framed_roundtrip"
+path = "src/bin/framed_roundtrip.rs"
+required-features = ["framed"]

@@ -8,6 +8,35 @@ published reports in [`docs/benchmarks/`](../docs/benchmarks/README.md).
 This page describes the comparison harness; [running it](../docs/benchmarking.md)
 is described with the commands.
 
+## Framed container benches
+
+`benches/framed_compress.rs` and `benches/framed_decompress.rs` need
+`--features framed`. They compare [framed containers](framing.md) with the
+closest thing zstd ships, the contrib seekable format compiled into
+`zstd-ffi`: identical inputs (`zstd_ffi::corpus` text, binary and mixed
+data, a 16 KiB text, 512 records), identical levels and 64 KiB frames.
+Before timing, every container must decode with `FramedDecompressor`,
+`ZSTD_decompress` and `ZSTD_seekable_decompress`, and every reference output
+with the seekable reader; both sizes are printed.
+
+```mermaid
+flowchart LR
+    In["corpus input"] --> M["FramedCompressor::compress_into, reused owner"]
+    In --> C["ZSTD_seekable_compressStream, maxFrameSize 64 KiB"]
+    M --> V{"decodes with mzstd, ZSTD_decompress, contrib seekable"}
+    C --> V
+    V --> T[Criterion timing, throughput in input bytes]
+    Ct["container (level 3, 64 KiB chunks)"] --> D1["FramedDecompressor::decompress_into"]
+    Ct --> D2["FramedSeekReader resource read"]
+    Ct --> D3["ZSTD_decompressDCtx"]
+    Ct --> D4["ZSTD_seekable_initBuff + decompress"]
+```
+
+The records case stores each record as its own resource and compares with
+one `ZSTD_compress2` frame per record; the difference in size is the
+container's per-resource structure (header frame, directory record and seek
+table entries).
+
 ## Module map
 
 ```mermaid

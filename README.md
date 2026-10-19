@@ -107,7 +107,32 @@ either for a whole input at once or for input that arrives in chunks. It require
 | `decompression` | yes | `mzstd::decompressor` |
 | `std` | yes | `std::error::Error`, `mzstd::io`, parallel compression |
 | `no_std` | no | alloc-only build; overrides `std` |
+| `framed` | no | `mzstd::framing`: seekable containers of resources and metadata, built only from Zstandard frames (see below) |
 | `hotpath`, `hotpath-cpu`, `hotpath-alloc` | no | profiling anchors |
+
+## Framed containers
+
+With `features = ["framed"]`, `mzstd::framing` stores ordered resources,
+metadata, padding, a central directory and a footer in one container,
+with the same API as mbrotli's framing. The container is only Zstandard
+frames: every visible resource is a sequence of regular frames, so
+`zstd -d` prints the visible resources concatenated; everything else is
+in skippable frames; and the last frame is a seek table in zstd's
+`contrib/seekable_format` layout, which seekable readers use to jump to
+any offset.
+
+```rust
+use mzstd::framing::{FramedCompressor, FramedDecompressor, FramedItem, FramedResource};
+
+let items = [FramedItem::Resource(FramedResource::from(&b"payload"[..]))];
+let container = FramedCompressor::new(Default::default())?.compress(items.as_slice().into())?;
+let output = FramedDecompressor::new(Default::default())?.decompress(&container)?;
+assert_eq!(output.resources[0].data, b"payload");
+```
+
+`FramedDecompressor::framed_seek_reader` reads one resource of a container
+through any `Read + Seek` source. The format is specified in
+[architecture/framing.md](architecture/framing.md).
 
 ## Performance
 

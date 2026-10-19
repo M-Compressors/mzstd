@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 const LIB: &str = "vendor/zstd/lib";
+const SEEKABLE: &str = "vendor/zstd/contrib/seekable_format";
 
 fn c_sources(directory: &str) -> Vec<PathBuf> {
     let mut sources = fs::read_dir(directory)
@@ -49,6 +50,16 @@ fn main() {
     configure(&mut library);
     library.files(&sources).compile("zstd");
 
+    // The contrib seekable format is the oracle and baseline for framed
+    // containers.
+    let mut seekable = cc::Build::new();
+    configure(&mut seekable);
+    seekable
+        .include(SEEKABLE)
+        .file(format!("{SEEKABLE}/zstdseek_compress.c"))
+        .file(format!("{SEEKABLE}/zstdseek_decompress.c"))
+        .compile("zstd_seekable");
+
     let mut shim = cc::Build::new();
     configure(&mut shim);
     shim.file("shim/zstd_shim.c").compile("zstd_shim");
@@ -56,12 +67,14 @@ fn main() {
     // Dependents precede their dependencies for single-pass static linkers.
     println!("cargo:rustc-link-search=native={output_directory}");
     println!("cargo:rustc-link-lib=static=zstd_shim");
+    println!("cargo:rustc-link-lib=static=zstd_seekable");
     println!("cargo:rustc-link-lib=static=zstd");
 
     for source in sources {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     println!("cargo:rerun-if-changed=shim");
+    println!("cargo:rerun-if-changed={SEEKABLE}");
     println!("cargo:rerun-if-changed={LIB}/zstd.h");
     println!("cargo:rerun-if-changed=UPSTREAM_VERSION");
     println!("cargo:rerun-if-env-changed=MZSTD_OVERFLOW_CORRECT_FREQUENTLY");

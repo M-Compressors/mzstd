@@ -21,6 +21,9 @@ include = [
     "vendor/zstd/lib/zdict.h",
     "vendor/zstd/lib/zstd.h",
     "vendor/zstd/lib/zstd_errors.h",
+    "vendor/zstd/contrib/seekable_format/zstd_seekable.h",
+    "vendor/zstd/contrib/seekable_format/zstdseek_compress.c",
+    "vendor/zstd/contrib/seekable_format/zstdseek_decompress.c",
 ]
 
 [build-dependencies]

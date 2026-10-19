@@ -27,9 +27,10 @@ jobs:
       # the default feature set is linted as well.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --features hotpath-cpu,hotpath-alloc --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features framed --locked -- -D warnings
       - name: clippy for every codec and std combination
         run: |
-          for features in std,compression std,decompression no_std,compression no_std,decompression ""; do
+          for features in std,compression std,decompression no_std,compression no_std,decompression std,compression,framed std,decompression,framed no_std,compression,framed no_std,decompression,framed ""; do
             echo "::group::features '$features'"
             cargo clippy -p mzstd --all-targets --no-default-features --features "$features" --locked -- -D warnings
             echo "::endgroup::"
@@ -39,7 +40,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: |
           cargo doc --workspace --no-deps --locked
-          for features in std,compression std,decompression no_std,compression,decompression; do
+          for features in std,compression std,decompression no_std,compression,decompression std,compression,framed std,decompression,framed std,compression,decompression,framed; do
             cargo doc -p mzstd --no-deps --no-default-features --features "$features" --locked
           done
       - run: cargo package -p mzstd --allow-dirty --locked
@@ -81,6 +82,8 @@ jobs:
       # The differential suites are far too slow without optimizations.
       - run: cargo test --workspace --release --locked
       - run: cargo test --workspace --all-features --release --locked
+      # all-features turns on no_std, so the std framed adapters are tested here.
+      - run: cargo test --workspace --features framed --release --locked
 
   overflow-correction:
     name: differential suites with frequent index overflow correction
@@ -124,11 +127,11 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --no-default-features -- -D warnings
-          cargo clippy --all-targets --no-default-features --features experimental -- -D warnings
+          cargo clippy --all-targets --no-default-features --features framed -- -D warnings
       # `cargo afl test` rather than `cargo test`: the fuzz binaries link AFL's
       # runtime, so plain `cargo test` cannot link them.
       - name: replay the regression corpus
         working-directory: fuzz/afl
         run: |
           cargo afl test --release --no-default-features
-          cargo afl test --release --no-default-features --features experimental
+          cargo afl test --release --no-default-features --features framed

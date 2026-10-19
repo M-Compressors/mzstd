@@ -18,6 +18,8 @@ graph TD
     Reg --> Replay["tests/regressions.rs (cargo afl test)"]
     Replay --> Body
     Bench["tests/benchmark_corpora.rs: the comparison benchmark's 8 inputs x 24 levels"] --> Body
+    Framed["framed feature: src/framed_targets.rs, bins framed_*"] --> Mzstd
+    Framed --> Ref
 ```
 
 ## Input layout
@@ -61,9 +63,42 @@ exhaust memory. The decoder rejects some inputs the reference accepts (see
 [decompressor](decompressor.md#compatibility-with-the-reference-decoder)),
 so a rejection by mzstd is not compared with the reference.
 
-The `experimental` feature is empty and gates no target yet. It exists so
-that both configurations are checked as targets are added; the fuzz package's
-dependencies never enable it.
+## Framed targets
+
+The opt-in `framed` feature (`framed = ["mzstd/framed"]`) builds three more
+targets from `src/framed_targets.rs`. Their binaries require the feature,
+their module and their entries in `tests/regressions.rs` are gated on it
+together, and `framed_targets_follow_feature_selection` checks, in both
+configurations, that each binary requires `framed` and has committed
+regressions. The fuzz package's dependencies never enable the feature, so the
+stable configuration builds and replays without these targets.
+
+```mermaid
+flowchart LR
+    E["framed_encode: selector byte + payload (≤ 1 KiB)"] --> S1["native session schedule, chunk size 1-31, output width 1/2/7/31"]
+    S1 --> Eq["= FramedWriter = compress = framed_reader"]
+    Eq --> D1["FramedDecompressor, ZSTD_decompress (with the raw prefix for shared resources), contrib seekable reader"]
+    R["framed_roundtrip: two settings bytes + payload (≤ 4 KiB)"] --> W[FramedWriter, repeated metadata, chunk size 1-63, five levels]
+    W --> D2["decode, seek read, ZSTD_decompress, contrib seekable range"]
+    D2 --> Dec
+    Dec["framed_decode: arbitrary bytes (≤ 64 KiB)"] --> O["Auto mode one-shot, FramedOnly, Vec rollback"]
+    Dec --> St["streaming on every backend: split input, outputs 0-32 bytes"]
+    Dec --> Sk["seek reader over a Cursor"]
+```
+
+| Target | Oracle |
+| --- | --- |
+| `framed_encode` | Byte 0 selects the chunk size (`% 31 + 1`), flush at the middle (bit 0), stored (bit 2) or prefix-dictionary (bit 3) encoding, hidden (bit 4), a checksum identity (bit 5), the output width (bits 6-7) and the backend. A native session (also checking `OutputPending`, a rejected lowercase global field and a dangling internal reference) equals `FramedWriter`, and without a flush `compress` and `framed_reader`. The container decodes back with a resolver; `ZSTD_decompress` outputs exactly the payload when visible and nothing when hidden; without a dictionary the contrib seekable reader agrees. |
+| `framed_decode` | Arbitrary bytes, Auto mode with tight limits: no panic or zero-progress loop. Raw input decodes like `Decompressor`; a framed container without dictionaries decodes with `ZSTD_decompress` and the contrib seekable reader to its visible resources; `FramedOnly` accepts exactly the framed results; `decompress_into` rolls back; a session fed `stride` input bytes and 0-32 output bytes per call on every backend agrees with one-shot decoding, never over-reports progress, and finishes with zero progress; a seek reader over the same bytes, when it opens, returns every resource and its metadata exactly as the sequential decode. |
+| `framed_roundtrip` | Two settings bytes (chunk size `% 63 + 1`, level among 1, 3, 9, 19, -5, checksum) and a payload through `FramedWriter` with resource metadata and repeated metadata: the decode, a seek read, `ZSTD_decompress` and a contrib seekable read from a third of the payload all return it; then the container goes through `framed_decode`. |
+
+Their regressions hold boundary inputs (empty, a lone selector, a bare
+container header, a dictionary magic, raw Zstandard frames, a truncated
+container) and containers covering every chunk kind, hidden and stored
+resources, external and internal dictionary references and the
+single-resource profile, generated once with the encoder.
+`campaign.sh` builds with `--features framed` and seeds these targets from
+their regressions.
 
 ## Corpora
 

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Framed containers (`framed` feature).** `mzstd::framing` ports
+  mbrotli's structured framing API one to one — `FramedCompressor` with
+  borrowed one-shot input, native and owned sessions, resource guards,
+  `FramedWriter`/`ResourceWriter` and `FramedEncoderReader`;
+  `FramedDecompressor` with owned, appended and sliced one-shot output,
+  event sessions, `FramedReader` and the random-access `FramedSeekReader`;
+  resources, metadata (resource, footer, global, repeated), padding,
+  hidden resources, explicit dictionary references, a central directory and
+  a footer. In place of RFC 9841's Brotli wire format the container is made
+  only of Zstandard frames: visible resource chunks are regular frames,
+  byte-identical to `ZSTD_compress2` of each chunk, so `zstd -d` prints the
+  visible resources; headers, metadata, hidden resources and the directory
+  live in skippable frames; and the container ends with a seek table in
+  zstd's `contrib/seekable_format` layout. Tests check every container
+  against `ZSTD_decompress` and the contrib seekable decoder, which
+  `zstd-ffi` now builds as an oracle (along with the contrib seekable
+  compressor, the benchmarks' baseline). The fuzz package's opt-in
+  `experimental` feature is replaced by `framed`, which gates the
+  `framed_encode`, `framed_decode` and `framed_roundtrip` targets. The
+  format is specified in `architecture/framing.md`; the API may change in
+  patch releases while the feature is opt-in.
+
 - **Clarified `ParallelTaskQueue` documentation.** Stopped executors can
   leave `wait`, the blocking reader and writer and the writer's finishing
   waiting indefinitely; dropping queue handles or tasks reports closure or
