@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v0.2.8](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.8) - 2026-10-20
 
 - **Framed containers (`framed` feature).** `mzstd::framing` ports
   mbrotli's structured framing API one to one — `FramedCompressor` with
