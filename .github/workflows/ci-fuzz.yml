@@ -23,7 +23,7 @@ jobs:
       matrix:
         target: [differential_c, output_capacity, encoder_session, compressor_lifecycle, parallel, parameter_parsing, decompress, decode_streaming, decode_roundtrip, framed_encode, framed_decode, framed_roundtrip]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
           if [ -d fuzz/afl/findings ]; then
             tar -czf findings-${{ matrix.target }}.tar.gz -C fuzz/afl findings
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: findings-${{ matrix.target }}
