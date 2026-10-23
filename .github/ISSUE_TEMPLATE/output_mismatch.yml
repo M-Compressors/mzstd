@@ -1,0 +1,68 @@
+name: Output differs from zstd
+description: Single-threaded compression wrote different bytes than zstd 1.5.7 for the same input and parameters.
+labels: ["bug", "byte-identity"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        mzstd's single-threaded encoder must match zstd 1.5.7 byte for byte:
+        one-shot calls match `ZSTD_compress2`, and sessions match
+        `ZSTD_compressStream2` driven with the same chunks, output capacities
+        and flushes.
+
+        Not covered by this guarantee: parallel compression (its frames are
+        valid but differ from zstd's multithreaded mode), `targetCBlockSize`,
+        and external sequence producers.
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: |
+        The `EncoderConfig` you used and the equivalent zstd parameters
+        (level, explicit `CompressionParams`, LDM, checksum, content size,
+        pledged size, size hint, dictionary).
+      render: rust
+    validations:
+      required: true
+  - type: dropdown
+    id: api
+    attributes:
+      label: API mode
+      options:
+        - One-shot (compared with ZSTD_compress2)
+        - Session, reader or writer (compared with ZSTD_compressStream2)
+    validations:
+      required: true
+  - type: textarea
+    id: schedule
+    attributes:
+      label: Streaming schedule
+      description: For sessions, the input chunk sizes, output capacities, and flush/end calls, in order.
+  - type: textarea
+    id: input
+    attributes:
+      label: Input
+      description: |
+        Attach the input (and dictionary, if any), or describe how to generate
+        it. A minimized input is much easier to debug.
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: Where the outputs differ
+      description: Output lengths and the first differing offset, if you know them.
+  - type: input
+    id: version
+    attributes:
+      label: mzstd version or commit
+      placeholder: 0.2.8
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Target and CPU
+      placeholder: aarch64-apple-darwin, Apple M2
+    validations:
+      required: true

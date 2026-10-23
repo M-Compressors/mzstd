@@ -207,6 +207,17 @@ and verified.
 - Legacy (v0.x) frames
 - Byte identity with zstd's multithreaded mode
 
+## Contributing
+
+Bug reports, differential test cases, fuzz findings and pull requests are
+welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks a
+change must pass, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). If
+compression output differs from zstd 1.5.7, open an issue with the
+[Output differs from zstd][mismatch] template.
+
+Report security vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md), not as public issues.
+
 ## License
 
 Licensed under either of
@@ -227,6 +238,7 @@ conditions.
 [crate]: https://crates.io/crates/mzstd
 [api]: https://docs.rs/mzstd
 [ci]: https://github.com/M-Compressors/mzstd/actions/workflows/ci.yml
+[mismatch]: https://github.com/M-Compressors/mzstd/issues/new?template=output_mismatch.yml
 [benchmarks]: ./docs/benchmarks/README.md
 [bench-levels]: ./docs/benchmarks/encoders/README.md
 [bench-csv]: ./docs/benchmarks/encoder-comparison.csv
