@@ -15,7 +15,7 @@ jobs:
     name: fmt, clippy, docs and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -49,7 +49,7 @@ jobs:
     name: no_std host tests and bare-metal compilation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -72,7 +72,7 @@ jobs:
           - os: ubuntu-latest
             toolchain: "1.89"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@master
@@ -92,7 +92,7 @@ jobs:
       # Read at build time by both mzstd and the vendored C library.
       MZSTD_OVERFLOW_CORRECT_FREQUENTLY: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -105,7 +105,7 @@ jobs:
     name: fuzz targets and their regression corpus
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
