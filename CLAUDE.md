@@ -63,7 +63,9 @@ explicitly an upstream-vendor update.
 
 - Measure before optimizing. Use `hotpath` on representative release-mode
   workloads to locate CPU and allocation hot paths. Keep instrumentation behind
-  the existing `hotpath`, `hotpath-cpu`, and `hotpath-alloc` features.
+  the existing `hotpath`, `hotpath-cpu`, `hotpath-alloc`, and
+  `hotpath-callgrind` features (`examples/profile_compressor.rs` is the
+  driver; the `hotpath benchmark` workflow tracks its instruction counts).
 - Implement confirmed hot paths with `fearless_simd`. Keep a correct baseline
   implementation and select the SIMD level outside inner loops so feature
   detection and dispatch are not repeated per block or element.

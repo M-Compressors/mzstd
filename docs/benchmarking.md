@@ -252,6 +252,18 @@ for regressions, and report intervals and noisy cases alongside improvements.
   `--dump-instr=yes` or `--cache-sim=yes`) on a build with
   `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` gives exact instruction
   counts per function and source line; `callgrind_annotate` reads them.
+- **Instruction counts per stage.** On x86_64 Linux, `hotpath-callgrind`
+  replaces the timing table with per-anchor instruction counts from
+  Callgrind. The `hotpath benchmark` workflow runs this on every pull request
+  and uploads the report to hotpath Cloud, judged by `hotpath/policy.toml`;
+  compare counts only within one Valgrind version, Rust toolchain and runner
+  image:
+
+  ```sh
+  cargo build --release --locked --example profile_compressor --features hotpath-alloc,hotpath-callgrind
+  valgrind -q --tool=callgrind --instr-atstart=no \
+    target/release/examples/profile_compressor testdata/alice29.txt
+  ```
 - **Code.** `cargo asm --lib --release '<symbol>'` shows what a kernel compiled
   to; the SIMD-dispatched kernels appear as `vectorize_avx2::<…::{closure}>`
   symbols.

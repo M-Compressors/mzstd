@@ -22,6 +22,8 @@ flowchart TD
     H[hotpath] --> HP[hotpath crate: measurement anchors]
     HC[hotpath-cpu] --> H
     HA[hotpath-alloc] --> H
+    HG[hotpath-callgrind] --> H
+    HCl[hotpath-cloud] --> H
 ```
 
 | Feature | Effect |
@@ -31,7 +33,7 @@ flowchart TD
 | `std` | `std::error::Error` for every error type, plus, unless `no_std` is also set, `mzstd::io` (reader and writer adapters, `FinishError`) and `compressor::parallel`. |
 | `no_std` | `#![no_std]` with `alloc`; it wins over `std`, so `--all-features` builds the alloc-only crate. One-shot calls, sessions, owned sessions and retention remain. `Backend::default()` is then the compile-time baseline level instead of the detected one. |
 | `framed` | `mzstd::framing` with either codec: its neutral types always; `FramedCompressor` and its sessions with `compression`; `FramedDecompressor` and its sessions with `decompression`. `FramedWriter`, `ResourceWriter`, `FramedEncoderReader`, `FramedReader` and `FramedSeekReader` also need std (not `no_std`). Enables no codec by itself and adds no dependency. |
-| `hotpath`, `hotpath-cpu`, `hotpath-alloc` | Turn on the `hotpath::measure` anchors at stage boundaries (one-shot compression, frame chunks, sequence building, entropy coding, LDM, parallel segments, and the decoder's frame, block, literal, Huffman and sequence stages). Ignored with `no_std`. |
+| `hotpath`, `hotpath-cpu`, `hotpath-alloc`, `hotpath-callgrind`, `hotpath-cloud` | Turn on the `hotpath::measure` anchors at stage boundaries (one-shot compression, frame chunks, sequence building, entropy coding, LDM, parallel segments, and the decoder's frame, block, literal, Huffman and sequence stages). `hotpath-cpu` and `hotpath-alloc` add CPU and allocation metrics, `hotpath-callgrind` replaces timing with Valgrind Callgrind instruction counts per anchor, and `hotpath-cloud` lets the report be uploaded to hotpath Cloud. `examples/profile_compressor.rs` (needs `compression`) carries `#[hotpath::main]`. Ignored with `no_std`, but the dependency stays in the graph, so bare-metal builds must omit every `hotpath*` feature. |
 
 With neither codec enabled, the crate exposes nothing; `backend`,
 `retention`, `shared`, `dictionary` (its content type, ID and error) and
