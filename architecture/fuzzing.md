@@ -4,7 +4,9 @@ AFL++ targets live in `fuzz/afl`, a package excluded from the workspace
 because its binaries link AFL's runtime. Target bodies are plain functions
 in `src/targets.rs`; each binary in `src/bin/` is a three-line
 `afl::fuzz!` adapter, so committed inputs replay through the same bodies
-under `cargo afl test` without instrumentation.
+under `cargo afl test` without instrumentation. A second excluded package,
+`fuzz/libfuzzer`, runs the same bodies under libFuzzer for ClusterFuzzLite;
+see [libFuzzer adapters and ClusterFuzzLite](#libfuzzer-adapters-and-clusterfuzzlite).
 
 ```mermaid
 graph TD
@@ -165,6 +167,83 @@ found no crashes or hangs: `differential_c` 1,470 new corpus items,
 3,365, `parallel` 185, `parameter_parsing` 3,683, `decompress` 387,
 `decode_streaming` 1,119, `decode_roundtrip` 226, `decode_dictionary`
 1,174, `compress_dictionary` 2,746.
+
+## libFuzzer adapters and ClusterFuzzLite
+
+`fuzz/libfuzzer` is a cargo-fuzz package excluded from the root workspace,
+like `fuzz/afl`. It owns no target logic: each of its 14 `fuzz_targets/*.rs`
+files is a `libfuzzer_sys::fuzz_target!` adapter around the body the AFL
+binary of the same name runs, taken from the `mzstd-afl` library by path. That
+library names no AFL symbol; only `fuzz/afl/src/bin/` calls `afl::fuzz!`, and
+nothing in the libFuzzer package links those binaries. A libFuzzer finding
+therefore replays through `cargo afl test` once its input is committed under
+`fuzz/afl/regressions/<target>/`.
+
+```mermaid
+graph TD
+    subgraph afl["fuzz/afl"]
+        aflbins["src/bin/ — afl::fuzz! adapters"]
+        bodies["library: targets, framed_targets, decode_config"]
+        regs["regressions/ and tests/regressions.rs"]
+    end
+    subgraph lf["fuzz/libfuzzer"]
+        lfbins["fuzz_targets/ — fuzz_target! adapters<br/>11 stable, 3 framed"]
+    end
+    subgraph cflite[".clusterfuzzlite"]
+        docker["Dockerfile: base-builder-rust"]
+        build["build.sh"]
+    end
+    aflbins --> bodies
+    regs --> bodies
+    lfbins --> bodies
+    docker --> build
+    build -->|cargo fuzz build| lfbins
+    build -->|prepare-seeds.sh, regressions| corpora["OUT/target_seed_corpus.zip"]
+```
+
+The bodies take only the input bytes, so the adapters hold no state. The
+framed adapters carry `required-features = ["framed"]`, the gate their
+bodies already share; the package's `framed` feature only forwards to
+`mzstd-afl/framed`. The targets are exactly the AFL package's: all eleven
+stable ones and `framed_decode`, `framed_encode` and `framed_roundtrip`.
+
+### Build and corpora
+
+`build.sh` runs inside ClusterFuzzLite's Rust image. It fetches the pinned
+zstd submodule when the checkout left it empty, because every C oracle and the
+seed script need it. It then builds twice, each time with
+`-O --debug-assertions`, which also turns on overflow checks:
+
+```mermaid
+flowchart TD
+    Start[build.sh] --> Sub{vendored zstd present?}
+    Sub -->|no| Fetch[git submodule update at the pinned commit]
+    Sub -->|yes| Stable
+    Fetch --> Stable[cargo fuzz build into WORK/stable]
+    Stable --> ShipS[copy every built target to OUT]
+    ShipS --> Framed[cargo fuzz build --features framed into WORK/framed]
+    Framed --> ShipF[copy only targets not yet in OUT]
+    ShipF --> Seeds[prepare-seeds.sh]
+    Seeds --> Zip[per target: mapped seeds plus regressions, zipped]
+```
+
+The stable binaries come from a build without `framed`, so they fuzz the
+default surface a dependant gets; the framed build's copies of the same
+targets are not shipped. The two builds use separate target directories.
+
+Seed selection follows `campaign.sh`: `decompress` takes `seeds/frames`;
+`decode_streaming`, `decode_dictionary`, `compress_dictionary` and the framed
+targets read their own layouts and take only their regressions; every other
+target takes `seeds/params`. Every target also gets its committed
+`regressions/<target>/` inputs. Files get a `seeds-` or `regressions-` prefix
+so equal names cannot collide. No size filter is applied: `prepare-seeds.sh`
+cuts payloads to 64 KiB, the largest regression is under the 256 KiB payload
+cap, and libFuzzer guesses its default maximum input length from the
+corpus, so dropping the larger regressions would also stop it from generating
+inputs that span several blocks. No target has a dictionary.
+
+The workflows that run these binaries are described in
+[CI](ci.md#clusterfuzzlite).
 
 ## Known gaps
 

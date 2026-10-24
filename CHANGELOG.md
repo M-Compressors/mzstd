@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Continuous fuzzing with ClusterFuzzLite**, ported from mbrotli.
+  `fuzz/libfuzzer` wraps all 14 AFL target bodies (11 stable, 3 framed) as
+  libFuzzer targets, which `.clusterfuzzlite/build.sh` builds with
+  AddressSanitizer, debug assertions and overflow checks and seeds from the
+  AFL corpora and committed regressions. Pull requests that touch code get a
+  ten-minute run on the changed code (`ci-cflite-pr.yml`). A daily workflow
+  runs 5.5 hours of batch fuzzing, then corpus pruning and a coverage report
+  (`ci-cflite-cron.yml`). `ci.yml` lints the adapters. The published crate
+  is unchanged.
+
 - **Miri and AddressSanitizer workflows**, ported from mbrotli and run on
   every `v*` tag or on demand. `ci-miri.yml` runs `scripts/miri.sh`, which
   interprets only the tests that reach `unsafe` in dependencies: the

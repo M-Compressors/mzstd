@@ -32,6 +32,9 @@ campaign; `cargo afl system-config` makes them (it runs `sudo`).
 | `campaign.sh` | Runs targets in parallel for a fixed time |
 | `seeds/`, `findings/` | Local artifacts, never committed |
 
+The same target bodies also run under libFuzzer for ClusterFuzzLite; see
+[`fuzz/libfuzzer`](../libfuzzer/README.md).
+
 ## Input layout
 
 `decode_config` reads byte 0 as the level (`value % 40`: `0..=32` map to

@@ -146,7 +146,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 
 [workspace]
 members = ["zstd-ffi", "mzstd-ffi"]
-# The fuzz package pulls in AFL's instrumentation runtime; keeping it out of
-# the workspace leaves `cargo test` and `cargo clippy` unaffected by it.
-exclude = ["benchmarks/comparison", "fuzz/afl"]
+# The fuzz packages pull in AFL's and libFuzzer's runtimes; keeping them out of
+# the workspace leaves `cargo test` and `cargo clippy` unaffected by them.
+exclude = ["benchmarks/comparison", "fuzz/afl", "fuzz/libfuzzer"]
 resolver = "3"

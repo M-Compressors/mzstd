@@ -193,7 +193,8 @@ capacity from the frame header.
 - AFL++ targets in `fuzz/afl`. Encoder targets: differential, output
   capacity, sessions, lifecycle, parallel and parameter parsing. Decoder
   targets: raw input against the reference decoder, chunked sessions, and
-  reference-written frames.
+  reference-written frames. ClusterFuzzLite runs the same targets under
+  libFuzzer and AddressSanitizer daily and on pull requests that touch code.
 - Miri over the code that reaches `unsafe` in dependencies (the
   `fearless_simd` vector kernels and `borrowed-buf` uninitialized output),
   and AddressSanitizer over the integration tests, on every release tag.

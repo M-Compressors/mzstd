@@ -38,6 +38,7 @@ graph TD
     CABI["mzstd-ffi: C ABI crate"] --> Root
     Fuzz["fuzz/afl (excluded package)"] -.-> Root
     Fuzz -.-> Ref
+    LibFuzz["fuzz/libfuzzer (excluded package): ClusterFuzzLite adapters"] -.-> Fuzz
     Cmp["benchmarks/comparison (excluded package): cold C vs mzstd reports"] -.-> Root
     Cmp -.-> Ref
 ```
@@ -65,8 +66,8 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman and sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
-| [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns. |
-| [CI](ci.md) | Workflows and the checks they run; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`. |
+| [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
+| [CI](ci.md) | Workflows and the checks they run; ClusterFuzzLite pull request and daily fuzzing; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
 
 ## Known gaps

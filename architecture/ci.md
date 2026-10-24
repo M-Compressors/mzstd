@@ -2,7 +2,10 @@
 
 GitHub Actions workflows live in `.github/workflows`. Every job checks out
 submodules recursively, because the C reference in
-`zstd-ffi/vendor/zstd` is needed to build the test oracle.
+`zstd-ffi/vendor/zstd` is needed to build the test oracle. The
+ClusterFuzzLite jobs are the exception: their actions check out the
+repository themselves, and `.clusterfuzzlite/build.sh` fetches the
+submodule.
 
 ```mermaid
 graph TD
@@ -12,6 +15,10 @@ graph TD
     CI --> Test["test: Linux x86-64, Linux arm64, macOS, and MSRV 1.89 — release mode"]
     CI --> OCF["overflow-correction: core differential suites with MZSTD_OVERFLOW_CORRECT_FREQUENTLY"]
     CI --> Fuzz["fuzz: fmt/clippy of fuzz/afl, regression replay with and without framed"]
+    CI --> LibFuzzer["libfuzzer: fmt/clippy of fuzz/libfuzzer with and without framed"]
+    PR[pull request touching code] --> CFPR["ci-cflite-pr.yml: ClusterFuzzLite on the changed code"]
+    Daily[daily schedule or manual] --> CFCron["ci-cflite-cron.yml: batch, prune, coverage"]
+    CFCron -. coverage report selects targets .-> CFPR
     Manual[workflow_dispatch] --> Cov["ci-coverage.yml: llvm-cov, 100% function coverage"]
     Manual --> Bench["ci-benchmarks.yml: Criterion smoke runs with differential checks"]
     Tag[v* tag or manual] --> Camp["ci-fuzz.yml: bounded AFL campaign per target"]
@@ -22,7 +29,9 @@ graph TD
 
 | Workflow | Trigger | Checks |
 | --- | --- | --- |
-| `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. |
+| `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
+| `ci-cflite-pr.yml` | pull requests touching `src/`, `zstd-ffi/`, `fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow | ClusterFuzzLite libFuzzer/ASan run on the changed code, 600 s. See [ClusterFuzzLite](#clusterfuzzlite). |
+| `ci-cflite-cron.yml` | daily, manual | ClusterFuzzLite batch fuzzing (5.5 h), corpus pruning and a coverage report. |
 | `ci-coverage.yml` | manual | `cargo llvm-cov --workspace --release` with `--fail-under-functions 100` over repository-owned sources (zstd-ffi and the vendored C excluded); HTML report as an artifact. |
 | `ci-benchmarks.yml` | manual | Short `compress`, `decompress` and `mzstd-ffi` `one_shot` runs. Each benchmark asserts byte identity with zstd before timing. The framed benches (`framed_compress`, `framed_decompress`) are run locally with `--features framed`. |
 | `ci-fuzz.yml` | `v*` tags, manual | `prepare-seeds.sh`, then `campaign.sh` for each target, the three framed targets included (600 s by default); findings uploaded as `findings-<target>.tar.gz`, since AFL file names contain `:`, which `upload-artifact` rejects. |
@@ -33,6 +42,55 @@ graph TD
 All Cargo invocations that build the workspace pass `--locked`, because
 `Cargo.lock` is committed so that benchmark baselines and campaigns are
 reproducible.
+
+## ClusterFuzzLite
+
+Both ClusterFuzzLite workflows build `.clusterfuzzlite/Dockerfile` with
+`google/clusterfuzzlite/actions/build_fuzzers@v1` and run the binaries that
+`build.sh` produces from `fuzz/libfuzzer` (see
+[fuzzing](fuzzing.md#libfuzzer-adapters-and-clusterfuzzlite)). The actions do
+their own checkout, so the workflows have no checkout step and `build.sh`
+fetches the vendored zstd submodule itself. Runs use libFuzzer with
+AddressSanitizer, the only engine and sanitizer ClusterFuzzLite supports for
+Rust, and the coverage job builds with the coverage sanitizer. All jobs use
+read-only permissions; corpora, crashes and coverage reports are kept as
+workflow artifacts, ClusterFuzzLite's default storage on GitHub.
+
+```mermaid
+sequenceDiagram
+    participant PR as pull request
+    participant Cron as daily schedule
+    participant CF as ClusterFuzzLite actions
+    participant Store as workflow artifacts
+    PR->>CF: build (address), run code-change, 600 s
+    Store-->>CF: latest corpus and coverage report
+    CF-->>PR: job fails on a crash, with the reproducer
+    Cron->>CF: batch: build (address), fuzz 19800 s, targets in parallel
+    CF->>Store: grown corpus, crashes
+    Cron->>CF: prune: minimize corpus, 600 s
+    CF->>Store: pruned corpus
+    Cron->>CF: coverage: build (coverage), report
+    CF->>Store: coverage report
+```
+
+`ci-cflite-pr.yml` runs only when a pull request touches `src/`, `zstd-ffi/`,
+`fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow
+itself, and a newer push cancels the run in progress. Code-change mode runs
+only the targets whose coverage reaches the changed lines once a coverage
+report exists, and every target before that. The 600 seconds are split among
+the targets it runs.
+
+In `ci-cflite-cron.yml` the jobs are chained: pruning follows batch fuzzing
+(ClusterFuzzLite requires pruning whenever batch fuzzing runs), and coverage
+follows pruning, so the report reflects the pruned corpus. A failed batch job
+still lets pruning and coverage run. Batch fuzzing gets 5.5 hours, shared by
+all targets, which run side by side on the runner's cores
+(`parallel-fuzzing: true`); the job's six-hour limit leaves the rest for the
+image and fuzzer builds and the corpus upload.
+
+`.dockerignore` keeps target directories and local AFL and libFuzzer
+artifacts out of the image, but keeps `.git`, which the submodule fetch
+needs.
 
 ## Memory checks
 
@@ -111,4 +169,8 @@ LeakSanitizer unless `ASAN_OPTIONS=detect_leaks=1` is set.
   the runner GitHub assigns. The C oracle itself is not built
   with ASan.
 - Memory checks run on tags and on demand, not on pull requests.
+  ClusterFuzzLite's ten-minute pull request run is the only sanitizer run
+  there, and it covers only the fuzz targets.
+- ClusterFuzzLite builds for x86-64 only, so its runs reach the x86 backends
+  the runner supports, not NEON.
 - Benchmark numbers from shared runners are smoke tests, not evidence.

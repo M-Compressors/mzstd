@@ -115,6 +115,21 @@ Turn every minimized crash into a regression input under
 `fuzz/afl/regressions/` before fixing it. Never commit AFL findings or output
 directories.
 
+[`fuzz/libfuzzer/`](fuzz/libfuzzer/README.md) wraps the same target bodies for
+ClusterFuzzLite and is excluded from the workspace too. After changing it, or
+a target body it wraps, run from `fuzz/libfuzzer/`:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked --features framed -- -D warnings
+```
+
+A new AFL target needs a matching adapter in `fuzz/libfuzzer/fuzz_targets/`
+and its `[[bin]]` entry, and, if it reads a generated corpus, a case in
+`.clusterfuzzlite/build.sh`'s `seeds_for`. ClusterFuzzLite findings are
+attached to the failed workflow run; commit them as regressions like AFL's.
+
 ### Memory checks
 
 Release tags run Miri and AddressSanitizer; see
@@ -160,8 +175,10 @@ machine, and before/after numbers for both speed and compressed size.
 - Keep each pull request focused on one change.
 - Fill in the pull request template, including which checks you ran.
 - CI runs formatting, Clippy, docs, `no_std`, tests on Linux (x86-64 and
-  Arm) and macOS, the overflow-correction suite, and the fuzz regression
-  corpus. It must pass before merging.
+  Arm) and macOS, the overflow-correction suite, the fuzz regression
+  corpus and the libFuzzer adapter lint. It must pass before merging. Pull
+  requests that touch code also get ten minutes of ClusterFuzzLite fuzzing
+  on the changed code.
 
 ## License
 

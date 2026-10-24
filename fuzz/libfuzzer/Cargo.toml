@@ -1,0 +1,130 @@
+[package]
+name = "mzstd-libfuzzer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "libFuzzer adapters over the engine-neutral mzstd AFL target bodies, for ClusterFuzzLite"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The target bodies, oracles and C reference live in the AFL package's library,
+# which names no AFL symbol: only its own `src/bin/` adapters do, and nothing
+# here links those.
+[dependencies.mzstd-afl]
+path = "../afl"
+
+[features]
+default = []
+# Opt-in targets for mzstd's framed containers, as in the AFL package.
+framed = ["mzstd-afl/framed"]
+
+[profile.release]
+debug = true
+codegen-units = 1
+
+[workspace]
+
+[[bin]]
+name = "compress_dictionary"
+path = "fuzz_targets/compress_dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compressor_lifecycle"
+path = "fuzz_targets/compressor_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_dictionary"
+path = "fuzz_targets/decode_dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_roundtrip"
+path = "fuzz_targets/decode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_streaming"
+path = "fuzz_targets/decode_streaming.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential_c"
+path = "fuzz_targets/differential_c.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encoder_session"
+path = "fuzz_targets/encoder_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "output_capacity"
+path = "fuzz_targets/output_capacity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parallel"
+path = "fuzz_targets/parallel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parameter_parsing"
+path = "fuzz_targets/parameter_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_decode"
+path = "fuzz_targets/framed_decode.rs"
+required-features = ["framed"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_encode"
+path = "fuzz_targets/framed_encode.rs"
+required-features = ["framed"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_roundtrip"
+path = "fuzz_targets/framed_roundtrip.rs"
+required-features = ["framed"]
+test = false
+doc = false
+bench = false

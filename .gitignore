@@ -34,6 +34,10 @@ fuzz/afl/findings/
 fuzz/afl/target/
 # Seeds are materialised from the vendored zstd test data.
 fuzz/afl/seeds/
+# `cargo fuzz run` keeps its queue and crashes beside the libFuzzer package.
+fuzz/libfuzzer/corpus/
+fuzz/libfuzzer/artifacts/
+fuzz/libfuzzer/coverage/
 .claude/worktrees/
 
 # Python bytecode from the benchmark report scripts.
