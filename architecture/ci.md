@@ -27,7 +27,7 @@ graph TD
 | `ci-benchmarks.yml` | manual | Short `compress`, `decompress` and `mzstd-ffi` `one_shot` runs. Each benchmark asserts byte identity with zstd before timing. The framed benches (`framed_compress`, `framed_decompress`) are run locally with `--features framed`. |
 | `ci-fuzz.yml` | `v*` tags, manual | `prepare-seeds.sh`, then `campaign.sh` for each target, the three framed targets included (600 s by default); findings uploaded as `findings-<target>.tar.gz`, since AFL file names contain `:`, which `upload-artifact` rejects. |
 | `ci-miri.yml` | `v*` tags, manual | `scripts/miri.sh` on nightly: exact-named tests for the vector kernels and `BorrowedBuf` output under Miri, interpreted for x86-64 with `MIRI_TARGET_CPU=native`, so the runner's CPU picks the backends. See [memory checks](#memory-checks). |
-| `ci-sanitizer.yml` | `v*` tags, manual | Nightly `-Zsanitizer=address` release builds: every integration test with `framed`, then the kernel and uninitialized-output unit modules on the runner's own backends. |
+| `ci-sanitizer.yml` | `v*` tags, manual | Nightly `-Zsanitizer=address` release builds, LeakSanitizer included: every integration test with `framed` (the two that forget an owning guard on purpose without leak detection), then the kernel and uninitialized-output unit modules on the runner's own backends. |
 | `release.yml` | manual from a `v*` tag | Tag/version match, then `cargo publish` through crates.io trusted publishing. |
 
 All Cargo invocations that build the workspace pass `--locked`, because
@@ -90,6 +90,18 @@ test, the C-reference differential suites included, and then the Miri
 modules natively on the runner's own backends, AVX-512 included when the
 runner has it. Locally, the same commands with an `aarch64-apple-darwin`
 target cover NEON.
+
+On Linux, ASan also runs LeakSanitizer when the process exits, so a test
+must not leak either: a borrowed `&'static` input or resolver lives in a
+`static OnceLock` rather than behind `Vec::leak` or `Box::leak`. The
+exceptions are `forgotten_readers_keep_the_owner_protected_until_recovery`
+(`framed_seek`) and `batches_with_leaked_tasks_report_invalid_state`
+(`parallel`), which `mem::forget` a seek reader or a task list that owns
+memory and borrows the test's input: the leak is the behavior they check.
+The integration step skips them and a second step runs them with
+`ASAN_OPTIONS=detect_leaks=0`, so ASan still checks their accesses, and a
+renamed one would make the first step report its leak. macOS does not run
+LeakSanitizer unless `ASAN_OPTIONS=detect_leaks=1` is set.
 
 ## Known gaps
 

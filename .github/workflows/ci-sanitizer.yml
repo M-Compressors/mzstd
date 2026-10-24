@@ -23,9 +23,22 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@nightly
       # Every integration test; `framed` adds its suites and std adapters.
+      # LeakSanitizer runs with ASan on Linux. Two tests `mem::forget` a
+      # guard that owns memory, which is the behavior they check, so they
+      # run in the next step without leak detection; renaming one makes
+      # this step report its leak instead of silently dropping it.
       - run: >
           cargo test --release --locked --target x86_64-unknown-linux-gnu
-          --features framed --test '*'
+          --features framed --test '*' --
+          --skip forgotten_readers_keep_the_owner_protected_until_recovery
+          --skip batches_with_leaked_tasks_report_invalid_state
+      - run: >
+          cargo test --release --locked --target x86_64-unknown-linux-gnu
+          --features framed --test framed_seek --test parallel -- --exact
+          forgotten_readers_keep_the_owner_protected_until_recovery
+          batches_with_leaked_tasks_report_invalid_state
+        env:
+          ASAN_OPTIONS: detect_leaks=0
       # The modules Miri checks, natively on every backend the runner
       # supports, AVX-512 included, which Miri cannot interpret.
       - run: >

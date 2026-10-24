@@ -229,9 +229,13 @@ After changing Rust code:
    SIMD), register their tests as described there and run, on nightly,
    `scripts/miri.sh` (x86-64 is interpreted on any host; add
    `MIRI_TARGET_CPU=icelake-server` to reach the AVX-512 backend) and
-   `RUSTFLAGS=-Zsanitizer=address cargo +nightly test --release --locked
-   --target <host triple> --features framed --test '*'` plus the `--lib`
-   step of `.github/workflows/ci-sanitizer.yml` with the same target.
+   the steps of `.github/workflows/ci-sanitizer.yml` with `--target <host
+   triple>` and, on macOS, `ASAN_OPTIONS=detect_leaks=1` (LeakSanitizer is
+   on by default only on Linux, where CI runs it). Tests must not leak
+   memory: keep a needed `&'static` value in a `static OnceLock` rather
+   than `Box::leak`/`Vec::leak`; a test that leaks by design (forgetting an
+   owning guard) goes into the workflow's `--skip` list and its
+   `detect_leaks=0` step.
 8. Do not use `#[allow(..)]` to fix clippy warnings.
 9. Update CHANGELOG.md
 

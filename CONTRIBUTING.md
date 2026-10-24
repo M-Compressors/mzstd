@@ -124,10 +124,17 @@ SIMD kernel or uninitialized-output code, run them locally:
 
 ```sh
 scripts/miri.sh
-RUSTFLAGS=-Zsanitizer=address RUSTDOCFLAGS=-Zsanitizer=address \
+ASAN_OPTIONS=detect_leaks=1 RUSTFLAGS=-Zsanitizer=address RUSTDOCFLAGS=-Zsanitizer=address \
   cargo +nightly test --release --locked --target "$(rustc -vV | sed -n 's/host: //p')" \
-  --features framed --test '*'
+  --features framed --test '*' -- \
+  --skip forgotten_readers_keep_the_owner_protected_until_recovery \
+  --skip batches_with_leaked_tasks_report_invalid_state
 ```
+
+LeakSanitizer is on by default on Linux but not on macOS, hence
+`detect_leaks=1`. Tests must not leak: keep a `&'static` value in a
+`static OnceLock` instead of `Box::leak`. The two skipped tests forget an
+owning guard on purpose; CI runs them without leak detection.
 
 `scripts/miri.sh` names its tests exactly. Add a new kernel's or
 `BorrowedBuf` user's tests to it, keeping them free of the C reference,

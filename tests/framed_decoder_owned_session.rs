@@ -4,7 +4,7 @@
 
 mod framed_decoder_support;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use framed_decoder_support::*;
 use mzstd::DecodeOperation;
@@ -291,8 +291,11 @@ fn owned_resolvers_decode_external_references_like_borrowed_ones() {
     assert_eq!(with_dictionaries(Arc::clone(&shared), &bytes), expected);
     let boxed: Box<dyn DictionaryResolver> = Box::new(dictionaries());
     assert_eq!(with_dictionaries(boxed, &bytes), expected);
-    let leaked: &'static Dictionaries = Box::leak(Box::new(dictionaries()));
-    assert_eq!(with_dictionaries(leaked, &bytes), expected);
+    // A static keeps the `&'static` resolver reachable, so LeakSanitizer
+    // does not report it as a leak.
+    static STATIC: OnceLock<Dictionaries> = OnceLock::new();
+    let shared: &'static Dictionaries = STATIC.get_or_init(dictionaries);
+    assert_eq!(with_dictionaries(shared, &bytes), expected);
     // Without a resolver the owned session reports the missing dictionary.
     let mut session = decoder(Default::default())
         .into_session(Default::default())

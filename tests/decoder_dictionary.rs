@@ -713,10 +713,12 @@ fn owned_sessions_keep_their_dictionary_across_reinit() {
         decoder.decompress(&frame),
         Err(DecodeError::DictionaryUnsupported { .. })
     ));
-    // A `&'static` dictionary works too.
-    let leaked: &'static DecodeDictionary =
-        Box::leak(Box::new(DecodeDictionary::try_from(bytes).expect("valid")));
-    let mut session = decoder.into_session_with_dictionary(leaked);
+    // A `&'static` dictionary works too. A static keeps it reachable, so
+    // LeakSanitizer does not report it as a leak.
+    static STATIC: OnceLock<DecodeDictionary> = OnceLock::new();
+    let shared: &'static DecodeDictionary =
+        STATIC.get_or_init(|| DecodeDictionary::try_from(bytes).expect("valid"));
+    let mut session = decoder.into_session_with_dictionary(shared);
     let mut output = vec![0u8; input.len()];
     session
         .process(&frame, &mut output, DecodeOperation::Finish)

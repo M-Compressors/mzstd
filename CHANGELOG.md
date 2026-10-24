@@ -12,7 +12,11 @@
   `borrowed-buf` uninitialized output of both codecs. Tests are named
   exactly and each run checks its pass count. `ci-sanitizer.yml` runs every
   integration test with `framed`, then the same kernel modules natively,
-  under `-Zsanitizer=address`. Under `cfg!(miri)` the `opt_count` window
+  under `-Zsanitizer=address` with LeakSanitizer. Tests that leaked their
+  inputs or `&'static` dictionaries through `Vec::leak`/`Box::leak` now
+  borrow locals or a `static OnceLock`; the two tests that forget an
+  owning guard on purpose run in a separate step without leak detection.
+  Under `cfg!(miri)` the `opt_count` window
   test keeps only lengths next to 16-byte boundaries and
   `compress_to_uninit_writes_the_one_shot_frame` compresses 2 KB; native
   runs check a superset of the previous window cases.

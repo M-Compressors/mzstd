@@ -83,7 +83,7 @@ fn drive(
     compressed
 }
 
-fn directives(steps: &[(&'static [u8], Operation)]) -> Vec<(&'static [u8], Directive)> {
+fn directives<'a>(steps: &[(&'a [u8], Operation)]) -> Vec<(&'a [u8], Directive)> {
     steps
         .iter()
         .map(|&(data, operation)| {
@@ -105,10 +105,6 @@ fn initialized(buffer: &[MaybeUninit<u8>], len: usize) -> Vec<u8> {
         // which is all this reads.
         .map(|byte| unsafe { byte.assume_init() })
         .collect()
-}
-
-fn leaked(input: Vec<u8>) -> &'static [u8] {
-    Vec::leak(input)
 }
 
 #[test]
@@ -709,13 +705,13 @@ fn a_session_with_a_declared_size_writes_the_one_shot_frame() {
 
 #[test]
 fn borrowed_session_flush_and_finish_match_the_reference() {
-    let first = leaked(corpus::text(70_000, 25));
-    let second = leaked(corpus::text(50_000, 26));
+    let first = corpus::text(70_000, 25);
+    let second = corpus::text(50_000, 26);
     let mut encoder = Compressor::default();
     let mut session = encoder.start(StreamConfig::default());
     let mut out = vec![0u8; 1 << 17];
     let mut ours = Vec::new();
-    for chunk in [first, second] {
+    for chunk in [&first[..], &second[..]] {
         let progress = session
             .process(chunk, &mut out, Operation::Continue)
             .expect("accepts");
@@ -732,9 +728,9 @@ fn borrowed_session_flush_and_finish_match_the_reference() {
     assert!(session.is_finished());
 
     let steps = directives(&[
-        (first, Operation::Continue),
+        (&first, Operation::Continue),
         (&[], Operation::Flush),
-        (second, Operation::Continue),
+        (&second, Operation::Continue),
         (&[], Operation::Flush),
         (&[], Operation::End),
     ]);
@@ -744,7 +740,7 @@ fn borrowed_session_flush_and_finish_match_the_reference() {
 
 #[test]
 fn borrowed_session_process_uninit_matches_the_reference_with_small_outputs() {
-    let input = leaked(corpus::text(150_000, 27));
+    let input = corpus::text(150_000, 27);
     let steps = [
         (&input[..60_000], Operation::Continue),
         (&input[60_000..], Operation::End),
@@ -859,7 +855,7 @@ fn borrowed_session_process_uninit_matches_the_reference_with_large_outputs() {
     // Outputs that hold a block's bound take the direct paths: blocks are
     // written straight into the caller's memory, and the final `End` is
     // compressed from the caller's input.
-    let input = leaked(corpus::text(400_000, 33));
+    let input = corpus::text(400_000, 33);
     let steps = [
         (&input[..250_000], Operation::Continue),
         (&[][..], Operation::Flush),
@@ -915,7 +911,7 @@ fn a_session_fails_when_input_falls_short_of_its_declared_size() {
 
 #[test]
 fn owned_sessions_match_the_reference_with_a_declared_size() {
-    let input = leaked(corpus::text(200_000, 28));
+    let input = corpus::text(200_000, 28);
     let (head, tail) = input.split_at(90_000);
     let mut session =
         Compressor::default().into_session(InputSize::from(input.len() as u64).into());
