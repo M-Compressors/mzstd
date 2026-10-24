@@ -66,7 +66,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns. |
-| [CI](ci.md) | Workflows and the checks they run. |
+| [CI](ci.md) | Workflows and the checks they run; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
 
 ## Known gaps

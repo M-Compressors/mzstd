@@ -194,6 +194,9 @@ capacity from the frame header.
   capacity, sessions, lifecycle, parallel and parameter parsing. Decoder
   targets: raw input against the reference decoder, chunked sessions, and
   reference-written frames.
+- Miri over the code that reaches `unsafe` in dependencies (the
+  `fearless_simd` vector kernels and `borrowed-buf` uninitialized output),
+  and AddressSanitizer over the integration tests, on every release tag.
 - 100% function coverage, checked with `cargo llvm-cov`.
 
 See [`architecture/`](architecture/README.md) for how the code is organized

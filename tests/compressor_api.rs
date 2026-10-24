@@ -630,7 +630,9 @@ fn compress_to_slice_succeeds_exactly_when_the_reference_does() {
 
 #[test]
 fn compress_to_uninit_writes_the_one_shot_frame() {
-    let input = corpus::text(30_000, 22);
+    // Still several sequences and a compressed block under Miri, which
+    // interprets the whole encoder.
+    let input = corpus::text(if cfg!(miri) { 2_000 } else { 30_000 }, 22);
     let mut encoder = Compressor::default();
     let expected = encoder.compress(&input).expect("compresses");
     let bound = Compressor::max_compressed_size(input.len()).expect("fits");

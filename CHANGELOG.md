@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Miri and AddressSanitizer workflows**, ported from mbrotli and run on
+  every `v*` tag or on demand. `ci-miri.yml` runs `scripts/miri.sh`, which
+  interprets only the tests that reach `unsafe` in dependencies: the
+  `fearless_simd` vector kernels (`opt_count` match-length scans, the row
+  finder's tag masks, the decoder's shuffle wildcopy and sequence execution
+  around it) on the scalar, SSE2, SSE4.2 and AVX2 backends, plus AVX-512
+  when the runner supports it (`MIRI_TARGET_CPU=native` in CI), and the
+  `borrowed-buf` uninitialized output of both codecs. Tests are named
+  exactly and each run checks its pass count. `ci-sanitizer.yml` runs every
+  integration test with `framed`, then the same kernel modules natively,
+  under `-Zsanitizer=address`. Under `cfg!(miri)` the `opt_count` window
+  test keeps only lengths next to 16-byte boundaries and
+  `compress_to_uninit_writes_the_one_shot_frame` compresses 2 KB; native
+  runs check a superset of the previous window cases.
+
 ## [v0.2.8](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.8) - 2026-10-20
 
 - **Framed containers (`framed` feature).** `mzstd::framing` ports

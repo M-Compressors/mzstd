@@ -73,6 +73,21 @@ explicitly an upstream-vendor update.
 - SIMD and baseline paths must produce identical observable results. Test the
   baseline path explicitly and test every SIMD level available on the current
   host; do not make tests require an instruction set the host lacks.
+- Miri and AddressSanitizer cover only code that reaches `unsafe` in
+  dependencies: `fearless_simd` vector types and `kernel!` intrinsics, and
+  `borrowed-buf`'s `BorrowedBuf`. Today those are `compressor::core::opt_count`,
+  `compressor::core::lazy::row`, `decompressor::core::copy` (and the sequence
+  execution that calls it), `compressor::core::output` and the decoder's
+  `decode_to_uninit`. When you add or change such a kernel or
+  `BorrowedBuf` user, add a test for it that is free of the C reference
+  (Miri cannot call FFI) and exercises every backend from
+  `Backend::available()` at buffer edges, then add its exact name to
+  `scripts/miri.sh` and its module to the `--lib` filters of
+  `.github/workflows/ci-sanitizer.yml`. Safe code that only runs inside a
+  `#[simd]` context (auto-vectorized scalar code) does not belong there.
+  If a sweep is too slow under Miri, thin it with `cfg!(miri)` while keeping
+  every vector width, tail and full-length case, never weakening the native
+  run. Keep the list in `architecture/ci.md#memory-checks` in sync.
 - Avoid allocations, redundant copies, cloning, bounds checks, and dynamic
   dispatch in hot loops when profiling shows they matter. Do not trade away
   correctness or API clarity without benchmark evidence.
@@ -210,8 +225,15 @@ After changing Rust code:
    `architecture/README.md` index, so they match the code as changed.
 6. Run relevant Criterion benchmarks for performance-sensitive changes and the
    relevant AFL target for changes to fuzzed boundaries.
-7. Do not use `#[allow(..)]` to fix clippy warnings.
-8. Update CHANGELOG.md
+7. After changing SIMD kernels or `BorrowedBuf` code (see Performance and
+   SIMD), register their tests as described there and run, on nightly,
+   `scripts/miri.sh` (x86-64 is interpreted on any host; add
+   `MIRI_TARGET_CPU=icelake-server` to reach the AVX-512 backend) and
+   `RUSTFLAGS=-Zsanitizer=address cargo +nightly test --release --locked
+   --target <host triple> --features framed --test '*'` plus the `--lib`
+   step of `.github/workflows/ci-sanitizer.yml` with the same target.
+8. Do not use `#[allow(..)]` to fix clippy warnings.
+9. Update CHANGELOG.md
 
 Steps 1 through 3 run at the workspace root, which does not reach `fuzz/afl`;
 that package is excluded from the workspace so AFL's instrumentation cannot

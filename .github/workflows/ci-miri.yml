@@ -1,0 +1,31 @@
+name: CI Miri
+
+# Run for every pushed tag, or on demand from Actions / the GitHub CLI.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  miri:
+    name: interpreter checks for SIMD kernels and uninitialized output
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Miri reports compile-time target features, so the runner's own CPU
+      # decides the backends: AVX2 everywhere, AVX-512 where available.
+      - run: grep -m1 'model name' /proc/cpuinfo
+      # Exact test names with a pass-count check: a renamed test fails the
+      # run instead of leaving a filter that matches nothing.
+      - run: scripts/miri.sh
+        env:
+          MIRI_TARGET_CPU: native

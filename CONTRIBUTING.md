@@ -115,6 +115,24 @@ Turn every minimized crash into a regression input under
 `fuzz/afl/regressions/` before fixing it. Never commit AFL findings or output
 directories.
 
+### Memory checks
+
+Release tags run Miri and AddressSanitizer; see
+[CI](architecture/ci.md#memory-checks). Both need a nightly toolchain, Miri
+also its component (`rustup +nightly component add miri`). After changing a
+SIMD kernel or uninitialized-output code, run them locally:
+
+```sh
+scripts/miri.sh
+RUSTFLAGS=-Zsanitizer=address RUSTDOCFLAGS=-Zsanitizer=address \
+  cargo +nightly test --release --locked --target "$(rustc -vV | sed -n 's/host: //p')" \
+  --features framed --test '*'
+```
+
+`scripts/miri.sh` names its tests exactly. Add a new kernel's or
+`BorrowedBuf` user's tests to it, keeping them free of the C reference,
+which Miri cannot call.
+
 ### Benchmarks
 
 Performance claims need evidence. Criterion benchmarks compare mzstd with the

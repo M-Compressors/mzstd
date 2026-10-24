@@ -1,0 +1,34 @@
+name: CI AddressSanitizer
+
+# Run for every pushed tag, or on demand from Actions / the GitHub CLI.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  address-sanitizer:
+    name: address sanitizer
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      # Every integration test; `framed` adds its suites and std adapters.
+      - run: >
+          cargo test --release --locked --target x86_64-unknown-linux-gnu
+          --features framed --test '*'
+      # The modules Miri checks, natively on every backend the runner
+      # supports, AVX-512 included, which Miri cannot interpret.
+      - run: >
+          cargo test --release --locked --target x86_64-unknown-linux-gnu --lib --
+          compressor::core::opt_count compressor::core::lazy::row compressor::core::output
+          decompressor::core::copy decompressor::core::sequences decompressor::core::stream

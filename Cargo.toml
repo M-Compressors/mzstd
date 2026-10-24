@@ -18,6 +18,7 @@ exclude = [
     "docs/**",
     "fuzz/**",
     "mzstd-ffi/**",
+    "scripts/**",
     "specifications/**",
     "target/**",
     "testdata/**",
