@@ -57,9 +57,11 @@ seeds_for() {
     esac
 }
 
-for binary in "$OUT"/*; do
-    [ -x "$binary" ] || continue
-    target=$(basename "$binary")
+# Walk the adapters rather than OUT, which also holds the image's
+# llvm-symbolizer.
+for source in fuzz/libfuzzer/fuzz_targets/*.rs; do
+    target=$(basename "$source" .rs)
+    [ -x "$OUT/$target" ] || continue
     corpus="$WORK/corpus/$target"
     rm -rf "$corpus"
     mkdir -p "$corpus"
