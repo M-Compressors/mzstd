@@ -32,6 +32,7 @@ jobs:
           fuzz-seconds: 19800
           mode: batch
           sanitizer: address
+          language: rust
           # Fuzz targets side by side on every runner core instead of one at
           # a time; the budget is shared by all targets either way.
           parallel-fuzzing: true
@@ -41,6 +42,7 @@ jobs:
     needs: batch
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: build fuzzers
         uses: google/clusterfuzzlite/actions/build_fuzzers@v1
@@ -50,8 +52,14 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          # Each target's merge must finish within its share of this budget,
+          # which starts at an even split and grows by what earlier targets
+          # leave unused. Merging a day's corpus at batch speed takes about an
+          # hour in total and over ten minutes for the slowest targets
+          # (compressor_lifecycle, parallel); 600 s timed out on the first.
+          fuzz-seconds: 10800
           mode: prune
+          language: rust
 
   coverage:
     name: coverage report
@@ -71,3 +79,4 @@ jobs:
           fuzz-seconds: 600
           mode: coverage
           sanitizer: coverage
+          language: rust

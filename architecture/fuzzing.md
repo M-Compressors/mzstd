@@ -212,16 +212,29 @@ stable ones and `framed_decode`, `framed_encode` and `framed_roundtrip`.
 `build.sh` runs inside ClusterFuzzLite's Rust image. It fetches the pinned
 zstd submodule when the checkout left it empty, because every C oracle and the
 seed script need it. It then builds twice, each time with
-`-O --debug-assertions`, which also turns on overflow checks:
+`-O --debug-assertions`, which also turns on overflow checks.
+
+Under the coverage sanitizer, `build.sh` runs `cargo build --release
+--target <host> --bins` in `fuzz/libfuzzer` instead of `cargo fuzz build`,
+adding `-Cdebug-assertions` to the image's `RUSTFLAGS`. The image's `cargo`
+wrapper rewrites `cargo fuzz build` into `cargo build --bins` run from
+`./fuzz` and drops `--fuzz-dir`, `--target-dir` and `--features`. Here that
+would build the root crate, which has no binaries, so `OUT` would stay empty.
+The direct build writes to the same `<target-dir>/<host>/release` as
+cargo fuzz, so both builds ship their binaries the same way. It also remaps
+`fuzz_targets` to an absolute path for the report, as the wrapper does.
 
 ```mermaid
 flowchart TD
     Start[build.sh] --> Sub{vendored zstd present?}
     Sub -->|no| Fetch[git submodule update at the pinned commit]
-    Sub -->|yes| Stable
-    Fetch --> Stable[cargo fuzz build into WORK/stable]
+    Sub -->|yes| Mode
+    Fetch --> Mode{SANITIZER}
+    Mode -->|address| Stable[cargo fuzz build into WORK/stable]
+    Mode -->|coverage| Stable2[cargo build --release --target host into WORK/stable]
     Stable --> ShipS[copy every built target to OUT]
-    ShipS --> Framed[cargo fuzz build --features framed into WORK/framed]
+    Stable2 --> ShipS
+    ShipS --> Framed[same build with --features framed into WORK/framed]
     Framed --> ShipF[copy only targets not yet in OUT]
     ShipF --> Seeds[prepare-seeds.sh]
     Seeds --> Zip[per target: mapped seeds plus regressions, zipped]

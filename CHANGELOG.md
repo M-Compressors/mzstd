@@ -21,7 +21,11 @@
   ten-minute run on the changed code (`ci-cflite-pr.yml`). A daily workflow
   runs 5.5 hours of batch fuzzing, then corpus pruning and a coverage report
   (`ci-cflite-cron.yml`). `ci.yml` lints the adapters. The published crate
-  is unchanged.
+  is unchanged. The coverage build calls `cargo build` directly, because the
+  image's cargo wrapper turned `cargo fuzz build` into a build of the root
+  crate, so no targets were built. Pruning gets 10800 s instead of 600 s,
+  which timed out merging the first target's corpus. `run_fuzzers` steps
+  declare `language: rust`.
 
 - **Miri and AddressSanitizer workflows**, ported from mbrotli and run on
   every `v*` tag or on demand. `ci-miri.yml` runs `scripts/miri.sh`, which

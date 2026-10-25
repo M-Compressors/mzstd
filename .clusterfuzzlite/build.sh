@@ -19,12 +19,28 @@ if [ ! -f zstd-ffi/vendor/zstd/lib/zstd.h ]; then
     git submodule update --init --depth 1 zstd-ffi/vendor/zstd
 fi
 
-# Debug assertions also turn on overflow checks, which AFL's builds have too.
-build() {
-    cargo fuzz build -O --debug-assertions --fuzz-dir fuzz/libfuzzer "$@"
-}
-
 host=$(rustc -vV | sed -n 's/^host: //p')
+
+# Debug assertions also turn on overflow checks, which AFL's builds have too.
+#
+# Under the coverage sanitizer the image's cargo wrapper turns
+# `cargo fuzz build` into `cargo build --bins` run from ./fuzz, dropping
+# --fuzz-dir, --target-dir and --features; here that builds the root crate,
+# which has no binaries. The coverage build therefore calls cargo build itself,
+# with the image's RUSTFLAGS (instrument-coverage, --cfg fuzzing) and the same
+# release profile and output directory as cargo fuzz. The remap gives the
+# adapters absolute paths in the report, as the wrapper does.
+build() {
+    if [ "$SANITIZER" = coverage ]; then
+        (
+            cd fuzz/libfuzzer
+            RUSTFLAGS="$RUSTFLAGS -Cdebug-assertions --remap-path-prefix fuzz_targets=$PWD/fuzz_targets" \
+                cargo build --release --target "$host" --bins "$@"
+        )
+    else
+        cargo fuzz build -O --debug-assertions --fuzz-dir fuzz/libfuzzer "$@"
+    fi
+}
 
 ship() {
     local release="$1/$host/release"
