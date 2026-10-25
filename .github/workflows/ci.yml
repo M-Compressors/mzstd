@@ -26,7 +26,7 @@ jobs:
       # all-features turns on no_std, which removes the std-only modules, so
       # the default feature set is linted as well.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo clippy --workspace --all-targets --features hotpath-cpu,hotpath-alloc --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features hotpath-cpu,hotpath-alloc,hotpath-callgrind,hotpath-cloud --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --features framed --locked -- -D warnings
       - name: clippy for every codec and std combination
         run: |

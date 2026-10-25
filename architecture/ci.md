@@ -25,11 +25,17 @@ graph TD
     Tag --> Miri["ci-miri.yml: Miri over SIMD kernels and BorrowedBuf output"]
     Tag --> ASan["ci-sanitizer.yml: AddressSanitizer over integration and kernel tests"]
     Manual --> Rel["release.yml: trusted publishing from a v* tag"]
+    Push --> HB["hotpath-benchmark.yml: profile_compressor under Callgrind"]
+    HB -->|"push: OIDC upload"| Cloud[(hotpath Cloud)]
+    HB -->|"pull request: report artifact"| Relay["hotpath-relay.yml (workflow_run)"]
+    Relay -->|"OIDC upload"| Cloud
 ```
 
 | Workflow | Trigger | Checks |
 | --- | --- | --- |
 | `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
+| `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run under `valgrind --tool=callgrind --instr-atstart=no` on `testdata/alice29.txt`. A push uploads the report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
+| `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.1 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
 | `ci-cflite-pr.yml` | pull requests touching `src/`, `zstd-ffi/`, `fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow | ClusterFuzzLite libFuzzer/ASan run on the changed code, 600 s. See [ClusterFuzzLite](#clusterfuzzlite). |
 | `ci-cflite-cron.yml` | daily, manual | ClusterFuzzLite batch fuzzing (5.5 h), corpus pruning and a coverage report. |
 | `ci-coverage.yml` | manual | `cargo llvm-cov --workspace --release` with `--fail-under-functions 100` over repository-owned sources (zstd-ffi and the vendored C excluded); HTML report as an artifact. |
@@ -42,6 +48,34 @@ graph TD
 All Cargo invocations that build the workspace pass `--locked`, because
 `Cargo.lock` is committed so that benchmark baselines and campaigns are
 reproducible.
+
+## hotpath Cloud
+
+`hotpath-benchmark.yml` measures the encoder by instruction count rather than
+time, so a shared GitHub runner gives reproducible numbers. Counts depend on
+the Valgrind build, the Rust toolchain and the runner image, which are all
+pinned; bumping any of them moves the baseline and belongs in a separate pull
+request. hotpath Cloud compares each pull request's report with the latest
+`main` upload and judges it by `hotpath/policy.toml`: instruction counts and
+allocations are judged (0.5% and 1% thresholds, functions above 0.05% of the
+total), wall time is reported but not judged. The thresholds come from
+mbrotli's measured run-to-run spread and have not been re-measured for this
+crate.
+
+```mermaid
+sequenceDiagram
+    participant PR as pull_request job (read-only)
+    participant Relay as hotpath-relay.yml
+    participant Push as push job (main)
+    participant Cloud as hotpath Cloud
+    Push->>Push: build profile_compressor, run under Callgrind
+    Push->>Cloud: upload report (OIDC), new baseline
+    PR->>PR: build profile_compressor, run under Callgrind
+    PR->>PR: upload-artifact compressor-report.json
+    PR-->>Relay: workflow_run completed
+    Relay->>Cloud: upload report for the pull request (OIDC)
+    Cloud->>Cloud: diff against baseline, apply hotpath/policy.toml
+```
 
 ## ClusterFuzzLite
 

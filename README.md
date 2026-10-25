@@ -108,7 +108,7 @@ either for a whole input at once or for input that arrives in chunks. It require
 | `std` | yes | `std::error::Error`, `mzstd::io`, parallel compression |
 | `no_std` | no | alloc-only build; overrides `std` |
 | `framed` | no | `mzstd::framing`: seekable containers of resources and metadata, built only from Zstandard frames (see below) |
-| `hotpath`, `hotpath-cpu`, `hotpath-alloc` | no | profiling anchors |
+| `hotpath`, `hotpath-cpu`, `hotpath-alloc`, `hotpath-callgrind`, `hotpath-cloud` | no | profiling anchors; Callgrind instruction counts and hotpath Cloud upload |
 
 ## Framed containers
 

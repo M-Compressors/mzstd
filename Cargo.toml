@@ -17,6 +17,7 @@ exclude = [
     "benchmarks/**",
     "docs/**",
     "fuzz/**",
+    "hotpath/**",
     "mzstd-ffi/**",
     "scripts/**",
     "specifications/**",
@@ -59,7 +60,7 @@ optional = true
 default-features = false
 
 [dependencies.hotpath]
-version = "0.28"
+version = "0.29"
 optional = true
 
 [dev-dependencies]
@@ -76,6 +77,12 @@ version = "0.8"
 
 [dev-dependencies.zstd-ffi]
 path = "zstd-ffi"
+
+# Profiling driver for the hotpath features and the `hotpath benchmark`
+# workflow; it builds without them as a plain compression loop.
+[[example]]
+name = "profile_compressor"
+required-features = ["compression"]
 
 [[bench]]
 name = "compress"
@@ -143,6 +150,8 @@ framed = []
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-callgrind = ["hotpath", "hotpath/hotpath-callgrind"]
+hotpath-cloud = ["hotpath", "hotpath/hotpath-cloud"]
 
 [workspace]
 members = ["zstd-ffi", "mzstd-ffi"]
