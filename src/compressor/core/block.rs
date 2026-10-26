@@ -191,6 +191,24 @@ pub(crate) fn build_seq_store(
     Ok(Build::Compress)
 }
 
+/// Writes `Number_of_Sequences` in its shortest form at the start of `dst`,
+/// which has room for three bytes, returning the field's size. A block
+/// holds fewer than `LONG_NB_SEQ + 0x10000` sequences.
+fn write_sequence_count(dst: &mut [u8], nb_seq: usize) -> usize {
+    if nb_seq < 128 {
+        dst[0] = nb_seq as u8;
+        1
+    } else if nb_seq < LONG_NB_SEQ {
+        dst[0] = ((nb_seq >> 8) + 0x80) as u8;
+        dst[1] = nb_seq as u8;
+        2
+    } else {
+        dst[0] = 0xFF;
+        dst[1..3].copy_from_slice(&((nb_seq - LONG_NB_SEQ) as u16).to_le_bytes());
+        3
+    }
+}
+
 /// Writes the literals and sequences sections of `store`
 /// (`ZSTD_entropyCompressSeqStore_internal`).
 ///
@@ -237,18 +255,7 @@ fn entropy_compress_internal(
     if dst.len() - op < 3 + 1 {
         return Err(CoreError::DstSizeTooSmall);
     }
-    if nb_seq < 128 {
-        dst[op] = nb_seq as u8;
-        op += 1;
-    } else if nb_seq < LONG_NB_SEQ {
-        dst[op] = ((nb_seq >> 8) + 0x80) as u8;
-        dst[op + 1] = nb_seq as u8;
-        op += 2;
-    } else {
-        dst[op] = 0xFF;
-        dst[op + 1..op + 3].copy_from_slice(&((nb_seq - LONG_NB_SEQ) as u16).to_le_bytes());
-        op += 3;
-    }
+    op += write_sequence_count(&mut dst[op..], nb_seq);
     if nb_seq == 0 {
         next.fse.clone_from(&prev.fse);
         return Ok(op);
@@ -358,6 +365,21 @@ pub(crate) fn compress_block_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_counts_take_their_shortest_form() {
+        let written = |nb_seq: usize| {
+            let mut dst = [0xAA; 4];
+            let size = write_sequence_count(&mut dst, nb_seq);
+            (size, dst)
+        };
+        assert_eq!(written(0), (1, [0, 0xAA, 0xAA, 0xAA]));
+        assert_eq!(written(127), (1, [127, 0xAA, 0xAA, 0xAA]));
+        assert_eq!(written(128), (2, [0x80, 0x80, 0xAA, 0xAA]));
+        assert_eq!(written(LONG_NB_SEQ - 1), (2, [0xFE, 0xFF, 0xAA, 0xAA]));
+        assert_eq!(written(LONG_NB_SEQ), (3, [0xFF, 0, 0, 0xAA]));
+        assert_eq!(written(LONG_NB_SEQ + 0x1234), (3, [0xFF, 0x34, 0x12, 0xAA]));
+    }
 
     #[test]
     fn rle_detection() {

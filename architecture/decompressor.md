@@ -507,6 +507,12 @@ Invariants each layer relies on:
   frame produced so far)`. The repeat-offset rules (including
   `Repeated_Offset1 - 1` for a zero literal length) follow the reference
   exactly; a zero offset is `Offset`.
+- **Headers.** `FrameHeader::parse` reads the fields at the offsets
+  `header_size` fixed, through `dictionary_id_size`, `described_window_size`
+  and `read_le`; `sequence_count` reads `Number_of_Sequences` before
+  `read_header` updates the tables. These and `BlockHeader::parse` are
+  proved against RFC 8878 in [formal verification](formal-verification.md),
+  including that none of their indexing can panic.
 - **Frames.** The reserved descriptor bit must be clear; a non-zero
   dictionary ID must match the operation's dictionary; the window must be
   within the limit (single-segment frames: the content size). The

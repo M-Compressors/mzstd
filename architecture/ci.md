@@ -16,6 +16,7 @@ graph TD
     CI --> OCF["overflow-correction: core differential suites with MZSTD_OVERFLOW_CORRECT_FREQUENTLY"]
     CI --> Fuzz["fuzz: fmt/clippy of fuzz/afl, regression replay with and without framed"]
     CI --> LibFuzzer["libfuzzer: fmt/clippy of fuzz/libfuzzer with and without framed"]
+    Push --> Lean["ci-lean.yml: Lean translation drift check, Lean proofs and axiom audit"]
     PR[pull request touching code] --> CFPR["ci-cflite-pr.yml: ClusterFuzzLite on the changed code"]
     Daily[daily schedule or manual] --> CFCron["ci-cflite-cron.yml: batch, prune, coverage"]
     CFCron -. coverage report selects targets .-> CFPR
@@ -34,6 +35,7 @@ graph TD
 | Workflow | Trigger | Checks |
 | --- | --- | --- |
 | `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
+| `ci-lean.yml` | push to `main`, pull requests | `scripts/extract_lean.py --check`: the Charon/Aeneas translation of the verified items matches the Rust source. `lake exe cache get` and `lake build` in `verification/lean`: the RFC 8878 proofs and the axiom audit. See [formal verification](formal-verification.md). |
 | `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run on `testdata/alice29.txt` in merged mode: natively for timing and allocations, then under `valgrind --tool=callgrind --instr-atstart=no` with `HOTPATH_MERGE_REPORT` pointing at the native report, which adds instruction counts. `jq` checks that the merged report has both icount and timing data. A push uploads the merged report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
 | `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.2 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
 | `ci-cflite-pr.yml` | pull requests touching `src/`, `zstd-ffi/`, `fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow | ClusterFuzzLite libFuzzer/ASan run on the changed code, 600 s. See [ClusterFuzzLite](#clusterfuzzlite). |

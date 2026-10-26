@@ -291,6 +291,23 @@ fn fill_described(
     Ok(used)
 }
 
+/// Reads `Number_of_Sequences` at the start of a sequences section,
+/// returning the count and the field's size in bytes.
+fn sequence_count(src: &[u8]) -> Result<(usize, usize), InvalidDataKind> {
+    let invalid = InvalidDataKind::SequencesSection;
+    let &first = src.first().ok_or(invalid)?;
+    if first < 128 {
+        return Ok((usize::from(first), 1));
+    }
+    if first < 255 {
+        let &second = src.get(1).ok_or(invalid)?;
+        return Ok((((usize::from(first) - 0x80) << 8) + usize::from(second), 2));
+    }
+    let bytes = src.get(1..3).ok_or(invalid)?;
+    let value = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+    Ok((value + LONG_NB_SEQ, 3))
+}
+
 /// The three sequence symbol types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SymbolType {
@@ -672,19 +689,7 @@ impl SequenceTables {
     /// sequences and the header's size.
     pub(crate) fn read_header(&mut self, src: &[u8]) -> Result<(usize, usize), InvalidDataKind> {
         let invalid = InvalidDataKind::SequencesSection;
-        let &first = src.first().ok_or(invalid)?;
-        let (count, mut used) = match first {
-            0..128 => (usize::from(first), 1),
-            128..255 => {
-                let &second = src.get(1).ok_or(invalid)?;
-                (((usize::from(first) - 0x80) << 8) + usize::from(second), 2)
-            }
-            255 => {
-                let bytes = src.get(1..3).ok_or(invalid)?;
-                let value = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-                (value + LONG_NB_SEQ, 3)
-            }
-        };
+        let (count, mut used) = sequence_count(src)?;
         if count == 0 {
             // Nothing may follow an empty sequences section.
             return if used == src.len() {

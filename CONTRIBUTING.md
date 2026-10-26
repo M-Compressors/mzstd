@@ -155,6 +155,27 @@ owning guard on purpose; CI runs them without leak detection.
 `BorrowedBuf` user's tests to it, keeping them free of the C reference,
 which Miri cannot call.
 
+### Formal verification
+
+`verification/lean/` holds Lean 4 proofs that a few Rust items implement RFC
+8878 (see `START` in `scripts/extract_lean.py`). The proofs compare the code
+with a transcription of the RFC, never with the C library. If you change one
+of those items, or code they call, regenerate the translation and rebuild the
+proofs:
+
+```sh
+python3 scripts/extract_lean.py
+cd verification/lean && lake exe cache get && lake build
+```
+
+Never edit the generated `verification/lean/Mzstd/Code/Types.lean` and
+`Code/Funs.lean` by hand. If the script reports a new unmodelled
+standard-library item, model it in `Code/FunsExternal.lean` and add it to
+`EXTERNALS`. If a proof no longer goes through, the change either broke the
+behaviour the RFC prescribes or needs the proof updated; say which in the pull
+request. `Mzstd/Rfc.lean` changes only to fix a transcription error, with the
+RFC section quoted.
+
 ### Benchmarks
 
 Performance claims need evidence. Criterion benchmarks compare mzstd with the

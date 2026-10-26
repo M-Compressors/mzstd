@@ -42,17 +42,30 @@ pub(crate) struct FrameHeader {
     pub(crate) checksum: bool,
 }
 
+/// Size of the `Dictionary_ID` field a frame header descriptor declares.
+const fn dictionary_id_size(descriptor: u8) -> usize {
+    match descriptor & 3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    }
+}
+
+/// Window size a `Window_Descriptor` byte describes: a power of two from
+/// the exponent in its high five bits, plus as many eighths of it as the
+/// mantissa in its low three bits.
+const fn described_window_size(window: u8) -> u64 {
+    let base = 1u64 << (WINDOW_LOG_ABSOLUTE_MIN + (window >> 3) as u32);
+    base + (base / 8) * (window & 7) as u64
+}
+
 /// Size of a frame header, from its descriptor byte to its last field
 /// (the magic number excluded).
 pub(crate) const fn header_size(descriptor: u8) -> usize {
     let single_segment = descriptor & 0x20 != 0;
     let window = if single_segment { 0 } else { 1 };
-    let dictionary = match descriptor & 3 {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        _ => 4,
-    };
+    let dictionary = dictionary_id_size(descriptor);
     let content_size = match descriptor >> 6 {
         0 => {
             if single_segment {
@@ -70,44 +83,43 @@ pub(crate) const fn header_size(descriptor: u8) -> usize {
 
 /// Reads a little-endian field of up to eight bytes.
 fn read_le(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .rev()
-        .fold(0u64, |value, &byte| (value << 8) | u64::from(byte))
+    let mut value = 0;
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        value = (value << 8) | u64::from(bytes[index]);
+    }
+    value
 }
 
 impl FrameHeader {
     /// Parses a header of exactly [`header_size`] bytes.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, InvalidDataKind> {
         let invalid = InvalidDataKind::FrameHeader;
-        let (&descriptor, mut fields) = bytes.split_first().ok_or(invalid)?;
+        if bytes.is_empty() {
+            return Err(invalid);
+        }
+        let descriptor = bytes[0];
         if bytes.len() != header_size(descriptor) || descriptor & 0x08 != 0 {
             return Err(invalid);
         }
+        // `header_size` fixed the width of every field, so the fields fill
+        // `bytes` exactly and none of the indexing below is out of range.
         let single_segment = descriptor & 0x20 != 0;
-        let mut window_size = 0;
-        if !single_segment {
-            let (&window, rest) = fields.split_first().ok_or(invalid)?;
-            let log = WINDOW_LOG_ABSOLUTE_MIN + u32::from(window >> 3);
-            let base = 1u64 << log;
-            window_size = base + (base / 8) * u64::from(window & 7);
-            fields = rest;
-        }
-        let dictionary_bytes = match descriptor & 3 {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            _ => 4,
-        };
-        let (dictionary, fields) = fields.split_at_checked(dictionary_bytes).ok_or(invalid)?;
+        let dictionary_start = if single_segment { 1 } else { 2 };
+        let content_start = dictionary_start + dictionary_id_size(descriptor);
+        let dictionary = &bytes[dictionary_start..content_start];
+        let fields = &bytes[content_start..];
         let content_size = match fields.len() {
             0 => None,
             2 => Some(read_le(fields) + 256),
             _ => Some(read_le(fields)),
         };
-        if single_segment {
-            window_size = content_size.unwrap_or(0);
-        }
+        let window_size = if single_segment {
+            content_size.unwrap_or(0)
+        } else {
+            described_window_size(bytes[1])
+        };
         Ok(Self {
             window_size,
             content_size,
@@ -330,6 +342,21 @@ mod tests {
         let header = FrameHeader::parse(&[0xe1, 7, 0, 0, 0, 0, 0, 0, 0, 1]).expect("valid");
         assert_eq!(header.dictionary_id, 7);
         assert_eq!(header.content_size, Some(1 << 56));
+    }
+
+    #[test]
+    fn window_descriptors_span_the_rfc_range() {
+        // The smallest window is 1 KiB, the largest (1 << 41) + 7 * (1 << 38).
+        assert_eq!(described_window_size(0x00), 1 << 10);
+        assert_eq!(described_window_size(0x07), (1 << 10) + 7 * (1 << 7));
+        assert_eq!(described_window_size(0xFF), (1 << 41) + 7 * (1 << 38));
+    }
+
+    #[test]
+    fn little_endian_fields_read_up_to_eight_bytes() {
+        assert_eq!(read_le(&[]), 0);
+        assert_eq!(read_le(&[0x34, 0x12]), 0x1234);
+        assert_eq!(read_le(&[0xFF; 8]), u64::MAX);
     }
 
     #[test]

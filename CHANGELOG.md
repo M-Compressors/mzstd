@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Formal verification against RFC 8878**, ported from mbrotli. Charon and
+  Aeneas translate selected Rust items into Lean 4
+  (`scripts/extract_lean.py`), and `verification/lean` proves them correct
+  against a transcription of RFC 8878 itself, never against the C library:
+  the frame header (descriptor, window formula, dictionary ID, content size)
+  and the block header on both sides, with round trips from the encoder's
+  writers through the decoder's parsers; `Number_of_Sequences` in its
+  shortest form and every form the RFC defines; the literals length and
+  match length codes, whose encoder picks the only code whose RFC range holds
+  each length and whose decoder tables read it back; the offset code tables,
+  the default distributions, the initial repeat offsets and the magic
+  numbers; the encoder's repeat offset update for every offset value; and the
+  FSE `Number_of_Bits` and `Baseline` of every state (Table 21). Each proof
+  also shows the translated code cannot panic or overflow on the inputs it
+  covers. The transcription checks itself against the RFC's worked examples;
+  RFC 8878's Table 18 misprints its last two rows, and the proofs follow the
+  RFC's text. `ci-lean.yml` checks that the translation matches the Rust
+  source and that the proofs build with only Lean's standard axioms. To make
+  the code translatable, `FrameHeader::parse` reads its fields by index,
+  `Number_of_Sequences` is read and written by the new `sequence_count` and
+  `write_sequence_count`, and the encoder's frame header is written from a
+  `FrameHeaderFields` value; behaviour and output are unchanged.
+
 - **hotpath Cloud with Callgrind**, ported from mbrotli. New opt-in
   `hotpath-callgrind` and `hotpath-cloud` profiling features, and the
   optional `hotpath` dependency is updated to 0.29.2. The new

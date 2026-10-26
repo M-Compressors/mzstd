@@ -200,6 +200,14 @@ capacity from the frame header.
   `fearless_simd` vector kernels and `borrowed-buf` uninitialized output),
   and AddressSanitizer over the integration tests, on every release tag.
 - 100% function coverage, checked with `cargo llvm-cov`.
+- [Formal verification](architecture/formal-verification.md) in Lean 4 of
+  parts of the format against RFC 8878 itself, not the C library: Charon and
+  Aeneas translate the Rust code, and machine-checked proofs show that the
+  frame and block headers, `Number_of_Sequences`, the length and offset code
+  tables, the default distributions, the repeat offset update and the FSE
+  state transitions follow the RFC, that encoder and decoder agree on them,
+  and that the translated code cannot panic or overflow on the inputs the
+  proofs cover.
 
 See [`architecture/`](architecture/README.md) for how the code is organized
 and verified.

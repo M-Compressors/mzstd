@@ -509,73 +509,17 @@ impl Engine {
     #[inline]
     fn write_frame_header(&self, dst: &mut [u8], pledged: u64) -> Result<usize, CoreError> {
         let fparams = self.applied.fparams;
-        let dict_id = self.dict_id;
-        let dict_id_size_code = if fparams.no_dict_id {
-            0
-        } else {
-            u8::from(dict_id > 0) + u8::from(dict_id >= 256) + u8::from(dict_id >= 65536)
-        };
-        let checksum = u8::from(fparams.checksum);
-        let window_size = 1u64 << self.applied.cparams.window_log;
-        let single_segment = fparams.content_size && window_size >= pledged;
-        let window_log_byte =
-            ((self.applied.cparams.window_log - WINDOW_LOG_ABSOLUTE_MIN) << 3) as u8;
-        let fcs_code: u8 = if fparams.content_size {
-            u8::from(pledged >= 256)
-                + u8::from(pledged >= 65536 + 256)
-                + u8::from(pledged >= 0xFFFF_FFFF)
-        } else {
-            0
-        };
-        let descriptor =
-            dict_id_size_code + (checksum << 2) + (u8::from(single_segment) << 5) + (fcs_code << 6);
-        if dst.len() < FRAME_HEADER_SIZE_MAX {
-            return Err(CoreError::DstSizeTooSmall);
-        }
-        dst[..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
-        let mut pos = 4;
-        dst[pos] = descriptor;
-        pos += 1;
-        if !single_segment {
-            dst[pos] = window_log_byte;
-            pos += 1;
-        }
-        match dict_id_size_code {
-            0 => {}
-            1 => {
-                dst[pos] = dict_id as u8;
-                pos += 1;
-            }
-            2 => {
-                dst[pos..pos + 2].copy_from_slice(&(dict_id as u16).to_le_bytes());
-                pos += 2;
-            }
-            _ => {
-                dst[pos..pos + 4].copy_from_slice(&dict_id.to_le_bytes());
-                pos += 4;
-            }
-        }
-        match fcs_code {
-            0 => {
-                if single_segment {
-                    dst[pos] = pledged as u8;
-                    pos += 1;
-                }
-            }
-            1 => {
-                dst[pos..pos + 2].copy_from_slice(&((pledged - 256) as u16).to_le_bytes());
-                pos += 2;
-            }
-            2 => {
-                dst[pos..pos + 4].copy_from_slice(&(pledged as u32).to_le_bytes());
-                pos += 4;
-            }
-            _ => {
-                dst[pos..pos + 8].copy_from_slice(&pledged.to_le_bytes());
-                pos += 8;
-            }
-        }
-        Ok(pos)
+        write_frame_header(
+            dst,
+            FrameHeaderFields {
+                window_log: self.applied.cparams.window_log,
+                dict_id: self.dict_id,
+                no_dict_id: fparams.no_dict_id,
+                checksum: fparams.checksum,
+                content_size: fparams.content_size,
+                pledged,
+            },
+        )
     }
 
     /// Compresses `len` bytes at `src` (`ZSTD_compressContinue_internal` in
@@ -844,6 +788,101 @@ impl Engine {
             self.prev.entropy.fse.offcode_repeat = FseRepeat::Check;
         }
     }
+}
+
+/// What a frame header declares: `ZSTD_writeFrameHeader`'s inputs.
+#[derive(Clone, Copy, Debug)]
+struct FrameHeaderFields {
+    /// Window size as a power of two, from `WINDOW_LOG_ABSOLUTE_MIN`.
+    window_log: u32,
+    /// Dictionary ID; zero declares none.
+    dict_id: u32,
+    /// Leaves the dictionary ID out even when it is not zero.
+    no_dict_id: bool,
+    /// Announces a content checksum after the last block.
+    checksum: bool,
+    /// Declares `pledged` as the frame's content size.
+    content_size: bool,
+    /// The frame's content size, when declared.
+    pledged: u64,
+}
+
+/// Writes a frame header at the start of `dst`, returning its size
+/// (`ZSTD_writeFrameHeader`).
+fn write_frame_header(dst: &mut [u8], header: FrameHeaderFields) -> Result<usize, CoreError> {
+    let FrameHeaderFields {
+        window_log,
+        dict_id,
+        no_dict_id,
+        checksum,
+        content_size,
+        pledged,
+    } = header;
+    let dict_id_size_code = if no_dict_id {
+        0
+    } else {
+        u8::from(dict_id > 0) + u8::from(dict_id >= 256) + u8::from(dict_id >= 65536)
+    };
+    let checksum = u8::from(checksum);
+    let window_size = 1u64 << window_log;
+    let single_segment = content_size && window_size >= pledged;
+    let window_log_byte = ((window_log - WINDOW_LOG_ABSOLUTE_MIN) << 3) as u8;
+    let fcs_code: u8 = if content_size {
+        u8::from(pledged >= 256)
+            + u8::from(pledged >= 65536 + 256)
+            + u8::from(pledged >= 0xFFFF_FFFF)
+    } else {
+        0
+    };
+    let descriptor =
+        dict_id_size_code + (checksum << 2) + (u8::from(single_segment) << 5) + (fcs_code << 6);
+    if dst.len() < FRAME_HEADER_SIZE_MAX {
+        return Err(CoreError::DstSizeTooSmall);
+    }
+    dst[..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+    let mut pos = 4;
+    dst[pos] = descriptor;
+    pos += 1;
+    if !single_segment {
+        dst[pos] = window_log_byte;
+        pos += 1;
+    }
+    match dict_id_size_code {
+        0 => {}
+        1 => {
+            dst[pos] = dict_id as u8;
+            pos += 1;
+        }
+        2 => {
+            dst[pos..pos + 2].copy_from_slice(&(dict_id as u16).to_le_bytes());
+            pos += 2;
+        }
+        _ => {
+            dst[pos..pos + 4].copy_from_slice(&dict_id.to_le_bytes());
+            pos += 4;
+        }
+    }
+    match fcs_code {
+        0 => {
+            if single_segment {
+                dst[pos] = pledged as u8;
+                pos += 1;
+            }
+        }
+        1 => {
+            dst[pos..pos + 2].copy_from_slice(&((pledged - 256) as u16).to_le_bytes());
+            pos += 2;
+        }
+        2 => {
+            dst[pos..pos + 4].copy_from_slice(&(pledged as u32).to_le_bytes());
+            pos += 4;
+        }
+        _ => {
+            dst[pos..pos + 8].copy_from_slice(&pledged.to_le_bytes());
+            pos += 8;
+        }
+    }
+    Ok(pos)
 }
 
 /// Writes a block header.

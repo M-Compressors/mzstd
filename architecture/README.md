@@ -41,6 +41,9 @@ graph TD
     LibFuzz["fuzz/libfuzzer (excluded package): ClusterFuzzLite adapters"] -.-> Fuzz
     Cmp["benchmarks/comparison (excluded package): cold C vs mzstd reports"] -.-> Root
     Cmp -.-> Ref
+    Lean["verification/lean (excluded): Lean 4 proofs against RFC 8878"] -. Charon/Aeneas translation .-> ECore
+    Lean -.-> DCore
+    Lean -.-> Shared
 ```
 
 Public modules own configuration, ownership, sessions and high-level errors.
@@ -60,6 +63,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches over slices or random-access sources (`prepare_source`), windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues and their executor progress requirements, the parallel `std::io` adapters, errors and panic safety. |
 | [Framed containers](framing.md) | The `framed` wire format (Zstandard and skippable frames, chunk headers, directory, footer, contrib-compatible seek table) and the framed compressor: owner, sessions, structured input, std adapters, state and memory. |
 | [Framed decoder](framed-decoder.md) | `FramedDecompressor`: detection, chunk and seek table validation, events, dictionaries and budgets; the `FramedSeekReader` index and dependency plan. |
+| [Formal verification](formal-verification.md) | Charon/Aeneas translation to Lean 4 and its drift check, the RFC 8878 transcription, function specifications, encoder/decoder round trips for headers, `Number_of_Sequences` and length codes, repeat offsets, FSE transitions, trusted base and the RFC coverage checklist. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration and compatibility with the reference decoder. |
 | [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed on demand a chunk at a time, the shared outcome mapping, the C ABI and their contract. |

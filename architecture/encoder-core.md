@@ -87,6 +87,15 @@ stateDiagram-v2
     Init --> Created: compress_end on empty input
 ```
 
+The frame header is written by the free function
+`cctx::write_frame_header` from a `FrameHeaderFields` value (window log,
+dictionary ID, checksum and content-size flags, pledged size) that the
+engine's method fills in, and block headers by `write_block_header`;
+`block::write_sequence_count` writes a block's `Number_of_Sequences`. The
+three are small and free of SIMD so that the [formal
+verification](formal-verification.md) can translate them and check them
+against RFC 8878.
+
 `begin` is `ZSTD_resetCCtx_internal`: it derives the block size from the
 window and the pledged size, resets indices on first use or when they come
 within 16 MiB of `ZSTD_CURRENT_MAX` (`ZSTD_indexTooCloseToMax`), sizes the

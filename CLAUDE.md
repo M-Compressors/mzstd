@@ -190,6 +190,24 @@ explicitly an upstream-vendor update.
   output directories. Turn every minimized crash into a deterministic
   regression test before fixing it.
 
+## Formal verification
+
+- `verification/lean/` proves in Lean 4 that the Rust items listed in `START`
+  of `scripts/extract_lean.py` implement RFC 8878. The specification is the
+  RFC, transcribed in `verification/lean/Mzstd/Rfc.lean`; never state a
+  theorem against the C library or against a restatement of the Rust code.
+- Charon and Aeneas generate `Mzstd/Code/Types.lean` and `Code/Funs.lean`;
+  never edit them. Model a new unmodelled standard-library item in
+  `Code/FunsExternal.lean` and list it in `EXTERNALS`.
+- Keep translated items free of iterator adapters, closures, SIMD and
+  allocation, which Aeneas cannot translate; factor the RFC arithmetic of a
+  hot or generic function into a small function instead, as
+  `sequence_count` and `write_sequence_count` are.
+- Proofs may use only Lean's three standard axioms: no `sorry`, no
+  `native_decide`. Register every headline theorem in `Mzstd/Audit.lean`.
+- Keep `architecture/formal-verification.md`, including its coverage
+  checklist, in sync with the theorems.
+
 ## Benchmarks
 
 - Add Criterion benchmarks for meaningful algorithm and API changes. Benchmarks
@@ -240,6 +258,10 @@ After changing Rust code:
    `detect_leaks=0` step.
 8. Do not use `#[allow(..)]` to fix clippy warnings.
 9. Update CHANGELOG.md
+10. After changing an item in `START` of `scripts/extract_lean.py`, or code it
+    calls, run `python3 scripts/extract_lean.py`, then `lake build` in
+    `verification/lean`, and fix or update the proofs (see Formal
+    verification).
 
 Steps 1 through 3 run at the workspace root, which does not reach `fuzz/afl`;
 that package is excluded from the workspace so AFL's instrumentation cannot
