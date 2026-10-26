@@ -4,13 +4,14 @@
 
 - **hotpath Cloud with Callgrind**, ported from mbrotli. New opt-in
   `hotpath-callgrind` and `hotpath-cloud` profiling features, and the
-  optional `hotpath` dependency is updated to 0.29. The new
+  optional `hotpath` dependency is updated to 0.29.2. The new
   `profile_compressor` example drives the encoder at levels -5 to 22 on
   repeated text, on a 17-byte input and on an optional corpus. The
-  `hotpath benchmark` workflow runs it under Callgrind on Alice for every
-  push to `main` and pull request and uploads the report to hotpath Cloud
-  (pull requests through `hotpath-relay.yml`), judged by
-  `hotpath/policy.toml`. The published crate is unchanged apart from the
+  `hotpath benchmark` workflow runs it on Alice for every push to `main` and
+  pull request in merged mode: natively for timing and allocations, then
+  under Callgrind for instruction counts, in one report. It uploads the
+  report to hotpath Cloud (pull requests through `hotpath-relay.yml`),
+  judged by `hotpath/policy.toml`. The published crate is unchanged apart from the
   example.
 
 - **Continuous fuzzing with ClusterFuzzLite**, ported from mbrotli.

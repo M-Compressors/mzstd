@@ -6,6 +6,7 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
 [![docs.rs](https://docs.rs/mzstd/badge.svg)][api]
 [![Tests](https://github.com/M-Compressors/mzstd/actions/workflows/ci.yml/badge.svg?branch=main)][ci]
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![hotpath-cloud](https://img.shields.io/endpoint?url=https://hotpath.rs/badge-cloud.json)](https://hotpath.rs/app/repos/M-Compressors/mzstd)
 
 - **Byte-identical encoder.** For the same input and parameters,
   single-threaded compression writes exactly the bytes of zstd 1.5.7:

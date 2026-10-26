@@ -25,7 +25,7 @@ graph TD
     Tag --> Miri["ci-miri.yml: Miri over SIMD kernels and BorrowedBuf output"]
     Tag --> ASan["ci-sanitizer.yml: AddressSanitizer over integration and kernel tests"]
     Manual --> Rel["release.yml: trusted publishing from a v* tag"]
-    Push --> HB["hotpath-benchmark.yml: profile_compressor under Callgrind"]
+    Push --> HB["hotpath-benchmark.yml: profile_compressor natively, then under Callgrind (merged)"]
     HB -->|"push: OIDC upload"| Cloud[(hotpath Cloud)]
     HB -->|"pull request: report artifact"| Relay["hotpath-relay.yml (workflow_run)"]
     Relay -->|"OIDC upload"| Cloud
@@ -34,8 +34,8 @@ graph TD
 | Workflow | Trigger | Checks |
 | --- | --- | --- |
 | `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
-| `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run under `valgrind --tool=callgrind --instr-atstart=no` on `testdata/alice29.txt`. A push uploads the report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
-| `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.1 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
+| `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run on `testdata/alice29.txt` in merged mode: natively for timing and allocations, then under `valgrind --tool=callgrind --instr-atstart=no` with `HOTPATH_MERGE_REPORT` pointing at the native report, which adds instruction counts. `jq` checks that the merged report has both icount and timing data. A push uploads the merged report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
+| `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.2 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
 | `ci-cflite-pr.yml` | pull requests touching `src/`, `zstd-ffi/`, `fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow | ClusterFuzzLite libFuzzer/ASan run on the changed code, 600 s. See [ClusterFuzzLite](#clusterfuzzlite). |
 | `ci-cflite-cron.yml` | daily, manual | ClusterFuzzLite batch fuzzing (5.5 h), corpus pruning and a coverage report. |
 | `ci-coverage.yml` | manual | `cargo llvm-cov --workspace --release` with `--fail-under-functions 100` over repository-owned sources (zstd-ffi and the vendored C excluded); HTML report as an artifact. |
@@ -51,8 +51,15 @@ reproducible.
 
 ## hotpath Cloud
 
-`hotpath-benchmark.yml` measures the encoder by instruction count rather than
-time, so a shared GitHub runner gives reproducible numbers. Counts depend on
+`hotpath-benchmark.yml` judges the encoder by instruction count rather than
+time, so a shared GitHub runner gives reproducible numbers. It runs in merged
+mode: the same build first runs natively and writes a JSON report with timing
+and allocations, then runs under Callgrind with `HOTPATH_MERGE_REPORT` naming
+that report, and the Callgrind run adds its instruction counts and writes (and,
+on a push, uploads) the merged report. Valgrind distorts allocation data as
+well as timing, so both come from the native run. Both runs share
+`HOTPATH_BENCHMARK`, `HOTPATH_USER_METADATA` and `HOTPATH_OUTPUT_FORMAT` from
+the job environment, so their reports describe one benchmark. Counts depend on
 the Valgrind build, the Rust toolchain and the runner image, which are all
 pinned; bumping any of them moves the baseline and belongs in a separate pull
 request. hotpath Cloud compares each pull request's report with the latest
@@ -68,9 +75,11 @@ sequenceDiagram
     participant Relay as hotpath-relay.yml
     participant Push as push job (main)
     participant Cloud as hotpath Cloud
-    Push->>Push: build profile_compressor, run under Callgrind
-    Push->>Cloud: upload report (OIDC), new baseline
-    PR->>PR: build profile_compressor, run under Callgrind
+    Push->>Push: build profile_compressor, run natively (native.json)
+    Push->>Push: run under Callgrind, merge icount into native.json
+    Push->>Cloud: upload merged report (OIDC), new baseline
+    PR->>PR: build profile_compressor, run natively (native.json)
+    PR->>PR: run under Callgrind, merge into compressor-report.json
     PR->>PR: upload-artifact compressor-report.json
     PR-->>Relay: workflow_run completed
     Relay->>Cloud: upload report for the pull request (OIDC)
