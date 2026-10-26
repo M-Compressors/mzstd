@@ -253,15 +253,21 @@ for regressions, and report intervals and noisy cases alongside improvements.
   `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` gives exact instruction
   counts per function and source line; `callgrind_annotate` reads them.
 - **Instruction counts per stage.** On x86_64 Linux, `hotpath-callgrind`
-  replaces the timing table with per-anchor instruction counts from
-  Callgrind. The `hotpath benchmark` workflow runs this on every pull request
-  and uploads the report to hotpath Cloud, judged by `hotpath/policy.toml`;
-  compare counts only within one Valgrind version, Rust toolchain and runner
-  image:
+  adds per-anchor instruction counts from Callgrind. The `hotpath benchmark`
+  workflow runs in merged mode on every pull request: one build runs natively
+  for timing and allocations, then under Callgrind, which merges its
+  instruction counts into the native report and uploads it to hotpath Cloud,
+  judged by `hotpath/policy.toml`. Valgrind distorts allocation data as well
+  as timing, so both come from the native run. Counts and allocations are
+  judged, timing is shown but not judged; compare counts only within one
+  Valgrind version, Rust toolchain and runner image:
 
   ```sh
   cargo build --release --locked --example profile_compressor --features hotpath-alloc,hotpath-callgrind
-  valgrind -q --tool=callgrind --instr-atstart=no \
+  HOTPATH_OUTPUT_FORMAT=json HOTPATH_OUTPUT_PATH=native.json \
+    target/release/examples/profile_compressor testdata/alice29.txt
+  HOTPATH_OUTPUT_FORMAT=json HOTPATH_MERGE_REPORT=native.json HOTPATH_OUTPUT_PATH=merged.json \
+    valgrind -q --tool=callgrind --instr-atstart=no \
     target/release/examples/profile_compressor testdata/alice29.txt
   ```
 - **Code.** `cargo asm --lib --release '<symbol>'` shows what a kernel compiled
