@@ -156,6 +156,14 @@ call after a frame ending exactly at a full output buffer as "truncated".
 It now records only calls that made progress, and
 `zstd-ffi/tests/oracle_stream_boundary.rs` covers both outcomes.
 
+The ClusterFuzzLite cron of 2026-10-27 found another harness bug in
+`framed_roundtrip`: with one-byte chunks a 4 KiB payload makes a chunk per
+byte plus the metadata and seek table, more than the 4096 chunks the shared
+decode limits allowed, so the decoder rightly returned
+`LimitExceeded { kind: Chunks }`. The limit is now twice the largest
+round-trip payload, and `regressions/framed_roundtrip/` keeps the CI input
+and a 4096-byte payload with one-byte chunks.
+
 A 10-minute run of `decode_dictionary` from its committed regressions
 (2026-10-15) found no crashes or hangs: 952 new corpus items, 40% map
 coverage.

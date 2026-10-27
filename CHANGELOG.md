@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Fixed a false `framed_roundtrip` fuzz crash.** With one-byte chunks the
+  target writes a chunk per payload byte plus metadata, which exceeded the
+  4096-chunk decode limit of the framed targets. The limit is now 8192, and
+  the ClusterFuzzLite input is kept as a regression. The library is
+  unchanged.
+
 - **Formal verification against RFC 8878**, ported from mbrotli. Charon and
   Aeneas translate selected Rust items into Lean 4
   (`scripts/extract_lean.py`), and `verification/lean` proves them correct

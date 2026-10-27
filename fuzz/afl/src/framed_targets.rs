@@ -13,6 +13,8 @@ use zstd_ffi::oracle::{self, Dictionary};
 const PREFIX: &[u8] = b"dictionary payload words";
 /// Its external identity.
 const PREFIX_ID: DictionaryId = DictionaryId([7; 32]);
+/// The longest payload [`framed_roundtrip`] writes.
+const ROUNDTRIP_PAYLOAD: usize = 4096;
 
 /// Resolves [`PREFIX_ID`] to [`PREFIX`].
 struct Prefix;
@@ -32,7 +34,9 @@ fn config() -> FramedDecodeConfig {
             FramedDecodeLimits::default()
                 .with_max_output_bytes(Some(1 << 20))
                 .with_max_decoded_bytes(Some(2 << 20))
-                .with_max_chunks(Some(4096))
+                // One-byte chunks give `framed_roundtrip` a chunk per payload
+                // byte on top of its metadata and seek table.
+                .with_max_chunks(Some(2 * ROUNDTRIP_PAYLOAD as u64))
                 .with_max_resources(Some(1024)),
         )
 }
@@ -208,7 +212,7 @@ pub fn framed_decode(data: &[u8]) {
 /// decodes back, reads back by index, and zstd's decoders see the payload.
 pub fn framed_roundtrip(input: &[u8]) {
     let (settings, data) = input.split_at(input.len().min(2));
-    let data = &data[..data.len().min(4096)];
+    let data = &data[..data.len().min(ROUNDTRIP_PAYLOAD)];
     let chunk_bytes = 1 + usize::from(settings.first().copied().unwrap_or(0) % 63);
     let level = [1, 3, 9, 19, -5][usize::from(settings.get(1).copied().unwrap_or(0) % 5)];
     let mut encoder = FramedCompressor::new(
