@@ -3,23 +3,24 @@
 
 import unittest
 
-from level_docs import (CORPORA, ENCODERS, LEVELS, cases, dataset_order, level_order, level_page,
-                        medians, number, summary, validate_rows)
+from level_docs import (CORPORA, ENCODERS, LEVELS, MAIN, cases, dataset_order, level_order, level_page,
+                        medians, number, overview_table, summary, validate_rows)
 
 LENGTHS = {"empty": 0, "tiny-text": 44, "alice29": 152089, "text-1m": 1 << 20,
            "binary-64k": 1 << 16, "random-64k": 1 << 16, "random-1m": 1 << 20, "repeated-1m": 1 << 20}
 ENVIRONMENT = {"baseline": "unit", "date": "2026-10-13", "cpu": "test CPU", "affinity": "one core.",
                "rustflags": "defaults", "versions": {"c-zstd": "1.5.7", "mzstd": "0.2.0"},
-               "sampling": {"samples": 20, "warmup_seconds": 1, "requested_measurement_seconds": 3}}
+               "sampling": {"samples": 20, "warmup_seconds": 1, "requested_measurement_seconds": 3},
+               "main": {"commit": "0123abc"}}
 
 
-def matrix(fast=lambda level, corpus: 800.0):
-    """A complete matrix; mzstd's time per case comes from `fast`."""
+def matrix(fast=lambda level, corpus: 800.0, c=1000.0):
+    """A complete matrix; mzstd's time per case comes from `fast`, C's is `c`."""
     rows = []
     for level in LEVELS:
         for corpus in CORPORA:
             for name in ENCODERS:
-                ns = 1000.0 if name == "c-zstd" else fast(level, corpus)
+                ns = c if name == "c-zstd" else fast(level, corpus)
                 rows.append({"corpus": corpus, "input_bytes": str(LENGTHS[corpus]), "level": str(level),
                              "implementation": name, "compressed_bytes": "100", "mean_ns": str(ns),
                              "mean_lower_ns": str(ns - 1), "mean_upper_ns": str(ns + 1)})
@@ -71,6 +72,23 @@ class Pages(unittest.TestCase):
         self.assertNotIn("←", level_page(rows, LEVELS[0], ENVIRONMENT, "a", "e", "r"))
         self.assertNotIn("→", level_page(rows, LEVELS[-1], ENVIRONMENT, "a", "e", "r"))
         self.assertIn("| mzstd | 1.250× | 1.000× | 8 |", summary(rows, 3))
+
+    def test_main_series_is_normalized_to_its_own_run(self):
+        rows = validate_rows(matrix())
+        main = validate_rows(matrix(lambda level, corpus: 1000.0, c=900.0))
+        values = medians(rows, 3, main)
+        self.assertEqual(list(values), ["c-zstd", MAIN, "mzstd"])
+        self.assertAlmostEqual(values[MAIN]["speed"], 0.9)
+        self.assertAlmostEqual(values["mzstd"]["speed"], 1.25)
+        self.assertIn("| mzstd main | 0.900× | 1.000× | 8 |", summary(rows, 3, main))
+        page = level_page(rows, 3, ENVIRONMENT, "a", "e", "r", main=main)
+        self.assertIn("measured on `0123abc`", page)
+        self.assertIn("mzstd main speed / C: 0.900× (separate run).", page)
+        self.assertNotIn("mzstd main", level_page(rows, 3, ENVIRONMENT, "a", "e", "r"))
+        table = overview_table(rows, main)
+        self.assertIn("| mzstd speed / C ↑ | mzstd main speed / C |", table[0])
+        self.assertIn("| [Level 3](l3.md) | 1.250× | 0.900× | 1.000× | 8 |", table)
+        self.assertEqual(overview_table(rows)[0], "| Level | mzstd speed / C ↑ | mzstd output / C ↓ | Datasets |")
 
     def test_numbers_avoid_scientific_notation(self):
         self.assertEqual(number(48470.2), "48,470")

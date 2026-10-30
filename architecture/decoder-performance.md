@@ -26,7 +26,7 @@ sequenceDiagram
         B->>B: copy_from_slice / fill
     else compressed block
         B->>B: MatchCopy from backend.has_fast_shuffle()
-        B->>B: fearless_simd::dispatch!(backend.0, simd => ...)
+        B->>B: fearless_simd::dispatch!(backend.block_decode_level(), simd => ...)
         B->>H: #[simd] kernel: literals
         B->>Q: #[simd] kernel: sequences
     end
@@ -43,13 +43,21 @@ them apart keeps each loop's register allocation independent.
 (SSSE3 and up, NEON, WASM SIMD); `sse2` and `fallback` use
 `MatchCopy::Scalar`.
 
+`Backend::block_decode_level` runs the block loops of an AVX-512 backend
+with AVX2's features. The loops are scalar apart from 16- and 32-byte
+copies, which AVX2 already has; with AVX-512's cheap gathers the compiler
+vectorized the four Huffman streams' independent lookups across lanes
+(`vpgatherdd`, `vpsllvq`, lane extracts), lengthening every stream's chain:
+a pair loop written as the reference's took 101.8 µs on Alice level 1
+compiled for AVX-512 against 87.2 µs for AVX2 (Ryzen 9 7950X).
+
 ## Bit readers
 
 ```mermaid
 classDiagram
     class BitContainer {
         container: u64
-        consumed: u32
+        avail: u32
         pos: usize
         +new(src) Option
         +look(n) / look_nonzero(n) / read(n) / skip(n)
@@ -69,18 +77,15 @@ classDiagram
     BitContainer <--> Sentinel : Huffman fast loops
 ```
 
-- **`BitContainer`** is `BIT_DStream_t`: the eight stream bytes at `pos`,
-  `consumed` bits read from the top. `look` is `BIT_getMiddleBits`.
-  `reload` is `BIT_reloadDStream`: a full refill while `pos >= 8`, the
-  cautious refill near the start (`#[cold]`, by value so the container
-  stays in registers), and no change once more than 64 bits were consumed.
-  While `pos >= 8` every refill so far was full and callers read at most
-  57 bits between refills, so the overflow test only runs on the cautious
-  path. A stream is valid only when `pos == 0 && consumed == 64`; once
-  reads pass the start, `consumed` stays above 64, so corrupt streams are
-  rejected exactly as by `BIT_endOfDStream`. `overflowed` (`consumed >
-  64`) is the reference's `BIT_DStream_overflow`; the Huffman weight
-  decoder uses it, so no separate reverse reader remains.
+- **`BitContainer`** keeps the eight bytes at `pos` and the count
+  `avail` of unread low bits. `look` subtracts the requested width, shifts
+  and masks; a zero-width read returns zero. A full refill while `pos >= 8`
+  moves back by `(64 - avail) / 8` bytes. Near the start, the cautious
+  refill is cold and takes the container by value so the hot loop can keep
+  it in registers. At `pos == 0` it returns directly without that cold
+  call. Valid exhaustion is `pos == 0 && avail == 0`; overreading wraps
+  `avail` above 64 and refills preserve that overflow until validation
+  rejects it. The Huffman weight decoder checks the same overflow state.
 - **`Sentinel`** is the reference's fast-loop stream
   (`HUF_DecompressFastArgs`): unread bits at the top, a `1` below them
   shifted up with every read, so the consumed count is the sentinel's
@@ -91,6 +96,10 @@ classDiagram
   changes a value, but it replaces a bounds-checked load and its fallback
   branch with a compare and a `cmov`. Each stream keeps its own position
   and output count, so its tail takes over where its fast rounds ended.
+  Pair rounds may refill across a later stream's start within the common
+  input allocation. `into_container` moves back to that stream's first
+  byte and subtracts prefix bits from `avail`, preserving both exact
+  exhaustion and overread errors before the stream-local tail runs.
 
 ## Huffman literals
 
@@ -103,7 +112,10 @@ flowchart TD
     Fast -->|no| Tails
     Fast -->|yes| Sel{prefers_pairs: HUF_selectDecoder}
     Sel -->|X1| Single[single_rounds: 5 symbols per stream per round, 4 if 12-bit tree]
-    Sel -->|X2, tree up to 11 bits| Pairs[build_pairs if stale; pair_rounds: 5 lookups per stream per refill, 11-bit pair rows]
+    Sel -->|X2, tree up to 11 bits| Fixed{buffer of FIXED_OUT bytes?}
+    Fixed -->|yes| PairsFixed[build_pairs if stale; pair_rounds_fixed: one masked position per stream, streams 1-3 interleaved, stream 4 with the refills]
+    Fixed -->|no| Pairs[build_pairs if stale; pair_rounds: per-round windows, streams 1-3 interleaved, then stream 4]
+    PairsFixed --> Back
     Single --> Back[Sentinels back to containers]
     Pairs --> Back
     Back --> Tails[decode_tail per stream: exact end check]
@@ -127,9 +139,10 @@ flowchart TD
   check and no array gathered on the stack: 176 instructions per 20
   symbols against the reference's 163.
 - The fast loops count the rounds every stream can afford up front (each
-  refill moves back at most seven bytes and must stay seven bytes into its
-  stream; outputs need room for the round's stores), run them without
-  per-stream tests, then recount.
+  refill moves back at most seven bytes; outputs need room for the round's
+  stores), run them without per-stream tests, then recount. Single rounds
+  remain within each input stream. Pair rounds use the common input bounds;
+  conversion back to stream-local containers restores strict end checks.
 - Pair rows (`HUF_DEltX2`) use 11-bit lookups
   (`HUF_DECODER_FAST_TABLELOG`): 2048 rows, half the size and build cost
   of 12-bit ones, a row pairing the code at the top of its index with the
@@ -140,22 +153,43 @@ flowchart TD
   as the reference's fast loop does; each stores two bytes into a 14-byte
   window of the stream's segment, and the count's range (at most 3) lets
   the compiler prove the five stores stay inside it without a mask or
-  per-store checks. Refill positions and window offsets are clamped to
-  their last in-bounds values, which the round counts never pass. Rounds
-  are limited to `(end - op - 8) / 10` per stream; 264 instructions per 20
-  lookups against the reference's about 225. Trees of 12 bits, which the reference accepts but
+  per-store checks. The output is split into four non-overlapping segments
+  once; every round takes a 14-byte window inside each segment. The first
+  three streams interleave their five lookups, exposing three independent
+  lookup chains to the processor. The fourth stream then decodes its five
+  lookups separately, limiting the live state during the interleaved work.
+  Refill positions and each segment's window offsets are clamped to their
+  last in-bounds values, which the round counts never pass. Rounds are
+  limited to `(end - op - 4) / 10` per stream. Trees of 12 bits, which the reference accepts but
   never writes, build no pair rows and decode with the single loop. Pair
   rows are rebuilt only after a new tree, and a test checks every row of
   trees of every depth against the definition.
+- `pair_rounds_fixed` is the reference's register layout: each stream
+  keeps only its container and one output position live, where a window
+  costs a base and an offset. Large four-stream sections (at least
+  `FIXED_MIN`, 4 KiB) decode into a literal buffer of at least
+  `FIXED_OUT` (`BLOCK_SIZE_MAX + PAIR_WINDOW`) bytes, which
+  `decode_streams` receives with the section size; smaller sections keep a
+  buffer of their own size, so small frames zero nothing more. Each round
+  masks the four positions to `BLOCK_SIZE_MAX - 1` (no section position
+  exceeds it) and advances them by at most three per lookup by the count's
+  type, so every two-byte store provably lands inside the array with no
+  check; the round counts still keep each stream inside its own segment.
+  As in the reference, the fourth stream's lookups interleave with the four
+  refills and its position ends the inner loop (`op4 < olimit`, with
+  `olimit` five symbols per affordable round), so no round counter is
+  live. On Alice level 1 the round executes 242 instructions instead of
+  295 (the reference: 221), and decoding takes 2.6% less time.
 - A code of `b` bits fills a run of `1 << (11 - b)` pair rows whose `j`th
   row continues with the code at row `j << b`, the same series for every
   code of that length (the reference's `HUF_fillDTableX2Level2` per rank).
   The first run of each length is built from the single rows; later runs
   of that length copy it with one add per row that swaps in their own
   first symbol.
-- Every stream finishes with the single-symbol table in the reference's
-  cautious loop and must be consumed exactly; the pair decoder never
-  decides how a stream ends.
+- Selected pair streams continue with four pair lookups per refill while
+  the remaining output has an 11-byte window. Every stream then finishes
+  with the single-symbol table in the cautious loop and must be consumed
+  exactly; pair decoding never decides how a stream ends.
 - The loops reach a table through `TableAccess`: the decoder's own table
   (`&mut HuffmanTable`, `decode_streams`) builds its pair rows on first
   use, a dictionary's shared table (`&HuffmanTable`,
@@ -166,7 +200,13 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Header[read_header: TableSlot::update per symbol type] --> Init[initial states, reload]
+    Header[read_header_on: count and per-symbol modes] --> Mode{table mode}
+    Mode -->|Basic| Static[borrow static predefined rows]
+    Mode -->|RLE or Compressed| Custom[allocate or rebuild private rows]
+    Mode -->|Repeat| Reuse[reuse static, private or dictionary rows]
+    Static --> Init[initial states, reload]
+    Custom --> Init
+    Reuse --> Init
     Init --> Next{sequences left?}
     Next -->|yes| Dec[SequenceDecoder::decode: ZSTD_decodeSequence]
     Dec -->|zero repeat offset| EOff[Offset]
@@ -185,23 +225,33 @@ flowchart TD
 
 - `SeqTable` rows are `ZSTD_seqSymbol`: baseline, next-state base,
   extra-bit and state-bit counts. Both counts are a `BitCount`, a
-  32-variant `#[repr(u8)]` enum: as an enum its range reaches the compiler
-  with every load, so reads by these counts need no `& 63` before the
-  `bzhi` or shift (about four instructions per sequence). The loop holds references to rows and
-  reads fields as needed. Slots are allocated on first use and rebuilt in
-  place. A slot's `predefined` flag says its entries hold the predefined
-  distribution whatever its `content` (what `Repeat_Mode` may reuse)
-  says: a frame start forgets the table for repeat modes but not its
-  entries, so the next predefined mode reuses them instead of rebuilding
-  them, as the reference points at static tables. An RLE or described
-  table clears it. Decoding a thousand small frames rebuilt all three
-  predefined tables per frame, 28% of the instructions.
-- `SeqTable::fill` precomputes each symbol's (baseline, extra bits) row,
-  so its row loop has no bounds checks or branches, and `spread` ports
+  32-variant `#[repr(u8)]` enum: its range reaches the compiler with every
+  load, so reads by these counts need no `& 63` before the `bzhi` or shift.
+  Constructing a count uses an exhaustive match, which compiles to range
+  masking without the memory lookup that indexing an array of enum variants
+  required. The sequence loop still holds references to rows and reads
+  fields as needed.
+- Basic sequence modes borrow immutable LL, OF and ML decoding rows built
+  at compile time from the predefined distributions. A `TableView` carries
+  the rows and initial-state width, whether the rows are static, owned by
+  the decoder or borrowed from a dictionary. Selecting a basic mode needs
+  no allocation or table construction, including the first block of a cold
+  decoder. RLE and described modes allocate private storage on first use
+  and reuse it thereafter. A frame start forgets which table repeat mode
+  may use; selecting a basic mode again simply restores its static view.
+  Private allocations remain reusable when a basic mode replaces them.
+- `SeqTable::fill_rows` consumes static per-alphabet symbol rows containing
+  the baselines and extra-bit counts. It no longer zeroes and rebuilds a
+  64-row symbol workspace for every described table. `spread` still ports
   `ZSTD_buildFSETable_body`: without "less than one" symbols it lays the
   symbols down eight at a time and scatters them with a fixed step,
   unrolled by two with no per-cell tests; otherwise it keeps the skipping
-  loop. Building a sequence table costs about 20% fewer instructions.
+  loop. Tests compare every predefined row with the runtime builder and
+  compare custom tables across the alphabets' symbols and accuracy logs.
+  Header parsing passes the block's existing SIMD token through
+  `read_header_on` to `fill_rows_on`; table construction therefore uses
+  the selected target features without detecting the CPU per table or row.
+  Dictionary parsing outside a block selects its backend once per table.
 - `Executor<const GROW: bool>`: fixed outputs (`decompress_to_slice`,
   streaming `History`) compile to the loop above with `execute_exactly`
   inline and cold. Growing outputs (`VecOutput`, `UninitOutput`) leave the
@@ -212,8 +262,13 @@ flowchart TD
   retries it, else runs `execute_exactly` (dictionary, end of output,
   errors in the old order: block size, offset, output full). Then the loop
   resumes.
+- An offset with more than one extra bit is read with `BitContainer::read`
+  (`sub`, `shrx`, `bzhi`), not `look_nonzero`, whose two shifts each need a
+  negated count: four instructions fewer per such sequence.
 - Decoding refills once per sequence and once more when the sequence's
   extra bits exceed `64 - 7 - (9 + 9 + 8)`, as the reference does.
+  Literal and match lengths with zero extra bits use their baselines
+  directly; they do not perform a zero-width shift and mask.
 - Errors keep the old order: literal overrun, block size, offset (and
   output room for caller-sized buffers).
 
@@ -359,7 +414,8 @@ flowchart TD
   compacts as before and ensures room for a block plus the overlength,
   `commit` records the block's end.
 - The literal buffer only grows, so blocks of varying sizes zero nothing
-  but its new tail.
+  but its new tail. A four-stream section of at least 4 KiB grows it to
+  `FIXED_OUT` bytes once, for the fixed-size pair loop.
 
 ## Measurements
 
@@ -394,6 +450,28 @@ multiply-rotate-multiply chain, and AVX2 has no 64-bit vector multiply. A
 which already matches the reference's 21 GB/s.
 
 ## Known gaps
+
+- Literal-heavy inputs decode slowest against the reference: Silesia x-ray
+  at level 1 0.85x ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30,
+  Ryzen 9 7950X, reused contexts), where both decoders spend
+  77-79% of their time in the four-stream pair loop. `pair_rounds_fixed`
+  takes 72.6 cycles per round against the reference's 61.5 (242
+  instructions against 221): the compiler keeps two streams' containers on
+  the stack between rounds, on their dependency chains (22.6M
+  store-to-load interlocks against 6.9M for 30 decodes). A branch-checked
+  refill and other stream orders measured slower.
+
+- Measured and rejected (2026-10-29, Ryzen 9 7950X, Alice level 1): the
+  repeat offsets as scalars, a packed `u64` pair, permuted slots, a ring
+  of four slots, the states kept local to the loop, a clamped refill
+  position, and the window test left out where the window covers the
+  output. Each changed the sequence loop's register allocation for the
+  worse: 2-12 more instructions per sequence and 2-14% slower, although the
+  ring cut store-to-load interlocks from 196M to 109M (the reference:
+  136M) for 3000 decodes. Shifting `[u32; 3]` in memory reloads two
+  offsets across two stores of different widths, about two interlocks per
+  sequence, but at about five instructions per cycle the loop is bound by
+  its instruction count, which the interlocks barely change.
 
 - Measured and rejected for `decompress` (2026-10-14): appending every
   sequence to the vector with `extend_from_slice`/`extend_from_within` is
@@ -438,25 +516,30 @@ which already matches the reference's 21 GB/s.
   faster but large decodes without a dictionary 1.5-3% slower through the
   same code-generation shift; it is not kept.
 
-- The one-shot sequence loop runs at the reference's instruction count:
-  126.9 instructions per sequence against 125.8 on Alice level 1 (AVX2),
-  with fewer mispredicted branches; both spill the decoder state to the
-  stack on every sequence. Literal-heavy text (Alice) still decodes a few
-  percent slower than the reference through `decompress`: the Huffman
-  pair loop executes about 13.2 instructions per lookup against the
-  reference's 11.25 (spills: four streams' bits, positions and outputs
-  plus their bases do not fit in 15 registers), the single-symbol loop 8.8
+- The one-shot sequence loop executes 126.7 instructions per sequence on
+  Alice level 1 (AVX2 code, Ryzen 9 7950X, 2026-10-29) against the
+  reference's 118.8; both spill the decoder state to the stack on every
+  sequence. It is the largest remaining gap: 74-89% of decoding time at
+  every level, against the reference's 77-90%. Literal-heavy text (Alice)
+  still decodes a few percent slower than the reference through
+  `decompress`: the Huffman
+  pair loop originally executed about 13.2 instructions per lookup against
+  the reference's 11.25 (spills: four streams' bits, positions and outputs
+  plus their bases do not fit in 15 registers), before the interleaved
+  three-stream schedule above and the fixed-size loop, which keeps two of
+  its four streams' containers in registers across a round and stores the
+  other two between rounds. The single-symbol loop used 8.8
   per symbol against 8.2, and about 2% of the time zeroes room for short
   sequences (`VecOutput::grow`). Both loops are limited by each stream's
   chain of dependent lookups, as the reference's are: removing 9-12% of
   their instructions made no measurable difference in a `codegen-units =
   1` build. Raw-literal frames (Alice level -5) decode at
   parity.
-- `SeqTable::fill` runs at about 26 instructions per row against the
-  reference's 21: it runs outside the SIMD dispatch, so without BMI or
-  LZCNT (`bsr`), and the `BitCount` enum needs a table lookup. Building
-  the pair table costs about 6K instructions per tree beyond its 8 KiB
-  zeroed allocation.
+- `SeqTable::fill_rows` still runs outside the SIMD dispatch, without
+  BMI or LZCNT in a portable build. Its alphabet rows are now static and
+  constructing a `BitCount` no longer needs a table lookup. Building the
+  pair table costs about 6K instructions per tree beyond its 8 KiB zeroed
+  allocation.
 - `decompress_to_slice` on 4 MiB of text is about 11% slower than
   `ZSTD_decompressDCtx` (level 1: 2.18 ms against 1.85 ms; level 3:
   1.89 ms against 1.65 ms) while executing only about 4% more

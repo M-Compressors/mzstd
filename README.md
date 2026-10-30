@@ -24,7 +24,56 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
   are not byte-identical to zstd's multithreaded mode. Segments are primed
   with the input before them the way zstd's multithreaded mode primes a job.
 - **No `unsafe`, no dependencies on zstd.** It runs with `no_std` + `alloc`,
-  and there is a C ABI in `mzstd-ffi`.
+  and there is a C ABI, one-shot and streaming, in `mzstd-ffi`.
+
+## Performance
+
+### Our benchmarks
+
+Compression writes byte-identical frames to zstd 1.5.7 and reaches a median
+1.256× its speed across the comparison corpus; decompression reaches 1.502×.
+These medians include empty and tiny inputs. Alice text remains slower at
+some compression levels and at every decompression level, and on whole
+Silesia files both codecs still trail C by 2–6% at most levels.
+
+<details>
+<summary>Compression benchmark results and methodology</summary>
+
+![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
+
+**Recorded 2026-10-30 · working tree on `0a4fd87` and main · AMD Ryzen 9 7950X (KVM) · cold one-shot APIs.**
+Each value is the median of per-dataset ratios across eight equally weighted datasets,
+including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
+frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
+median over all 192 dataset/level pairs is **1.256×**, with lower mean latency
+in 179 pairs (main: 1.254×, 178 pairs). The slower pairs are Alice at levels
+-1, 1, 2, 4-9, 11 and 12 (0.94–0.99×) and random 1 MiB at levels 3 and 4.
+
+The benchmark includes compressor construction, allocation, compression, and disposal.
+Results apply to the [recorded revision and machine][bench-levels]; [Silesia][silesia]
+covers whole large files with reused contexts.
+
+[Per-dataset results and methodology][benchmarks] · [Raw measurements][bench-csv] · [Reproduce the benchmarks][benchmarking]
+
+</details>
+
+<details>
+<summary>Decompression benchmark results and methodology</summary>
+
+![Decompression speed relative to zstd 1.5.7 by source level][decoder-bench-chart]
+
+**Recorded 2026-10-30 · working tree on `0a4fd87` and main · AMD Ryzen 9 7950X (KVM) · cold one-shot APIs.**
+zstd C and mzstd decode identical C-written frames at source levels **-5 to 22**.
+All **384 cases** restore the original bytes. The median over all 192 pairs is
+**1.502×** (main 1.400×), faster in 143 pairs: much faster on empty and tiny
+frames and on random data, 1.44× on structured binary and 1.51× on run-length
+data, and 0.94× (Alice) and 0.97× (cyclic Alice) on compressible text.
+Construction, allocation, decode and disposal are timed; C reads the output
+capacity from the frame header.
+
+[Per-level and dataset results][decoder-benchmarks] · [Raw measurements][decoder-bench-csv] · [Methodology and limits][decoder-bench-report]
+
+</details>
 
 ```toml
 [dependencies]
@@ -135,53 +184,6 @@ assert_eq!(output.resources[0].data, b"payload");
 through any `Read + Seek` source. The format is specified in
 [architecture/framing.md](architecture/framing.md).
 
-## Performance
-
-### Our benchmarks
-
-Compression writes byte-identical frames to zstd 1.5.7 and reaches a median
-1.112× its speed across the comparison corpus; decompression reaches 1.111×.
-These medians include empty and tiny inputs. Alice text at the fastest
-compression levels and literal-heavy text decoding remain a few percent slower.
-
-<details>
-<summary>Compression benchmark results and methodology</summary>
-
-![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
-
-**Recorded 2026-10-18 · mzstd 0.2.7 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
-Each value is the median of per-dataset ratios across eight equally weighted datasets,
-including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
-frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
-median over all 192 dataset/level pairs is **1.112×**, with lower mean latency
-in 166 pairs. Every dataset's median across levels is above 1×: Alice text
-**1.021×**, cyclic Alice at 1 MiB **1.041×**. Alice at levels -5 to 1 remains
-slower (0.92–0.94×).
-
-The benchmark includes compressor construction, allocation, compression, and disposal.
-Results apply to the [recorded revision and machine][bench-levels].
-
-[Per-dataset results and methodology][benchmarks] · [Raw measurements][bench-csv] · [Reproduce the benchmarks][benchmarking]
-
-</details>
-
-<details>
-<summary>Decompression benchmark results and methodology</summary>
-
-![Decompression speed relative to zstd 1.5.7 by source level][decoder-bench-chart]
-
-**Recorded 2026-10-18 · mzstd 0.2.7 · Intel Core i7-13700KF · WSL2 · cold one-shot APIs.**
-zstd C and mzstd decode identical C-written frames at source levels **-5 to 22**.
-All **384 cases** restore the original bytes. The median over all 192 pairs is
-**1.111×**, faster in 147 pairs: much faster on empty and tiny frames and on
-random data, 1.10× on structured binary and 1.12× on run-length data, and
-0.95× (Alice) and 0.98× (cyclic Alice) on compressible text. Construction, allocation, decode and disposal are timed; C reads the output
-capacity from the frame header.
-
-[Per-level and dataset results][decoder-benchmarks] · [Raw measurements][decoder-bench-csv] · [Methodology and limits][decoder-bench-report]
-
-</details>
-
 ## Verification
 
 - Differential tests against zstd 1.5.7 (built from the vendored submodule by
@@ -261,3 +263,4 @@ conditions.
 [decoder-bench-csv]: ./docs/benchmarks/decoder-comparison.csv
 [decoder-bench-chart]: ./docs/benchmarks/decoders/charts/overview.svg
 [decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
+[silesia]: ./docs/benchmarks/silesia.md

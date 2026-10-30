@@ -17,6 +17,10 @@ ENCODERS = {
     "c-zstd": ("zstd C", "#475569"),
     "mzstd": ("mzstd", "#0072B2"),
 }
+# The same matrix measured on the main branch, in its own process; its
+# ratios use the C timings of that run.
+MAIN = "mzstd-main"
+SERIES = {"c-zstd": ENCODERS["c-zstd"], MAIN: ("mzstd main", "#56B4E9"), "mzstd": ENCODERS["mzstd"]}
 LEVELS = [-5, -1, *range(1, 23)]
 CORPORA = {
     "empty": "Empty input; measures API overhead.",
@@ -84,14 +88,20 @@ def throughput(row):
     return row["input_bytes"] * 1e9 / row["mean_ns"] / 1048576
 
 
-def medians(rows, level):
-    """Give each dataset equal weight after normalizing to its own C result."""
-    reference = {r["corpus"]: r for r in rows
-                 if r["level"] == level and r["implementation"] == "c-zstd"}
+def medians(rows, level, main=None):
+    """Give each dataset equal weight after normalizing to its own C result.
+
+    With `main`, the main branch's matrix, add its mzstd series as `MAIN`,
+    normalized to the C result of its own run.
+    """
     result = {}
-    for encoder in ENCODERS:
-        group = [r for r in rows if r["level"] == level and r["implementation"] == encoder]
-        result[encoder] = {
+    for series, source, encoder in [("c-zstd", rows, "c-zstd"), (MAIN, main, "mzstd"), ("mzstd", rows, "mzstd")]:
+        if source is None:
+            continue
+        reference = {r["corpus"]: r for r in source
+                     if r["level"] == level and r["implementation"] == "c-zstd"}
+        group = [r for r in source if r["level"] == level and r["implementation"] == encoder]
+        result[series] = {
             "speed": median(reference[r["corpus"]]["mean_ns"] / r["mean_ns"] for r in group),
             "size": median(r["compressed_bytes"] / reference[r["corpus"]]["compressed_bytes"] for r in group),
         }
@@ -112,12 +122,18 @@ def level_order(rows):
     return sorted(LEVELS, key=lambda level: -medians(rows, level)["mzstd"]["speed"])
 
 
-def summary(rows, level):
+def summary(rows, level, main=None):
     lines = ["| Implementation | Median speed / C ↑ | Median output / C ↓ | Datasets |",
              "| --- | ---: | ---: | ---: |"]
-    for encoder, values in medians(rows, level).items():
-        lines.append(f"| {ENCODERS[encoder][0]} | {values['speed']:.3f}× | {values['size']:.3f}× | {len(CORPORA)} |")
+    for encoder, values in medians(rows, level, main).items():
+        lines.append(f"| {SERIES[encoder][0]} | {values['speed']:.3f}× | {values['size']:.3f}× | {len(CORPORA)} |")
     return lines
+
+
+def main_note(environment):
+    """Describe the main-branch series, which comes from a separate run."""
+    return (f"mzstd main is the same matrix measured on `{environment['main']['commit']}` in a process "
+            "beside this run's; its ratios use that run's C timings.")
 
 
 def number(value):
@@ -190,7 +206,15 @@ def chart(group, level, corpus, path):
     plt.close(fig)
 
 
-def level_page(rows, level, environment, source_link, environment_link, report_link):
+def main_speed(main, level, corpus):
+    """One line with the main branch's speed / C for a dataset, if measured."""
+    if main is None:
+        return []
+    c, own = cases(main, level, corpus)
+    return [f"mzstd main speed / C: {c['mean_ns'] / own['mean_ns']:.3f}× (separate run)."]
+
+
+def level_page(rows, level, environment, source_link, environment_link, report_link, main=None):
     versions = environment["versions"]
     sampling = environment["sampling"]
     position = LEVELS.index(level)
@@ -209,7 +233,7 @@ def level_page(rows, level, environment, source_link, environment_link, report_l
              "1× matches C; higher speed and lower output are better. These are medians across datasets,",
              "not median sample latencies, and do not imply statistical significance.", "",
              f"![Median speed and output relative to C at level {level}](charts/l{level}-summary.svg)", "",
-             *summary(rows, level), "", "<details>", "<summary>Measurement setup and interpretation</summary>", "",
+             *summary(rows, level, main), *(["", main_note(environment)] if main else []), "", "<details>", "<summary>Measurement setup and interpretation</summary>", "",
              f"zstd {versions['c-zstd']} (the C library built by `zstd-ffi`) and mzstd at the recorded",
              "working tree compress identical bytes at this level. Every frame was checked byte-identical",
              "to zstd's and decoded back to its input before any timing.", "",
@@ -233,7 +257,8 @@ def level_page(rows, level, environment, source_link, environment_link, report_l
         scale, unit = (1, "ns") if length == 0 else (1000, "µs")
         lines += [f"### {corpus}", "", f"{CORPORA[corpus]} **Input: {length:,} bytes.**", "",
                   f"mzstd speed / C: **{c['mean_ns'] / own['mean_ns']:.3f}×**; "
-                  f"output: {own['compressed_bytes']:,} / {c['compressed_bytes']:,} bytes.", "",
+                  f"output: {own['compressed_bytes']:,} / {c['compressed_bytes']:,} bytes.",
+                  *main_speed(main, level, corpus), "",
                   f"![Level {level}: {corpus} speed and compressed size](charts/l{level}-{corpus}.svg)", "",
                   "<details>", "<summary>Exact measurements and confidence bounds</summary>", "",
                   f"| Implementation | Mean, {unit} | 95% mean interval, {unit} | MiB/s | Output bytes | Output / input | Speed / C |",
@@ -248,6 +273,19 @@ def level_page(rows, level, environment, source_link, environment_link, report_l
     return "\n".join(lines)
 
 
+def overview_table(rows, main=None):
+    """One row per level, strongest first; a main-branch column when measured."""
+    lines = ["| Level | mzstd speed / C ↑ |" + (" mzstd main speed / C |" if main else "")
+             + " mzstd output / C ↓ | Datasets |",
+             "| --- | ---: |" + (" ---: |" if main else "") + " ---: | ---: |"]
+    for level in level_order(rows):
+        values = medians(rows, level, main)
+        before = f" {values[MAIN]['speed']:.3f}× |" if main else ""
+        lines.append(f"| [Level {level}](l{level}.md) | {values['mzstd']['speed']:.3f}× |{before} "
+                     f"{values['mzstd']['size']:.3f}× | {len(CORPORA)} |")
+    return lines
+
+
 def main():
     from plot import median_chart
 
@@ -256,8 +294,10 @@ def main():
     parser.add_argument("--environment", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--main-csv", type=Path, help="the same matrix measured on the main branch")
     args = parser.parse_args()
     rows = load_rows(args.csv)
+    main = load_rows(args.main_csv) if args.main_csv else None
     environment = json.loads(args.environment.read_text())
     args.output.mkdir(parents=True, exist_ok=True)
     charts = args.output / "charts"
@@ -265,10 +305,10 @@ def main():
     links = [Path(os.path.relpath(path.resolve(), args.output.resolve())).as_posix()
              for path in (args.csv, args.environment, args.report)]
     for level in LEVELS:
-        median_chart(rows, level, charts / f"l{level}-summary.svg")
+        median_chart(rows, level, charts / f"l{level}-summary.svg", main)
         for corpus in CORPORA:
             chart(cases(rows, level, corpus), level, corpus, charts / f"l{level}-{corpus}.svg")
-        (args.output / f"l{level}.md").write_text(level_page(rows, level, environment, *links))
+        (args.output / f"l{level}.md").write_text(level_page(rows, level, environment, *links, main=main))
     overview = ["# Encoder comparison", "", "[Benchmark index](../README.md)", "",
                 f"Recorded run: **{environment['baseline']}** ({environment['date']}).",
                 f"[Raw results]({links[0]}) · [Environment]({links[1]}) · [Run analysis]({links[2]}).", "",
@@ -278,11 +318,8 @@ def main():
                 "output / C = mzstd bytes / C bytes. Medians are taken over those ratios.",
                 "Levels are ordered by mzstd median speed / C, highest first. Frames are byte-identical,",
                 "so output / C is 1× at every level.", "",
-                "| Level | mzstd speed / C ↑ | mzstd output / C ↓ | Datasets |",
-                "| --- | ---: | ---: | ---: |"]
-    for level in level_order(rows):
-        values = medians(rows, level)["mzstd"]
-        overview.append(f"| [Level {level}](l{level}.md) | {values['speed']:.3f}× | {values['size']:.3f}× | {len(CORPORA)} |")
+                *([main_note(environment), ""] if main else []),
+                *overview_table(rows, main)]
     for level in level_order(rows):
         overview.extend(["", f"## [Level {level}](l{level}.md)", "",
                          f"![Level {level}: median across all datasets](charts/l{level}-summary.svg)"])

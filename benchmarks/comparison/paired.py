@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect interleaved cold-API timings from two saved profile binaries.
+"""Collect interleaved API timings from two saved profile binaries.
 
 Each binary validates its selected case before timing. Iteration counts come
 from a comparison CSV, so both sides of a pair do identical amounts of work.
@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--codec", choices=["encode", "decode"], default="encode")
+    parser.add_argument("--boundary", choices=["cold", "warm"], default="cold")
     parser.add_argument("--baseline-implementation", choices=["mzstd", "c-zstd"], default="mzstd")
     parser.add_argument("--candidate-implementation", choices=["mzstd", "c-zstd"], default="mzstd")
     parser.add_argument("--filter", default=".")
@@ -53,7 +54,11 @@ def main():
             "implementations": implementations,
             "seconds_requested": args.seconds, "seed": args.seed,
             "calibration_csv": str(args.csv.resolve()),
-            "boundary": "cold API including construction, allocation and disposal",
+            "boundary": (
+                "cold API including construction, allocation and disposal"
+                if args.boundary == "cold"
+                else "warm API with reusable contexts and destinations"
+            ),
         },
         "cases": [],
     }
@@ -79,6 +84,13 @@ def main():
                 match = re.search(r"([0-9.]+) ns/iteration", output)
                 if match is None:
                     raise ValueError(f"missing timing in {output!r}")
+                sizes = re.search(r"(\d+) input bytes, (\d+) frame bytes", output)
+                if sizes is None:
+                    raise ValueError(f"missing sizes in {output!r}")
+                for key, value in zip(("input_bytes", "frame_bytes"), sizes.groups()):
+                    size = int(value)
+                    if case.setdefault(key, size) != size:
+                        raise ValueError(f"{case['name']}: {key} differs between runs")
                 times[side] = float(match[1])
             case["pairs"].append({
                 "baseline": times[0], "candidate": times[1],

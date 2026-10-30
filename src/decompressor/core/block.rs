@@ -145,7 +145,7 @@ impl BlockDecoder {
                     MatchCopy::Scalar
                 };
                 let target = Target { out, op, context };
-                fearless_simd::dispatch!(backend.0, simd => self.decode_compressed(simd, copy, content, target))
+                fearless_simd::dispatch!(backend.block_decode_level(), simd => self.decode_compressed(simd, copy, content, target))
             }
         }
     }
@@ -165,7 +165,7 @@ impl BlockDecoder {
             .literals
             .decode(simd, content, context.block_max, tree)?;
         let sequences = content.get(used..).unwrap_or(&[]);
-        let (count, header_size) = self.sequences.read_header(sequences)?;
+        let (count, header_size) = self.sequences.read_header_on(simd, sequences)?;
         if count == 0 {
             // The literals section already bounds its size by the block's.
             out.put(op, &literals.bytes[..literals.len])?;

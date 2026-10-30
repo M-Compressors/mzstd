@@ -16,6 +16,7 @@ Both codecs use the same documentation layout under `docs/benchmarks/`:
 | Measurements | `encoder-comparison.csv` | `decoder-comparison.csv` |
 | Environment | `encoder-comparison-environment.json` | `decoder-comparison-environment.json` |
 | Size manifest | `encoder-comparison-<date>/sizes.csv` | `decoder-comparison-<date>/sizes.csv` |
+| Main branch's run | `encoder-comparison-<date>/main.csv` | `decoder-comparison-<date>/main.csv` |
 | Index and level pages | `encoders/README.md`, `encoders/l-5.md`–`l22.md` | `decoders/README.md`, `decoders/l-5.md`–`l22.md` |
 | Charts | `encoders/charts/` | `decoders/charts/` |
 
@@ -85,28 +86,29 @@ Rebuild the checked-in encoder pages and charts with Matplotlib 3.10.8:
 ```sh
 python3 benchmarks/comparison/level_docs.py \
   --csv docs/benchmarks/encoder-comparison.csv \
+  --main-csv docs/benchmarks/encoder-comparison-2026-10-30/main.csv \
   --environment docs/benchmarks/encoder-comparison-environment.json \
   --report docs/benchmarks/encoder-comparison.md \
   --output docs/benchmarks/encoders
 python3 benchmarks/comparison/plot.py \
   --csv docs/benchmarks/encoder-comparison.csv \
+  --main-csv docs/benchmarks/encoder-comparison-2026-10-30/main.csv \
   --output docs/benchmarks/encoders/charts \
-  --subtitle 'i7-13700KF; mzstd 0.2.7; 20 samples; 1 core; 2026-10-18'
+  --subtitle 'Ryzen 9 7950X (KVM); 20 samples; one vCPU per process; 2026-10-30'
 ```
 
 `level_docs.py` writes the index, 24 level pages and their detailed charts.
 `plot.py` writes `overview.svg`, `throughput.svg` and `size.svg` into the same
-charts directory. All eight corpora contribute to the medians. The published
-encoder CSV is `enc-20261018` (2026-10-18), with its
-[size manifest](benchmarks/encoder-comparison-2026-10-18/sizes.csv) and
-[raw Criterion samples](benchmarks/encoder-comparison-2026-10-18/criterion-samples.json.gz).
-It uses 20 samples, 0.2 s warmup and 0.5 s requested measurement on CPU 2,
-beside the decoder sweep on CPU 6; see the
-[recorded command and limits](benchmarks/encoder-comparison.md).
-The latest decoder CSV is `dec-20261018` (2026-10-18), with its
-[size manifest](benchmarks/decoder-comparison-2026-10-18/sizes.csv) and
-[raw Criterion samples](benchmarks/decoder-comparison-2026-10-18/criterion-samples.json.gz),
-recorded with the same sampling on CPU 6. Each
+charts directory. All eight corpora contribute to the medians. `--main-csv`
+adds the main branch's series (see [main branch series](#main-branch-series)).
+The published encoder and decoder CSVs are the Criterion baseline
+`full-20261030` (2026-10-30), with their size manifests, the main branch's
+CSVs and the raw Criterion samples of both trees in
+`benchmarks/encoder-comparison-2026-10-30/` and
+`benchmarks/decoder-comparison-2026-10-30/`. They use 20 samples, 0.5 s
+warmup and 1 s requested measurement; see the
+[encoder](benchmarks/encoder-comparison.md) and
+[decoder](benchmarks/decoder-comparison.md) reports. Each
 environment record identifies the measured sources; regenerating charts reuses
 those measurements and does not rerun the benchmark. When publishing a fresh
 run, update the CSV, archived manifest and environment record together before
@@ -150,6 +152,7 @@ Matplotlib 3.10.8:
 ```sh
 python3 benchmarks/comparison/decoder_docs.py \
   --csv docs/benchmarks/decoder-comparison.csv \
+  --main-csv docs/benchmarks/decoder-comparison-2026-10-30/main.csv \
   --environment docs/benchmarks/decoder-comparison-environment.json \
   --report docs/benchmarks/decoder-comparison.md \
   --output docs/benchmarks/decoders
@@ -167,6 +170,55 @@ The generators are covered by unit tests that need no Matplotlib:
 ```sh
 cd benchmarks/comparison && python3 -m unittest
 ```
+
+## Main branch series
+
+To compare the working tree with the main branch, export main into a
+separate directory (`git archive main`, plus the vendored zstd submodule),
+build its harness with its own `CARGO_TARGET_DIR`, and run each suite of
+both trees side by side, one process per vCPU, under the same baseline name:
+
+```sh
+taskset -c 0 "$current_encoders" --bench --save-baseline full-20261030 --sample-size 20 --warm-up-time 0.5 --measurement-time 1 --noplot &
+taskset -c 1 "$main_encoders" --bench --save-baseline full-20261030 --sample-size 20 --warm-up-time 0.5 --measurement-time 1 --noplot &
+wait
+python3 benchmarks/comparison/report.py --root "$main_tree/benchmarks/comparison/target/criterion" --baseline full-20261030 --csv /tmp/main-encoders.csv
+```
+
+Each tree's harness writes Criterion output under its own manifest
+directory. The generators normalize each tree's mzstd to the C timings of
+its own process, so the two series are comparable as ratios to C, not as
+absolute times. Repeat with the decoder binaries and `--decoding`.
+
+Allocation-heavy cold cases (levels 13 and above, the 1 MiB inputs, empty
+input) move by up to 40% between processes, so the published change from
+main comes from paired process runs of the two trees' `profile` drivers
+over the whole matrix:
+
+```sh
+python3 benchmarks/comparison/paired.py /tmp/profile-main /tmp/profile-current \
+  --csv docs/benchmarks/encoder-comparison.csv --output /tmp/paired-encoders.json \
+  --codec encode --cpu 0 --pairs 5 --seconds .1
+```
+
+## Silesia
+
+`silesia.py` times whole Silesia files with reused contexts. It takes two
+saved `warm` binaries: the working tree's, which times C and mzstd, and the
+main branch's. Every cell runs five rounds of the three sides in a seeded
+random order, each process at about 0.25 s of iterations calibrated on C,
+and checks its bytes against C first:
+
+```sh
+python3 benchmarks/comparison/silesia.py run --current /tmp/warm-current --main /tmp/warm-main \
+  --corpus /path/to/silesia --output /tmp/silesia-encode.json --cpu 0 \
+  --plan encode-1,encode1,encode3,encode5,encode7,encode9,encode12
+python3 benchmarks/comparison/silesia.py report --results docs/benchmarks/silesia-2026-10-30/silesia.json.gz \
+  --output docs/benchmarks/silesia-2026-10-30/silesia.svg
+```
+
+Interrupted runs resume from the output file. `report` reads plain or
+gzipped JSON.
 
 ## Sharded runs
 

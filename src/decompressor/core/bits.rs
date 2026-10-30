@@ -154,8 +154,8 @@ impl BitContainer {
             self.reload_fast(src);
             return true;
         }
-        if self.avail > CONTAINER_BITS {
-            // Read past the start: corrupt, and caught by `is_exhausted`.
+        if self.pos == 0 || self.avail > CONTAINER_BITS {
+            // At the start there is nothing to refill; overflow is permanent.
             return false;
         }
         let (next, full) = self.reload_tail(src);
@@ -230,10 +230,16 @@ impl Sentinel {
     /// `src`.
     #[inline(always)]
     pub(crate) fn into_container(self, src: &[u8], start: usize) -> BitContainer {
+        // A fast loop may load a word that starts in the preceding stream.
+        // Move its base to this stream's first byte and remove those prefix
+        // bits from the available count. A consumed prefix wraps avail above
+        // 64, preserving the cautious reader's permanent overflow state.
+        let pos = self.pos.max(start);
+        let prefix_bits = ((pos - self.pos) as u32).wrapping_mul(8);
         BitContainer {
-            container: read64(src, self.pos),
-            avail: CONTAINER_BITS - self.bits.trailing_zeros(),
-            pos: self.pos - start,
+            container: read64(src, pos),
+            avail: (CONTAINER_BITS - self.bits.trailing_zeros()).wrapping_sub(prefix_bits),
+            pos: pos - start,
         }
     }
 
@@ -414,6 +420,52 @@ mod tests {
         assert!(sentinel.reload_within(&src, limit));
         assert_eq!(sentinel.remaining(0), 2);
         assert_eq!(sentinel.into_container(&src, 0).look(8), 0x0a);
+    }
+
+    #[test]
+    fn sentinels_crossing_stream_starts_keep_only_the_stream_bits() {
+        let src: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        let start = 8;
+        let word = u64::from_le_bytes(src[start..start + 8].try_into().expect("whole word"));
+        // The common word starts in a preceding stream. Every remaining
+        // bit count, including an exact end, refers to this stream only.
+        for prefix in 1..=8 {
+            let pos = start - prefix;
+            for consumed in 0..=64 - prefix as u32 * 8 {
+                let sentinel = Sentinel {
+                    bits: (read64(&src, pos) | 1) << consumed,
+                    pos,
+                };
+                let mut container = sentinel.into_container(&src, start);
+                let available = 64 - consumed - prefix as u32 * 8;
+                assert_eq!(container.pos, 0);
+                assert!(!container.overflowed());
+                assert_eq!(container.read(available), word & ((1 << available) - 1));
+                assert!(container.is_exhausted());
+            }
+        }
+    }
+
+    #[test]
+    fn sentinels_read_past_stream_starts_remain_overflowed() {
+        let src: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(17));
+        let start = 16;
+        for prefix in 1..=16 {
+            let pos = start - prefix;
+            let consumed = 64u32.saturating_sub(prefix as u32 * 8) + 1;
+            let sentinel = Sentinel {
+                bits: (read64(&src, pos) | 1) << consumed,
+                pos,
+            };
+            let mut container = sentinel.into_container(&src, start);
+            assert_eq!(container.pos, 0);
+            assert!(container.overflowed());
+            assert!(!container.is_exhausted());
+            assert!(!container.reload(&src[start..]));
+            container.read(7);
+            assert!(container.overflowed());
+            assert!(!container.is_exhausted());
+        }
     }
 
     #[test]

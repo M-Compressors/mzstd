@@ -35,11 +35,11 @@ graph TD
     IO --> Encode
     IO --> Decode
     Ref["zstd-ffi: zstd 1.5.7 + oracle + corpus"] -. tests, benches, fuzzing .-> Root
-    CABI["mzstd-ffi: C ABI crate"] --> Root
+    CABI["mzstd-ffi: C ABI crate, one-shot and sessions"] --> Root
     Fuzz["fuzz/afl (excluded package)"] -.-> Root
     Fuzz -.-> Ref
     LibFuzz["fuzz/libfuzzer (excluded package): ClusterFuzzLite adapters"] -.-> Fuzz
-    Cmp["benchmarks/comparison (excluded package): cold C vs mzstd reports"] -.-> Root
+    Cmp["benchmarks/comparison (excluded package): cold reports and warm profiling against C"] -.-> Root
     Cmp -.-> Ref
     Lean["verification/lean (excluded): Lean 4 proofs against RFC 8878"] -. Charon/Aeneas translation .-> ECore
     Lean -.-> DCore
@@ -67,9 +67,9 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
 | [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration and compatibility with the reference decoder. |
 | [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed on demand a chunk at a time, the shared outcome mapping, the C ABI and their contract. |
-| [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman and sequence loops, wildcopies, direct slice output and measurements. |
+| [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman stream scheduling, static and custom FSE tables, sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
-| [C ABI](c-abi.md) | `mzstd-ffi`: exported functions, validation, panic guard and status mapping. |
+| [C ABI](c-abi.md) | `mzstd-ffi`: one-shot and session functions, handle lifecycle, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
 | [CI](ci.md) | Workflows and the checks they run; ClusterFuzzLite pull request and daily fuzzing; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`; hotpath Cloud merged-mode (native plus Callgrind) benchmarks. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
@@ -82,19 +82,20 @@ signatures. Each codec compiles on its own, with or without `std`.
   sequence producers, and no legacy (v0.x) frames.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
   and dispatched once per block. In the cold comparison against zstd 1.5.7
-  ([benchmarks](../docs/benchmarks/README.md), i7-13700KF, AVX2, one core,
-  2026-10-18, mzstd 0.2.7) compression runs at a median 1.112x the
-  reference's speed, faster in 166 of 192 dataset/level pairs, and
-  decompression at 1.111x, faster in 147. These medians include empty and
-  tiny inputs. The encoder still trails on Alice at its fastest levels
-  (0.92-0.94x at levels -5 to 1) and at the lazy levels 5 to 9
-  (0.94-0.97x), and on 1 MiB of text at some lazy levels (0.96-0.99x);
-  the fast and dfast kernels execute 1.3-1.5x the reference's instructions
-  at equal or lower misprediction rates ([encoder core](encoder-core.md#known-gaps)).
-  The decoder trails on literal-heavy text (Alice 0.92-0.97x, cyclic Alice
-  0.95-0.99x at most levels): its Huffman loops execute about 15% more
-  instructions per symbol than the reference's, and short sequences still
-  need zeroed room ([decoder fast paths](decoder-performance.md#known-gaps)).
+  ([benchmarks](../docs/benchmarks/README.md), Ryzen 9 7950X under KVM,
+  AVX-512, 2026-10-30) compression runs at a median 1.256x the reference's
+  speed, faster in 179 of 192 dataset/level pairs, and decompression at
+  1.502x, faster in 143. These medians include empty and tiny inputs. The
+  encoder still trails on Alice at levels -1, 1, 2, 4-9, 11 and 12
+  (0.94-0.99x), and on whole Silesia files with reused contexts at the
+  `fast` levels (0.94x) and the row levels 5-9 (0.95-0.96x); `fast`
+  executes about 127 instructions per match against the reference's 91
+  ([encoder core](encoder-core.md#known-gaps)). The decoder trails on
+  compressible text at every level (Alice 0.93-0.96x, cyclic Alice
+  0.94-0.98x) and on whole Silesia files (0.96-0.98x, x-ray level 1
+  0.85x): its four-stream Huffman loop executes about 242 instructions per
+  round against the reference's 221
+  ([decoder fast paths](decoder-performance.md#known-gaps)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's: segments are primed with their
   overlap the way ZSTDMT primes a job, but the overlap is capped at a

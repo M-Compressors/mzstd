@@ -121,9 +121,34 @@ candidate below `lowLimit`, and the binary trees (lazy and optimal) and the
 of its cells. A stale entry therefore acts as the zero it replaces. Keeping the
 tables changes no output and saves zeroing them on every call. The row
 finder's tag table is likewise never re-zeroed while indices continue (the
-reference's `init_once` tags). The reference's per-frame salt is not
-modelled, because XOR-ing it into the hash permutes rows and tags without
-changing which positions collide. The engine's two block states (`prev`, `next`) are boxed, so
+reference's `init_once` tags). Kept row tables are searched through a view
+one 64-entry step further on at every reset (`MatchState::row_view`, eight
+views in turn, back to the first when tables are cleared), so the entries
+an input of similar content left behind lie in rows of unrelated hashes
+(tables of at least 2^14 entries)
+and match the new input's tags by chance only. Without it, on repeated
+Alice frames every search found and dismissed the previous frame's twins:
+five times the stale candidates, ten times the page walks of speculatively
+prefetched ones, and 1-6% of the row levels' time. The reference keeps
+them apart by salting its hash at every reset (`ZSTD_advanceHashSalt`); a
+salt costs an XOR per hash, which measured 1.5-5% slower on cold row
+searches, and a view costs nothing per position. Like the salt, the view
+changes no frame. A copied dictionary's rows are written through the
+context's current view.
+
+```mermaid
+stateDiagram-v2
+    [*] --> View0: tables allocated (zero)
+    View0 --> ViewNext: reset, indices continue (tables kept)
+    ViewNext --> ViewNext: reset, indices continue: view + 64 entries mod 8 steps
+    ViewNext --> View0: reset with fresh indices or for a dictionary (tables cleared)
+    View0 --> View0: reset with fresh indices
+    note right of ViewNext
+        RowState::new and copy_dictionary_tables
+        read and write rows from the 64-byte
+        boundary plus row_view
+    end note
+``` The engine's two block states (`prev`, `next`) are boxed, so
 confirming a block swaps two pointers as the reference does.
 
 Their tables are not allocated with them. `Tables` keeps the Huffman table
@@ -258,12 +283,77 @@ sequenceDiagram
   codes and the sequence's extra-bit count) and, in the same loop, the three
   code histograms (`CodeCounts`) that `ZSTD_buildSequencesStatistics`
   counts with three `HIST_countFast_wksp` passes. The long-length escape is
-  patched afterwards for its one sequence, counts included. The codes buffer
+  patched afterwards for its one sequence, counts included. Small lengths
+  use packed 16-bit code/width lookup rows; larger stored lengths derive
+  both values from the same high bit. Adding the packed LL and ML rows
+  cannot carry from the code byte into the width byte (`35 + 52 < 256`),
+  so one shift obtains their combined extra-bit width. Exhaustive tests
+  cover every stored 16-bit length and every code combination. The original
+  `ll_code` and `ml_code` RFC functions remain unchanged.
+  The codes buffer
   only grows and every entry below `nb_seq` is written before it is read.
   It is kept at four bytes a sequence on purpose: a 16-byte record holding
   precomputed extra bits pushed a cold one-shot call's peak heap past
   glibc's dynamic trim threshold, so every call returned and re-faulted
   about 2.7 MB (text-1m level 3 went from 0.69 ms to 1.03 ms).
+- Dense full blocks in the `fast` prefix parser can switch from `SeqStore`
+  vector appends to a `SeqCursor` over the store's kept full-block
+  destinations (`FullBlock`: a boxed `[SeqDef; 32768]` and
+  `[u8; 128 KiB + 16]`), allocated and zeroed on the store's first
+  promotion and reused by every later one.
+  The first 1024 sequences use the original vector writer. At the end of
+  a complete match/repeat-code chain, at least 64 KiB of remaining input
+  selects the cursor; otherwise the vector loop resumes. This keeps the
+  initialization cost away from sparse random and long-run inputs. The
+  continuation preserves the hash table, current position and raw repeat
+  offsets; it changes neither search order nor match decisions.
+  Promotion copies the entries the vectors already hold into the
+  destinations; the cursor owns local counts, and on return the block's
+  entries stay there: `sequences()`, `literals()`, `sequences_mut()` and
+  `nb_seq()` read them until `reset`, and `store_last_literals` appends
+  after them. Before, the vectors were resized to a full block and
+  truncated again around every promotion, zeroing 384 KiB per dense block:
+  on Silesia nci level -1 that was 2.3% of the time, and the call ran
+  4.5% behind the main branch (2026-10-30); with the kept destinations it
+  runs 1-2.5% ahead of it, and cyclic Alice with a reused context gains
+  2.4-2.9% at levels -5 to 2. The vector writer is unchanged: making the
+  vectors themselves keep their length cost the dfast and lazy levels
+  1.5-3.9%. At most 32768 matches of at least four bytes fit in 128 KiB;
+  masks on the sequence and literal indices are therefore identity while
+  proving the fixed-size writes in bounds. Dictionary entry points and
+  partial blocks keep the vector path. The promoted loop has its own
+  `#[simd]` entry so the callback retains the selected target features,
+  and scans with a local reborrow of the cursor (`SeqCursor::reborrow`),
+  whose address never escapes: the compiler then keeps its counts in
+  registers, where through the caller's cursor it stored both on every
+  sequence (2026-10-29: 3 instructions per sequence on Silesia dickens).
+  Exceptional lengths share one cold helper; the common path tests both
+  lengths with one bitwise OR.
+
+```mermaid
+flowchart TD
+    Start[fast prefix block] --> Full{128 KiB and min match at least 4?}
+    Full -->|no| Vec[vector writer]
+    Full -->|yes| Probe[vector writer through 1024 sequences]
+    Probe --> Boundary[finish match, hash insertions and repeat chain]
+    Boundary --> Left{at least 64 KiB left?}
+    Left -->|no| Vec
+    Left -->|yes| Kept{store has a FullBlock?}
+    Kept -->|no| Alloc[allocate and zero it once]
+    Kept -->|yes| Copy
+    Alloc --> Copy[copy the vectors' entries into it]
+    Copy --> Cursor[resume with SeqCursor over it]
+    Cursor --> Counts[block's counts kept beside it until reset]
+    Vec --> End[unchanged entropy coding]
+    Counts --> End
+```
+
+The lazy-family no-dictionary loop uses block-relative `usize` positions
+for its cursor, anchor, repeat checks and match counting. One source slice
+ends at the logical block end; conversion to global window indices happens
+at search-table boundaries. Dictionary variants keep their separate window
+adapters. Lookahead depths, cache updates and parsing heuristics are unchanged.
+
 - `entropy` is the reference's FSE and Huffman encoders: histogram counting,
   normalization, table building, the cost estimates used to choose between
   predefined, repeat, RLE and new tables, and the backward bit streams.
@@ -325,18 +415,37 @@ sequenceDiagram
 - `presplit` (`ZSTD_splitBlock`, by fingerprint distance) chooses block sizes
   before match finding for the strategies that enable it; `split_block`
   (`ZSTD_compressBlock_splitBlock`) splits the sequences of a finished block
-  for the ultra levels. `split_by_chunks` dispatches once to an instance
-  compiled for the level's sampling rate and hash log (43/8, 11/9, 5/10,
-  1/10), as `ZSTD_GEN_RECORD_FINGERPRINT` does: a constant stride, hash
-  indices that provably fit the table, and an `fpDistance` whose products
-  of 32-bit factors vectorize.
+  for the ultra levels. `presplit::split_block` dispatches once per eligible
+  full block to the encoder's selected backend. The splitter body stays out
+  of line so the dispatcher does not retain a second fingerprint stack
+  frame; the frame is released before match finding. `split_by_chunks`
+  selects the instance compiled for the level's sampling rate and hash log (43/8,
+  11/9, 5/10, 1/10), as `ZSTD_GEN_RECORD_FINGERPRINT` does: a constant
+  stride and hash indices that provably fit the table. Fingerprints hold
+  their fixed 1024-entry event arrays on the stack; chunk sampling needs
+  two, and border sampling at most three. Recording, comparison and
+  accumulation touch only the active 256, 512 or 1024 entries, with no
+  fingerprint heap allocation.
+  `fpDistance` uses signed 32-bit products and an unsigned 32-bit sum:
+  before each comparison at most fifteen 8191-event chunks have accumulated,
+  and the incoming chunk has at most 8191 events. Each product is below
+  2^30 and the sum of absolute differences is below 2^31. Border samples
+  have only 512 events. These bounds preserve the reference's exact
+  distance while allowing native integer SIMD arithmetic. The scalar and
+  feature-enabled paths keep the reference's sample-count rounding,
+  thresholds and split positions; tests compare every backend with a plain
+  reference loop and cover the largest chunk products.
 - After a block, `prev` and `next` swap (`confirm_block_state`) unless the
   block was stored raw or RLE, which keeps the previous entropy tables and
   demotes repeat-mode state as the reference does.
 
 ```mermaid
 flowchart LR
-    MF[match finder] --> SS["SeqStore {sequences, literals}"]
+    PRE[eligible full 128 KiB block] --> PB["presplit: backend dispatch"]
+    PB --> FP["stack fingerprints: sample, 32-bit distance, merge"]
+    FP --> BC["choose block boundary"]
+    BC --> MF
+    MF[match finder] --> SS["SeqStore: vectors, or a promoted block's FullBlock"]
     SS --> FC["fill_codes(backend): codes + extra-bit counts + CodeCounts, one pass"]
     FC --> ST["build_statistics: code_histogram -> select_encoding_type / build_ctable"]
     FC --> EN["sequences::encode: codes + sequences -> extra-bit word, FSE states"]
@@ -516,10 +625,13 @@ reference's templates are:
   also its `ip2 + 1 < ilimit` test (`mem::probe_window`, `probe_pair`),
   dfast's 8-byte load at `ip1` (`mem::try_load64`) is its `ip1 <= ilimit`
   test;
-- after a match, fast extends backwards without per-byte checks
-  (`mem::common_suffix`), compares the first word of the forward length
-  inline (`mem::count_at_simd`), and reads `ip0 - 2` once for both the
-  hash insert and the first repcode compare;
+- after a match, fast extends backwards with the reference's loop over
+  single bytes (it rarely takes a step; cutting two slices first cost four
+  bounds tests per match), compares the first word of the forward length
+  inline with one bounds test (`mem::count_behind_simd`: the match lies
+  behind the searched position, so its word is inside the input whenever
+  the position's is), and reads `ip0 - 2` once for both the hash insert
+  and the first repcode compare;
 - the extDict variants use the same prefix offsets, reading only
   candidates below the prefix from the external segment by window index.
   fast's (`compress_block_ext_dict_mls`, `ZSTD_compressBlock_fast_extDict_generic`)
@@ -674,9 +786,12 @@ Per block the parser builds the search's state (`Search::State<'t>`, from
 back into the match state at the block's end. The row finder's `RowState`
 holds:
 
-- the tag and slot tables viewed from their first 64-byte boundary
-  (`aligned_rows`). `MatchState` gives both tables `ROW_TABLE_SLACK` (64)
-  extra entries in row mode. glibc returns large blocks 16 bytes past a
+- the tag and slot tables viewed from their first 64-byte boundary plus
+  the current view's offset (`aligned_rows`). `MatchState` gives both
+  tables 64 extra entries in row mode, and `ROW_TABLE_SLACK` (64 plus seven
+  view steps) from `ROW_VIEW_MIN` (2^14) entries on; smaller tables keep
+  one view, since tiny inputs allocate and zero them on every call and the
+  views' slack made a 44-byte level 5 call 5-8% slower. glibc returns large blocks 16 bytes past a
   page, so unaligned, half of the 32-byte tag rows crossed a cache line and
   every 128-byte slot row spanned three; the reference's workspace aligns
   them to 64 bytes. Moving the view cannot change a frame: a search only
@@ -867,11 +982,48 @@ buffers are always large enough) into `EncodeError::Internal`.
 
 ## Known gaps
 
+- `fast` on inputs above 256 KiB (Silesia, levels -1 and 1) runs at a
+  median 0.939-0.945x the reference, 0.93-0.96x on text
+  ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30, Ryzen 9 7950X).
+  Its search loop
+  costs about the reference's instructions per position; a match costs
+  about 127 instructions against the reference's 91 (Silesia dickens,
+  level 1), of which about 25 load and store values the loop cannot keep
+  in registers and about 12 are bounds tests. Rejected: one span for the
+  two hash inserts after a match (no fewer instructions); constant hash
+  widths for reused contexts (level -5 3-6% slower).
+
+- The lazy no-dictionary loop's block-relative positions (`lazy_generic`)
+  trade incompressible inputs for text: against the main branch's
+  absolute positions it is 1-2% faster on Alice with reused contexts at
+  the row levels 4-9 (0.7% cold) and 0.4-1% on cyclic Alice, but random
+  data at levels 7-10 runs 2-11% slower (random 64 KiB level 10 11%,
+  2026-10-30, paired against the main branch). The
+  instruction counts match within 1.2%; the extra cycles are register
+  pressure from the five inlined `count_at_simd` calls, which spill the
+  loop's state (store-to-load interlocks +9%). Calling the context's
+  `count` instead, relative repeat tests or `ctx.base` for the local base
+  recovered at most half.
+
+- Cold one-shot calls on empty input execute about 70 more instructions
+  than the main branch's (2,635 against 2,563, 2026-10-30), 3.7% slower,
+  and the 44-byte text at levels -5 to 10 runs 2-6% slower: the frame setup
+  (`begin_sized`, `compress_once_into`) is no longer inlined into
+  `Compressor::compress_to_slice_with`, and the store carries the
+  full-block destinations' state. Forcing the inlining added instructions.
+
+- The `fast` kernel's speed depends on where it lands in the binary: on
+  2026-10-29 a change elsewhere left its instructions identical (5,035M
+  for 800 Alice level 1 calls) but raised branch mispredictions from 9.28M
+  to 9.99M and its time by 1.8% (Ryzen 9 7950X). Measure kernel changes by
+  instruction and misprediction counts as well as time.
+
 - SIMD: the lazy finders compare row tags with one vector compare;
   fast/dfast and lazy search share the 128-byte match-length scan. The
   optimal parser and LDM use native-vector kernels (`opt_count`). The entropy
   coders run in the backend's feature context without explicit vector code.
-  Histogram counting is scalar. Output is identical on every backend.
+  The pre-splitter's 32-bit distance and histogram merges also run in that
+  context. Histogram counting is scalar. Output is identical on every backend.
 - See the [benchmarks](../docs/benchmarks/encoder-comparison.md) for the
   current end-to-end ratios. Text at the fast levels and the lazy levels
   6–12 still trails the reference. After the small-table widths
@@ -906,10 +1058,11 @@ buffers are always large enough) into `EncodeError::Internal`.
   executes about 4% more instructions, two per collected candidate for the
   masked buffer index. The finder is bound by memory latency (without its
   prefetches it is 15-26% slower), so instruction counts are a poor proxy
-  there. A reused context measures the finder 2-6% slower on an input
-  identical to the previous one, because the reference salts its row hash
-  at each reset and mzstd does not: the previous call's entries match tags
-  and end each search early. btlazy2 executes about 21% more instructions
+  there. A reused context measured the finder 2-6% slower on an input
+  identical to the previous one before the row view moved per reset
+  (see [Engine lifecycle](#engine-lifecycle)); the view recovers 0.2-6.5%
+  at levels 4-10, the reference's salt measured 1-3% more at levels 6-8
+  with ROW 16 (2026-10-29). btlazy2 executes about 21% more instructions
   than the reference on Alice at level 12 (index arithmetic and bounds
   checks in the tree walk) at equal or better speed. Measured and
   rejected (2026-10-18): the row search out of line (0.5-4.5% slower),
@@ -1023,8 +1176,9 @@ buffers are always large enough) into `EncodeError::Internal`.
   widths; as separate functions they are now kept. A sequence store written through a block-long cursor kept its
   positions in registers and gave dfast 5%, but its buffers had to be
   initialized at full capacity to be written safely: a cold one-shot call
-  on 64 KiB then paid about 2.5 us more (32-50% at levels -5 to 1), so the
-  store stays on `Vec`. The constant widths for every match length at once instead
+  on 64 KiB then paid about 2.5 us more (32-50% at levels -5 to 1), so that trial
+  kept the store on `Vec`. The current dense full-block promotion above
+  avoids paying that setup for short inputs. The constant widths for every match length at once instead
   of per default pair cost 100 KB of code for the same instruction count;
   timings of one build against another varied by about 3% with the
   register allocation alone, so these comparisons interleave several
@@ -1050,3 +1204,11 @@ buffers are always large enough) into `EncodeError::Internal`.
   build of the reference writes; a 32-bit build of the reference caps the
   window at 2^30 and corrects overflow earlier, so their frames can differ
   for very large windows or inputs.
+
+### Alice follow-up (2026-10-29)
+
+The dense full-block writer, relative lazy prefix positions and packed
+code/width maps above were chosen with paired Alice runs on AMD; eager
+cursor initialization, promotion in dfast/lazy and a separate padded-input
+specialization were rejected. Current timings against C and the main
+branch are in the [benchmark results](../docs/benchmarks/README.md).

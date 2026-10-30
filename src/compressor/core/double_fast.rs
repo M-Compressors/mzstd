@@ -634,16 +634,7 @@ fn store_seq_wild(
     off_base: u32,
     match_length: usize,
 ) {
-    debug_assert!(seq_store.literals.len() + lit_length <= seq_store.max_nb_lit);
-    let literals = &mut seq_store.literals;
-    match src.get(anchor..).and_then(<[u8]>::first_chunk::<16>) {
-        Some(chunk) if lit_length <= 16 => {
-            let start = literals.len();
-            literals.extend_from_slice(chunk);
-            literals.truncate(start + lit_length);
-        }
-        _ => literals.extend_from_slice(&src[anchor..anchor + lit_length]),
-    }
+    seq_store.push_literals_wild(src, anchor, lit_length);
     seq_store.store_seq_only(lit_length, off_base, match_length);
 }
 
@@ -1204,13 +1195,17 @@ mod tests {
                 let mut shared = SeqStore::default();
                 wild.reserve(1 << 10, 4);
                 shared.reserve(1 << 10, 4);
-                wild.literals.push(0xAA);
-                shared.literals.push(0xAA);
+                wild.store_last_literals(&[0xAA]);
+                shared.store_last_literals(&[0xAA]);
                 store_seq_wild(&mut wild, &src, anchor, lit_length, 7, 5);
                 shared.store_seq_from(&src, anchor, lit_length, 7, 5);
-                assert_eq!(wild.literals, shared.literals, "{anchor} {lit_length}");
-                assert_eq!(wild.literals[1..], src[anchor..anchor + lit_length]);
-                assert_eq!(wild.sequences, shared.sequences, "{anchor} {lit_length}");
+                assert_eq!(wild.literals(), shared.literals(), "{anchor} {lit_length}");
+                assert_eq!(wild.literals()[1..], src[anchor..anchor + lit_length]);
+                assert_eq!(
+                    wild.sequences(),
+                    shared.sequences(),
+                    "{anchor} {lit_length}"
+                );
             }
         }
     }
@@ -1423,7 +1418,12 @@ mod tests {
             seq_store.reserve(input.len(), cparams.min_match);
             let mut rep = [1, 4, 8];
             let literals = compressor(&mut ms, &mut seq_store, &mut rep, &block);
-            (literals, rep, seq_store.sequences, seq_store.literals)
+            (
+                literals,
+                rep,
+                seq_store.sequences().to_vec(),
+                seq_store.literals().to_vec(),
+            )
         };
         let ours = run(compress_block_dict_match_state);
         assert!(!ours.2.is_empty());

@@ -656,7 +656,7 @@ impl Engine {
         } else {
             (level - 2) as usize
         };
-        presplit::split_block(&src[..block_size_max], level)
+        presplit::split_block(&src[..block_size_max], level, self.ms.backend)
     }
 
     /// Compresses a chunk into one or more blocks (`ZSTD_compress_frameChunk`).

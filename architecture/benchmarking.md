@@ -48,7 +48,10 @@ graph TD
         BEnc["benches/encoders.rs"] --> Lib
         BDec["benches/decoders.rs"] --> Lib
         BProfile["bin/profile.rs"] --> Lib
+        BWarm["bin/warm.rs: reused contexts, corpus or file:PATH"] --> Mzstd
         Paired["paired.py: randomized AB/BA process pairs"] --> BProfile
+        Paired --> BWarm
+        Silesia["silesia.py: C / main / working tree rounds on whole files, median chart"] --> BWarm
         Report["report.py: Criterion run to CSV"] --> Docs["level_docs.py: compression level pages and dataset charts"]
         Report --> Plot["plot.py: overview, throughput and size charts"]
         Report --> DecDocs["decoder_docs.py: decompression level pages and charts"]
@@ -61,6 +64,7 @@ graph TD
     Docs --> Out["docs/benchmarks/{encoders,decoders}/"]
     Plot --> Out
     DecDocs --> Out
+    Silesia --> SOut["docs/benchmarks/silesia*"]
 ```
 
 The package has its own `[workspace]` and lockfile, and the root workspace
@@ -72,6 +76,11 @@ collection boundary, so Callgrind can exclude corpus setup and preflight.
 `paired.py` runs saved driver binaries with randomized AB/BA process ordering
 and records every pair for analysis; it does not generate the published
 Criterion matrix. See the [profiling commands](../docs/benchmarking.md#profiling).
+The `warm` driver times one case with a context and destination reused
+across iterations, after checking its frame or output against C; it also
+reads any file as `file:PATH`. `silesia.py` drives two saved `warm`
+binaries over whole Silesia files, the working tree's (C and mzstd) and the
+main branch's (mzstd), in five rounds of seeded random order per cell.
 
 ## Corpus and matrix
 
@@ -105,6 +114,7 @@ sequenceDiagram
     R-->>L: CSV with means, 95% bounds, MiB/s, speed / C
     L-->>L: README, l<level>.md pages, summary and per-dataset SVGs (encoders)
     L-->>L: README, l<level>.md pages, one SVG per level (decoders)
+    Note over R,L: optional --main-csv: the main branch's matrix from its own run
 ```
 
 - **Preflight before timing.** The encoder run compresses every case with
@@ -136,13 +146,21 @@ flowchart TD
     Validate -->|encoders| Enc["level_docs.py: README + l-5.md ... l22.md, l<level>-summary.svg, l<level>-<dataset>.svg"]
     Enc --> Plot["plot.py: overview.svg, throughput.svg, size.svg"]
     Validate -->|decoders| Dec["decoder_docs.py: README + l-5.md ... l22.md, l<level>.svg, overview.svg"]
+    Main["--main-csv: main branch's CSV, validated the same way"] -.-> Enc
+    Main -.-> Plot
+    Main -.-> Dec
 ```
 
 The layout mirrors mbrotli's benchmark documentation. Per level and
 dataset, speed / C = C mean latency / mzstd mean latency and output / C =
 mzstd bytes / C bytes; level summaries take the median of the eight
 per-dataset ratios, and the index pages order levels by mzstd's median
-speed / C. Each compression level page has a summary chart, one chart per
+speed / C. With `--main-csv`, a third series, mzstd main, joins every
+median, overview and summary chart and table: the main branch's harness
+timed in its own process beside the working tree's, each normalized to the
+C timings of its own run, so drift between the two processes cancels as
+far as C sees it. Per-dataset charts keep the working tree's run only.
+Each compression level page has a summary chart, one chart per
 dataset (throughput or latency with 95% bounds, beside the frame size) and
 the exact numbers; each decompression level page has one panel per dataset.
 The hand-written run reports (`encoder-comparison.md`,
@@ -161,14 +179,18 @@ regenerating from the same CSV yields the same files.
   Criterion baseline; `report.py` and `level_docs.py` refuse anything else.
 - Python unit tests (`python3 -m unittest` in `benchmarks/comparison`)
   cover validation, ordering, page text and the exporter without Matplotlib
-  (`test_level_docs.py`, `test_decoder_docs.py`, `test_report.py`);
-  `test_plot.py` renders every chart kind when Matplotlib is installed.
+  (`test_level_docs.py`, `test_decoder_docs.py`, `test_report.py`,
+  `test_silesia.py`); `test_plot.py` renders every chart kind when
+  Matplotlib is installed.
 
 ## Known gaps
 
-- One host (Intel Core i7-13700KF under WSL2); frequency and scheduling are
-  not controlled beyond pinning to one core.
+- One host (AMD Ryzen 9 7950X, two dedicated KVM vCPUs); frequency and
+  scheduling are not controlled beyond pinning each process to one vCPU.
+- The main branch's series comes from a separate process run beside the
+  working tree's, not from interleaved pairs; only the Silesia sweep
+  interleaves the three sides.
 - The C library is built by `zstd-ffi` with `cc` defaults (`-O3`), without
   its x86-64 Huffman assembly (`ZSTD_DISABLE_ASM`) and single-threaded.
-- Warm (reused-context) and streaming performance are measured only by the
-  root `benches/`, not published here.
+- Reused contexts are published only for Silesia; streaming performance is
+  measured only by the root `benches/`.

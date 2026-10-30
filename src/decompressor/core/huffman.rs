@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 use super::bits::{BitContainer, Sentinel};
 use super::fse::{MAX_WEIGHTS, decode_weights};
 use crate::decompressor::InvalidDataKind;
-use crate::shared::format::{LIT_HUF_LOG, highbit32};
+use crate::shared::format::{BLOCK_SIZE_MAX, LIT_HUF_LOG, highbit32};
 
 /// Deepest code the reference decoder accepts.
 ///
@@ -90,7 +90,6 @@ impl PairRow {
     }
 
     /// The bits the symbols take.
-    #[cfg(test)]
     const fn nb_bits(self) -> u8 {
         self.0 as u8
     }
@@ -224,6 +223,39 @@ fn decode_tail(
     } else {
         Err(InvalidDataKind::HuffmanStream)
     }
+}
+
+/// Continues an X2 stream four pair lookups per refill while there is room
+/// for their stores, then uses the exact single-symbol tail for its end.
+#[inline(always)]
+fn decode_pair_tail(
+    rows: &[Row; TABLE_SIZE],
+    pairs: &[PairRow; PAIR_SIZE],
+    mut bits: BitContainer,
+    src: &[u8],
+    out: &mut [u8],
+) -> Result<(), InvalidDataKind> {
+    const LOOKUPS: usize = 4;
+    const WINDOW: usize = 3 * (LOOKUPS - 1) + 2;
+    let mut done = 0;
+    while let Some(window) = out
+        .get_mut(done..)
+        .and_then(<[u8]>::first_chunk_mut::<WINDOW>)
+    {
+        // Near the start, reload places all remaining bits in this word.
+        // Valid pairs consume only the symbols still promised by out;
+        // corrupt overreads keep avail wrapped until decode_tail rejects.
+        bits.reload(src);
+        let mut written = 0;
+        for _ in 0..LOOKUPS {
+            let pair = pairs[bits.look_nonzero(PAIR_BITS) as usize & PAIR_MASK];
+            bits.skip(u32::from(pair.nb_bits()));
+            window[written..written + 2].copy_from_slice(&pair.symbols().to_le_bytes());
+            written += pair.count();
+        }
+        done += written;
+    }
+    decode_tail(rows, bits, src, &mut out[done..])
 }
 
 /// The four streams of a four-stream literals section, laid out in one
@@ -378,7 +410,9 @@ const PAIR_WINDOW: usize = 3 * (PAIR_LOOKUPS - 1) + 2;
 /// most seven consumed. Each lookup stores two bytes and advances by the
 /// symbols it decoded, as `HUF_4X2_DECODE_SYMBOL` does; a store's byte past
 /// the symbols lies inside the stream's own segment, where the next lookup
-/// or the tail overwrites it.
+/// or the tail overwrites it. The first three streams interleave their
+/// lookups; the fourth is decoded separately to limit live registers while
+/// retaining three independent lookup chains.
 ///
 /// Refill positions and window offsets are clamped to the last ones that
 /// fit their buffers. The round counts keep them below those anyway, so
@@ -399,17 +433,35 @@ fn pair_rounds(
     let mut ops = [segments[0], segments[1], segments[2], segments[3]];
     let mut s = *sentinels;
     let out = &mut *streams.out;
-    // Refills and windows stay below these, which the round counts ensure;
-    // clamped to them, they need no branches.
-    let (Some(src_limit), Some(out_limit)) =
-        (src.len().checked_sub(8), out.len().checked_sub(PAIR_WINDOW))
+    // Split the output once so each stream's clamped window is confined to
+    // its own segment. Counts of at most three bound the unrolled stores.
+    let [b1, b2, b3, b4, end] = segments;
+    let Some(out) = out.get_mut(b1..end) else {
+        return [0; 4];
+    };
+    let Some((first, rest)) = out.split_at_mut_checked(b2 - b1) else {
+        return [0; 4];
+    };
+    let Some((second, rest)) = rest.split_at_mut_checked(b3 - b2) else {
+        return [0; 4];
+    };
+    let Some((third, fourth)) = rest.split_at_mut_checked(b4 - b3) else {
+        return [0; 4];
+    };
+    let Some(src_limit) = src.len().checked_sub(8) else {
+        return [0; 4];
+    };
+    let [Some(l1), Some(l2), Some(l3), Some(l4)] =
+        [first.len(), second.len(), third.len(), fourth.len()]
+            .map(|len| len.checked_sub(PAIR_WINDOW))
     else {
         return [0; 4];
     };
     'rounds: loop {
-        let mut rounds = affordable_rounds(&s, &streams.starts);
-        // A round's window must fit before the segment's end, which also
-        // keeps its stores inside the segment.
+        // Every position indexes the common input. Later streams may
+        // refill across their starts; into_container restores their exact
+        // remaining bits before the stream-local tails validate the ends.
+        let mut rounds = affordable_rounds(&s, &[0; 5]);
         for (op, end) in ops.iter().zip(&segments[1..]) {
             rounds = rounds
                 .min((end - op).saturating_sub(PAIR_WINDOW - PAIR_ROUND_BYTES) / PAIR_ROUND_BYTES);
@@ -417,33 +469,63 @@ fn pair_rounds(
         if rounds == 0 {
             break;
         }
+        let [s1, s2, s3, s4] = &mut s;
         for _ in 0..rounds {
-            // Stream by stream: the four chains are independent, so the
-            // core overlaps them anyway, and only one stream's window is
-            // live at a time.
-            for (op, sentinel) in ops.iter_mut().zip(s.iter_mut()) {
-                // Every stream keeps its own position and output, so
-                // stopping between two streams leaves each one where its
-                // tail can take over; the limits above never let it happen.
-                if !sentinel.reload_within(src, src_limit) {
-                    break 'rounds;
-                }
-                let at = (*op).min(out_limit);
-                if let Some(window) = out
-                    .get_mut(at..)
-                    .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
-                {
-                    let mut written = 0usize;
-                    for _ in 0..PAIR_LOOKUPS {
-                        let pair = pairs[sentinel.peek(PAIR_SHIFT)];
-                        sentinel.skip(pair.0);
-                        // Counts are at most three, so the stores stay
-                        // inside the window without a check.
-                        window[written..written + 2].copy_from_slice(&pair.symbols().to_le_bytes());
-                        written += pair.count();
-                    }
-                    *op = at + written;
-                }
+            if !s1.reload_within(src, src_limit)
+                || !s2.reload_within(src, src_limit)
+                || !s3.reload_within(src, src_limit)
+                || !s4.reload_within(src, src_limit)
+            {
+                break 'rounds;
+            }
+            let [a1, a2, a3, a4] = core::array::from_fn(|i| ops[i] - segments[i]);
+            let Some(w1) = first
+                .get_mut(a1.min(l1)..)
+                .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
+            else {
+                break 'rounds;
+            };
+            let Some(w2) = second
+                .get_mut(a2.min(l2)..)
+                .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
+            else {
+                break 'rounds;
+            };
+            let Some(w3) = third
+                .get_mut(a3.min(l3)..)
+                .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
+            else {
+                break 'rounds;
+            };
+            let Some(w4) = fourth
+                .get_mut(a4.min(l4)..)
+                .and_then(<[u8]>::first_chunk_mut::<PAIR_WINDOW>)
+            else {
+                break 'rounds;
+            };
+            let (mut n1, mut n2, mut n3, mut n4) = (0, 0, 0, 0);
+            for _ in 0..PAIR_LOOKUPS {
+                let p1 = pairs[s1.peek(PAIR_SHIFT)];
+                let p2 = pairs[s2.peek(PAIR_SHIFT)];
+                let p3 = pairs[s3.peek(PAIR_SHIFT)];
+                s1.skip(p1.0);
+                s2.skip(p2.0);
+                s3.skip(p3.0);
+                w1[n1..n1 + 2].copy_from_slice(&p1.symbols().to_le_bytes());
+                w2[n2..n2 + 2].copy_from_slice(&p2.symbols().to_le_bytes());
+                w3[n3..n3 + 2].copy_from_slice(&p3.symbols().to_le_bytes());
+                n1 += p1.count();
+                n2 += p2.count();
+                n3 += p3.count();
+            }
+            for _ in 0..PAIR_LOOKUPS {
+                let p4 = pairs[s4.peek(PAIR_SHIFT)];
+                s4.skip(p4.0);
+                w4[n4..n4 + 2].copy_from_slice(&p4.symbols().to_le_bytes());
+                n4 += p4.count();
+            }
+            for (op, count) in ops.iter_mut().zip([n1, n2, n3, n4]) {
+                *op += count;
             }
         }
     }
@@ -453,6 +535,108 @@ fn pair_rounds(
         ops[1] - segments[1],
         ops[2] - segments[2],
         ops[3] - segments[3],
+    ]
+}
+
+/// Positions in a literals section: below [`BLOCK_SIZE_MAX`], a power of
+/// two.
+const OUT_MASK: usize = BLOCK_SIZE_MAX - 1;
+/// Bytes a literal buffer needs for [`pair_rounds_fixed`]: every position
+/// a mask leaves, and a whole [`PAIR_WINDOW`] after it.
+pub(crate) const FIXED_OUT: usize = BLOCK_SIZE_MAX + PAIR_WINDOW;
+
+/// Decodes one pair lookup into `out` at `*op`, the reference's
+/// `HUF_4X2_DECODE_SYMBOL`: two bytes are stored and `*op` advances by the
+/// symbols decoded.
+#[inline(always)]
+fn pair_lookup(
+    pairs: &[PairRow; PAIR_SIZE],
+    sentinel: &mut Sentinel,
+    out: &mut [u8; FIXED_OUT],
+    op: &mut usize,
+) {
+    let pair = pairs[sentinel.peek(PAIR_SHIFT)];
+    sentinel.skip(pair.0);
+    out[*op..*op + 2].copy_from_slice(&pair.symbols().to_le_bytes());
+    *op += pair.count();
+}
+
+/// [`pair_rounds`] over a buffer of [`FIXED_OUT`] bytes, as the reference
+/// decodes: each stream keeps only its container and its output position
+/// live, the first three streams interleave their lookups and the fourth
+/// stream's interleave with the refills, and the fourth stream's position
+/// counts the rounds.
+///
+/// Every round masks each position to [`OUT_MASK`], which a section's
+/// positions never exceed. A round then advances a position by at most
+/// `3 * PAIR_LOOKUPS` (the type of a count bounds it) before its last
+/// store, so every store provably lies inside the buffer with no check.
+/// The round counts keep each stream's stores inside its own segment, as
+/// [`pair_rounds`] does.
+#[inline(always)]
+fn pair_rounds_fixed(
+    pairs: &[PairRow; PAIR_SIZE],
+    src: &[u8],
+    out: &mut [u8; FIXED_OUT],
+    segments: [usize; 5],
+    sentinels: &mut [Sentinel; 4],
+) -> [usize; 4] {
+    const {
+        assert!(PAIR_LOOKUPS * PAIR_BITS as usize + 7 <= 63);
+        assert!(OUT_MASK + 1 + 3 * (PAIR_LOOKUPS - 1) + 2 <= FIXED_OUT);
+    };
+    let starts = [segments[0], segments[1], segments[2], segments[3]];
+    let mut ops = starts;
+    let mut s = *sentinels;
+    let Some(src_limit) = src.len().checked_sub(8) else {
+        return [0; 4];
+    };
+    'rounds: loop {
+        let mut rounds = affordable_rounds(&s, &[0; 5]);
+        for (op, end) in ops.iter().zip(&segments[1..]) {
+            rounds = rounds
+                .min((end - op).saturating_sub(PAIR_WINDOW - PAIR_ROUND_BYTES) / PAIR_ROUND_BYTES);
+        }
+        if rounds == 0 {
+            break;
+        }
+        // Each lookup decodes at least one symbol, so the fourth stream
+        // gets there within `rounds` rounds.
+        let olimit = ops[3] + PAIR_LOOKUPS * rounds;
+        let [s1, s2, s3, s4] = &mut s;
+        let [mut o1, mut o2, mut o3, mut o4] = ops;
+        loop {
+            [o1, o2, o3, o4] = [o1, o2, o3, o4].map(|op| op & OUT_MASK);
+            for _ in 0..PAIR_LOOKUPS {
+                pair_lookup(pairs, s1, out, &mut o1);
+                pair_lookup(pairs, s2, out, &mut o2);
+                pair_lookup(pairs, s3, out, &mut o3);
+            }
+            pair_lookup(pairs, s4, out, &mut o4);
+            pair_lookup(pairs, s4, out, &mut o4);
+            let refilled = s1.reload_within(src, src_limit);
+            pair_lookup(pairs, s4, out, &mut o4);
+            let refilled = refilled & s2.reload_within(src, src_limit);
+            pair_lookup(pairs, s4, out, &mut o4);
+            let refilled = refilled & s3.reload_within(src, src_limit);
+            pair_lookup(pairs, s4, out, &mut o4);
+            let refilled = refilled & s4.reload_within(src, src_limit);
+            if !refilled {
+                ops = [o1, o2, o3, o4];
+                break 'rounds;
+            }
+            if o4 >= olimit {
+                break;
+            }
+        }
+        ops = [o1, o2, o3, o4];
+    }
+    *sentinels = s;
+    [
+        ops[0] - starts[0],
+        ops[1] - starts[1],
+        ops[2] - starts[2],
+        ops[3] - starts[3],
     ]
 }
 
@@ -686,17 +870,21 @@ impl HuffmanTable {
         decode_tail(&self.rows, bits, src, out)
     }
 
-    /// Decodes `out.len()` literals from one stream or four streams, with
-    /// `simd`'s target features. The pair rows are built on first use.
+    /// Decodes `size` literals from one stream or four streams into the
+    /// start of `buffer`, with `simd`'s target features. The pair rows are
+    /// built on first use. A `buffer` of at least [`FIXED_OUT`] bytes lets
+    /// the pair loop run over a buffer of a fixed size; the bytes after the
+    /// literals are left as they were.
     #[fearless_simd_macros::simd]
     pub(crate) fn decode_streams<S: fearless_simd::Simd>(
         &mut self,
         simd: S,
         src: &[u8],
-        out: &mut [u8],
+        buffer: &mut [u8],
+        size: usize,
         four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
-        decode_with(self, src, out, four_streams)
+        decode_with(self, src, buffer, size, four_streams)
     }
 
     /// Decodes literals as [`Self::decode_streams`] with a table that may
@@ -707,10 +895,11 @@ impl HuffmanTable {
         &self,
         simd: S,
         src: &[u8],
-        out: &mut [u8],
+        buffer: &mut [u8],
+        size: usize,
         four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
-        decode_with(self, src, out, four_streams)
+        decode_with(self, src, buffer, size, four_streams)
     }
 
     /// Builds the pair rows ahead of time, for a table that is then shared.
@@ -770,14 +959,18 @@ impl TableAccess for &HuffmanTable {
 fn decode_with<T: TableAccess>(
     table: T,
     src: &[u8],
-    out: &mut [u8],
+    buffer: &mut [u8],
+    size: usize,
     four_streams: bool,
 ) -> Result<(), InvalidDataKind> {
+    let out = buffer
+        .get_mut(..size)
+        .ok_or(InvalidDataKind::HuffmanStream)?;
     if !four_streams {
         return table.table().decode_stream(src, out);
     }
-    let pairs = prefers_pairs(out.len(), src.len());
-    decode_four(table, src, out, pairs)
+    let pairs = prefers_pairs(size, src.len());
+    decode_four(table, src, buffer, size, pairs)
 }
 
 /// Decodes four streams after their jump table, with the pair rows in the
@@ -786,12 +979,14 @@ fn decode_with<T: TableAccess>(
 fn decode_four<T: TableAccess>(
     mut table: T,
     src: &[u8],
-    out: &mut [u8],
+    buffer: &mut [u8],
+    size: usize,
     pairs: bool,
 ) -> Result<(), InvalidDataKind> {
     let invalid = InvalidDataKind::HuffmanStream;
+    let out_len = size;
     let (jump, streams) = src.split_first_chunk::<6>().ok_or(invalid)?;
-    if streams.len() < 4 || out.len() < 6 {
+    if streams.len() < 4 || out_len < 6 || out_len > buffer.len() {
         return Err(invalid);
     }
     let size = |at: usize| usize::from(u16::from_le_bytes([jump[at], jump[at + 1]]));
@@ -801,12 +996,12 @@ fn decode_four<T: TableAccess>(
     if fourth > streams.len() {
         return Err(invalid);
     }
-    let segment = out.len().div_ceil(4);
-    if 3 * segment > out.len() {
+    let segment = out_len.div_ceil(4);
+    if 3 * segment > out_len {
         return Err(invalid);
     }
     let starts = [0, second, third, fourth, streams.len()];
-    let segments = [0, segment, 2 * segment, 3 * segment, out.len()];
+    let segments = [0, segment, 2 * segment, 3 * segment, out_len];
     let stream = |index: usize| &streams[starts[index]..starts[index + 1]];
     let open = |index: usize| BitContainer::new(stream(index)).ok_or(invalid);
     let mut bits = [open(0)?, open(1)?, open(2)?, open(3)?];
@@ -818,18 +1013,26 @@ fn decode_four<T: TableAccess>(
             bits[index].reload_fast(stream(index));
             Sentinel::from_container(bits[index], streams, starts[index])
         });
-        let mut four = FourStreams {
-            src: streams,
-            starts,
-            out: &mut *out,
-            segments,
-        };
         // Without pair rows (a tree deeper than they serve, or a shared
         // table without them), the single-symbol loop decodes instead.
         let pairs = if pairs { table.pairs() } else { None };
-        done = if let Some(pairs) = pairs {
+        let fixed = match buffer.first_chunk_mut::<FIXED_OUT>() {
+            Some(fixed) if out_len <= BLOCK_SIZE_MAX => Some(fixed),
+            _ => None,
+        };
+        let mut four = FourStreams {
+            src: streams,
+            starts,
+            out: &mut [],
+            segments,
+        };
+        done = if let (Some(pairs), Some(fixed)) = (pairs, fixed) {
+            pair_rounds_fixed(pairs, streams, fixed, segments, &mut sentinels)
+        } else if let Some(pairs) = pairs {
+            four.out = &mut buffer[..out_len];
             pair_rounds(pairs, &mut four, &mut sentinels)
         } else {
+            four.out = &mut buffer[..out_len];
             let single = table.table();
             if single.log <= 11 {
                 single_rounds::<5>(&single.rows, &mut four, &mut sentinels)
@@ -841,10 +1044,21 @@ fn decode_four<T: TableAccess>(
             *container = sentinel.into_container(streams, start);
         }
     }
-    let rows = &*table.table().rows;
+    let table = table.table();
+    let rows = &*table.rows;
+    let tail_pairs = if pairs && table.pairs_valid {
+        table.pairs.as_deref()
+    } else {
+        None
+    };
+    let out = &mut buffer[..out_len];
     for (index, (container, decoded)) in bits.into_iter().zip(done).enumerate() {
         let output = &mut out[segments[index] + decoded..segments[index + 1]];
-        decode_tail(rows, container, stream(index), output)?;
+        if let Some(pairs) = tail_pairs {
+            decode_pair_tail(rows, pairs, container, stream(index), output)?;
+        } else {
+            decode_tail(rows, container, stream(index), output)?;
+        }
     }
     Ok(())
 }
@@ -913,7 +1127,7 @@ mod tests {
         src.extend_from_slice(&[0b0000_1101; 4]);
         let mut out = [0u8; 8];
         table
-            .decode_streams(fearless_simd::Fallback::new(), &src, &mut out, true)
+            .decode_streams(fearless_simd::Fallback::new(), &src, &mut out, 8, true)
             .expect("valid");
         assert_eq!(out, [0, 1, 0, 1, 0, 1, 0, 1]);
     }
@@ -930,18 +1144,25 @@ mod tests {
                 fearless_simd::Fallback::new(),
                 &[1, 0, 1, 0, 1],
                 &mut out,
+                8,
                 true
             ),
             invalid
         );
         let oversized = [9, 0, 1, 0, 1, 0, 1, 1, 1, 1];
         assert_eq!(
-            table.decode_streams(fearless_simd::Fallback::new(), &oversized, &mut out, true),
+            table.decode_streams(
+                fearless_simd::Fallback::new(),
+                &oversized,
+                &mut out,
+                8,
+                true
+            ),
             invalid
         );
         let short = [1, 0, 1, 0, 1, 0, 1, 1, 1];
         assert_eq!(
-            table.decode_streams(fearless_simd::Fallback::new(), &short, &mut out, true),
+            table.decode_streams(fearless_simd::Fallback::new(), &short, &mut out, 8, true),
             invalid
         );
         let streams = [1, 0, 1, 0, 1, 0, 1, 1, 1, 1];
@@ -950,8 +1171,14 @@ mod tests {
                 fearless_simd::Fallback::new(),
                 &streams,
                 &mut [0u8; 5],
+                5,
                 true
             ),
+            invalid
+        );
+        // More literals than the buffer holds.
+        assert_eq!(
+            table.decode_streams(fearless_simd::Fallback::new(), &streams, &mut out, 9, true),
             invalid
         );
     }
@@ -1105,8 +1332,14 @@ mod tests {
                 let src = encode_four(&table, &symbols);
                 for pairs in [false, true] {
                     let mut out = alloc::vec![0xee; len];
-                    decode_four(&mut table, &src, &mut out, pairs).expect("valid");
+                    decode_four(&mut table, &src, &mut out, len, pairs).expect("valid");
                     assert_eq!(out, symbols, "log {} len {len} pairs {pairs}", table.log);
+                    // A buffer of the fixed size decodes alike and keeps the
+                    // bytes after the literals.
+                    let mut fixed = alloc::vec![0xee; FIXED_OUT + 3];
+                    decode_four(&mut table, &src, &mut fixed, len, pairs).expect("valid");
+                    assert_eq!(fixed[..len], symbols, "fixed len {len} pairs {pairs}");
+                    assert!(fixed[len..].iter().all(|&byte| byte == 0xee));
                 }
                 // A shared table decodes alike, with or without pair rows.
                 let mut shared = table.clone();
@@ -1121,27 +1354,36 @@ mod tests {
                         } else {
                             encode(&table, &symbols)
                         };
-                        let mut out = alloc::vec![0xee; len];
-                        shared
-                            .decode_streams_shared(
-                                fearless_simd::Fallback::new(),
-                                &src,
-                                &mut out,
-                                four,
-                            )
-                            .expect("valid");
-                        assert_eq!(out, symbols, "prebuilt {prebuilt} four {four}");
+                        for room in [len, FIXED_OUT] {
+                            let mut out = alloc::vec![0xee; room];
+                            shared
+                                .decode_streams_shared(
+                                    fearless_simd::Fallback::new(),
+                                    &src,
+                                    &mut out,
+                                    len,
+                                    four,
+                                )
+                                .expect("valid");
+                            assert_eq!(out[..len], symbols, "prebuilt {prebuilt} four {four}");
+                        }
                     }
                 }
                 let mut out = alloc::vec![0xee; len];
                 table
-                    .decode_streams(fearless_simd::Fallback::new(), &src, &mut out, true)
+                    .decode_streams(fearless_simd::Fallback::new(), &src, &mut out, len, true)
                     .expect("valid");
                 assert_eq!(out, symbols);
                 let single = encode(&table, &symbols);
                 let mut out = alloc::vec![0xee; len];
                 table
-                    .decode_streams(fearless_simd::Fallback::new(), &single, &mut out, false)
+                    .decode_streams(
+                        fearless_simd::Fallback::new(),
+                        &single,
+                        &mut out,
+                        len,
+                        false,
+                    )
                     .expect("valid");
                 assert_eq!(out, symbols);
             }
@@ -1157,11 +1399,41 @@ mod tests {
             // One symbol fewer leaves bits in every stream, one more reads
             // past the start of the last one.
             for len in [symbols.len() - 1, symbols.len() + 1] {
+                for room in [len, FIXED_OUT] {
+                    let mut out = alloc::vec![0; room];
+                    assert_eq!(
+                        decode_four(&mut table, &src, &mut out, len, pairs),
+                        Err(InvalidDataKind::HuffmanStream),
+                        "pairs {pairs} len {len} room {room}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pair_tails_decode_exactly_at_output_boundaries() {
+        for mut table in [example_table(), flat_table()] {
+            table.build_pairs();
+            let pairs = table.pairs.as_deref().expect("pair rows");
+            for len in [0, 1, 2, 3, 7, 10, 11, 12, 15, 16, 17, 31, 32, 1000] {
+                let symbols = message(&table, len, len as u64 + 1);
+                let source = encode(&table, &symbols);
+                let bits = BitContainer::new(&source).expect("terminated");
                 let mut out = alloc::vec![0; len];
+                decode_pair_tail(&table.rows, pairs, bits, &source, &mut out).expect("valid");
+                assert_eq!(out, symbols, "log {} len {len}", table.log);
+                if len > 0 {
+                    let mut short = alloc::vec![0; len - 1];
+                    assert_eq!(
+                        decode_pair_tail(&table.rows, pairs, bits, &source, &mut short),
+                        Err(InvalidDataKind::HuffmanStream)
+                    );
+                }
+                let mut long = alloc::vec![0; len + 1];
                 assert_eq!(
-                    decode_four(&mut table, &src, &mut out, pairs),
-                    Err(InvalidDataKind::HuffmanStream),
-                    "pairs {pairs} len {len}"
+                    decode_pair_tail(&table.rows, pairs, bits, &source, &mut long),
+                    Err(InvalidDataKind::HuffmanStream)
                 );
             }
         }

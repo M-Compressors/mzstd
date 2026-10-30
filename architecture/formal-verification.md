@@ -299,7 +299,7 @@ sequence loop of `decompressor/core/sequences.rs` and is not translated.
 
 Section 4.1.1 assigns each state of a symbol with probability `p` (in natural
 order, `k = 0, 1, ...`) a `Number_of_Bits` and a `Baseline` (Table 21).
-`SeqTable::fill` visits the cells in natural order with a per-symbol counter
+`SeqTable::fill_rows` visits the cells in natural order with a per-symbol counter
 that starts at `p` and calls `transition(p + k, table_log)`.
 `transition.spec` proves that the result is `fseState table_log p k`. The
 proof goes through `fseState_eq`, which shows that the RFC's description by
@@ -364,7 +364,7 @@ these are the limits of what is already proved.
   stream state machine that reads the magic number and skippable frames, the
   engine method that fills `FrameHeaderFields`, and the parallel compressor's
   own frame header writer (`parallel::core`) are outside the proofs.
-- `SeqTable::fill` and `spread`, which call `transition` with the counter
+- `SeqTable::fill_rows` and `spread`, which call `transition` with the counter
   `p + k` and place the symbols with the section 4.1.1 step, use iterator
   adapters and const generics and are not translated; their spread is checked
   against Appendix A by unit tests.

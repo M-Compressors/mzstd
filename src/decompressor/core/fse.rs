@@ -91,7 +91,7 @@ pub(crate) const SEQ_TABLE_LOG_MAX: u32 = 9;
 /// Rows of the largest [`SeqTable`]; smaller tables use a prefix.
 pub(crate) const SEQ_TABLE_SIZE: usize = 1 << SEQ_TABLE_LOG_MAX;
 /// Room for the largest sequence alphabet (match lengths, 53 codes).
-const SEQ_SYMBOLS: usize = 64;
+pub(crate) const SEQ_SYMBOLS: usize = 64;
 /// Masks a state into [`SEQ_TABLE_SIZE`].
 const SEQ_STATE_MASK: usize = SEQ_TABLE_SIZE - 1;
 
@@ -152,46 +152,45 @@ enum BitCount {
 }
 
 impl BitCount {
-    /// Every count, by value.
-    const ALL: [Self; 32] = [
-        Self::B0,
-        Self::B1,
-        Self::B2,
-        Self::B3,
-        Self::B4,
-        Self::B5,
-        Self::B6,
-        Self::B7,
-        Self::B8,
-        Self::B9,
-        Self::B10,
-        Self::B11,
-        Self::B12,
-        Self::B13,
-        Self::B14,
-        Self::B15,
-        Self::B16,
-        Self::B17,
-        Self::B18,
-        Self::B19,
-        Self::B20,
-        Self::B21,
-        Self::B22,
-        Self::B23,
-        Self::B24,
-        Self::B25,
-        Self::B26,
-        Self::B27,
-        Self::B28,
-        Self::B29,
-        Self::B30,
-        Self::B31,
-    ];
-
-    /// The count `count`, which must be below 32.
+    /// The count `count`, which must be below 32. A match makes the
+    /// conversion an identity operation after range masking; indexing an
+    /// array of the variants would require a table load at runtime.
     const fn new(count: u8) -> Self {
         debug_assert!(count < 32);
-        Self::ALL[(count & 31) as usize]
+        match count & 31 {
+            0 => Self::B0,
+            1 => Self::B1,
+            2 => Self::B2,
+            3 => Self::B3,
+            4 => Self::B4,
+            5 => Self::B5,
+            6 => Self::B6,
+            7 => Self::B7,
+            8 => Self::B8,
+            9 => Self::B9,
+            10 => Self::B10,
+            11 => Self::B11,
+            12 => Self::B12,
+            13 => Self::B13,
+            14 => Self::B14,
+            15 => Self::B15,
+            16 => Self::B16,
+            17 => Self::B17,
+            18 => Self::B18,
+            19 => Self::B19,
+            20 => Self::B20,
+            21 => Self::B21,
+            22 => Self::B22,
+            23 => Self::B23,
+            24 => Self::B24,
+            25 => Self::B25,
+            26 => Self::B26,
+            27 => Self::B27,
+            28 => Self::B28,
+            29 => Self::B29,
+            30 => Self::B30,
+            _ => Self::B31,
+        }
     }
 }
 
@@ -465,15 +464,110 @@ impl FseTable {
 }
 
 impl SeqTable {
-    /// Rebuilds the table for a distribution whose probabilities sum to
-    /// `1 << table_log`, at most `1 << 9`, over an alphabet whose symbol `s`
-    /// decodes to `bases[s]` plus `extra_bits[s]` more bits.
+    /// Symbol baselines and extra-bit counts, built once per alphabet.
+    pub(crate) const fn symbol_rows(bases: &[u32], extra_bits: &[u8]) -> [SeqRow; SEQ_SYMBOLS] {
+        let mut rows = [SeqRow::new(0, 0, 0, 0); SEQ_SYMBOLS];
+        let mut symbol = 0;
+        while symbol < bases.len() && symbol < extra_bits.len() && symbol < SEQ_SYMBOLS {
+            rows[symbol] = SeqRow::new(bases[symbol], 0, extra_bits[symbol], 0);
+            symbol += 1;
+        }
+        rows
+    }
+
+    /// Builds the rows of a valid predefined distribution at compile time.
+    /// The scalar spreading walk is the RFC's table construction, independent
+    /// of the runtime fill's unrolled fast path.
+    pub(crate) const fn predefined_rows(
+        counts: &[i16],
+        table_log: u32,
+        bases: &[u32],
+        extra_bits: &[u8],
+    ) -> [SeqRow; SEQ_TABLE_SIZE] {
+        assert!(table_log <= SEQ_TABLE_LOG_MAX);
+        let size = 1usize << table_log;
+        let mask = size - 1;
+        let step = (size >> 1) + (size >> 3) + 3;
+        let mut symbols = [0u8; SEQ_TABLE_SIZE];
+        let mut next = [0u16; MAX_SYMBOLS];
+        let mut high = size;
+        let mut symbol = 0;
+        while symbol < counts.len() {
+            let count = counts[symbol];
+            if count == -1 {
+                high -= 1;
+                symbols[high] = symbol as u8;
+                next[symbol] = 1;
+            } else {
+                next[symbol] = count as u16;
+            }
+            symbol += 1;
+        }
+        let mut position = 0;
+        symbol = 0;
+        while symbol < counts.len() {
+            let mut count = 0;
+            while count < counts[symbol] {
+                symbols[position] = symbol as u8;
+                position = (position + step) & mask;
+                while position >= high {
+                    position = (position + step) & mask;
+                }
+                count += 1;
+            }
+            symbol += 1;
+        }
+        assert!(position == 0);
+        let mut rows = [SeqRow::new(0, 0, 0, 0); SEQ_TABLE_SIZE];
+        let mut index = 0;
+        while index < size {
+            let symbol = symbols[index] as usize;
+            let (nb_bits, state) = transition(next[symbol], table_log);
+            next[symbol] += 1;
+            rows[index] = SeqRow::new(bases[symbol], state, extra_bits[symbol], nb_bits);
+            index += 1;
+        }
+        rows
+    }
+
+    /// Independent runtime construction of symbol rows for the tests.
+    #[cfg(test)]
     pub(crate) fn fill(
         &mut self,
         counts: &[i16],
         table_log: u32,
         bases: &[u32],
         extra_bits: &[u8],
+    ) {
+        let mut symbol_rows = [SeqRow::default(); SEQ_SYMBOLS];
+        for ((row, &base), &extra) in symbol_rows.iter_mut().zip(bases).zip(extra_bits) {
+            *row = SeqRow::new(base, 0, extra, 0);
+        }
+        self.fill_rows(counts, table_log, &symbol_rows);
+    }
+
+    /// Builds rows in the block's selected feature context, without
+    /// repeating runtime CPU detection for individual tables or states.
+    #[fearless_simd_macros::simd]
+    pub(crate) fn fill_rows_on<S: fearless_simd::Simd>(
+        &mut self,
+        simd: S,
+        counts: &[i16],
+        table_log: u32,
+        symbol_rows: &[SeqRow; SEQ_SYMBOLS],
+    ) {
+        self.fill_rows(counts, table_log, symbol_rows);
+    }
+
+    /// Rebuilds the table for a normalized distribution over precomputed
+    /// symbol baselines and extra-bit counts. Inlined so `fill_rows_on`
+    /// compiles this body with its token's target features.
+    #[inline(always)]
+    pub(crate) fn fill_rows(
+        &mut self,
+        counts: &[i16],
+        table_log: u32,
+        symbol_rows: &[SeqRow; SEQ_SYMBOLS],
     ) {
         debug_assert!(table_log <= SEQ_TABLE_LOG_MAX);
         let size = 1usize << table_log;
@@ -485,12 +579,6 @@ impl SeqTable {
             &mut symbols,
             &mut next,
         );
-        // Each symbol's baseline and extra bits, by symbol: alphabets have
-        // at most 53 symbols, and the spread only places described ones.
-        let mut symbol_rows = [SeqRow::default(); SEQ_SYMBOLS];
-        for ((row, &base), &extra) in symbol_rows.iter_mut().zip(bases).zip(extra_bits) {
-            *row = SeqRow::new(base, 0, extra, 0);
-        }
         for (row, &symbol) in self.rows.iter_mut().zip(&symbols[..size]) {
             let symbol = usize::from(symbol);
             let next_state = &mut next[symbol];
@@ -605,6 +693,15 @@ mod tests {
         OF_DEFAULT_NORM, OF_DEFAULT_NORM_LOG,
     };
     use alloc::vec::Vec;
+
+    #[test]
+    fn bit_counts_represent_every_supported_width() {
+        for count in 0..32 {
+            let row = SeqRow::new(0, 0, count, count);
+            assert_eq!(row.extra_bits(), u32::from(count));
+            assert_eq!(row.nb_bits(), u32::from(count));
+        }
+    }
 
     /// Writes `(value, width)` fields forward, little-endian.
     fn pack(fields: &[(u32, u32)]) -> Vec<u8> {

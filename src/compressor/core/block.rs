@@ -225,11 +225,11 @@ fn entropy_compress_internal(
 ) -> Result<usize, CoreError> {
     let strategy = engine_params.cparams.strategy;
     let nb_seq = store.nb_seq();
-    let lit_size = store.literals.len();
+    let lit_size = store.literals().len();
     let suspect = nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
     let mut op = literals::try_compress(
         dst,
-        &store.literals,
+        store.literals(),
         &prev.huf,
         &mut next.huf,
         LiteralsSettings {
@@ -249,7 +249,7 @@ fn entropy_compress_internal(
             }
             return Ok(0);
         }
-        op = literals::no_compress(dst, &store.literals)?;
+        op = literals::no_compress(dst, store.literals())?;
     }
 
     if dst.len() - op < 3 + 1 {

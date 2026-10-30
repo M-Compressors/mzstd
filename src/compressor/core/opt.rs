@@ -2813,7 +2813,12 @@ mod tests {
                 seq_store.reserve(bytes.len(), cparams.min_match);
                 let mut rep = [1, 4, 8];
                 let last = compressor(&mut ms, &mut seq_store, &mut rep, &block);
-                outputs.push((last, rep, seq_store.sequences, seq_store.literals));
+                outputs.push((
+                    last,
+                    rep,
+                    seq_store.sequences().to_vec(),
+                    seq_store.literals().to_vec(),
+                ));
             }
             assert_eq!(outputs[0], outputs[1], "level {level}");
         }

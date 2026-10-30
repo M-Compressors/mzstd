@@ -1,6 +1,74 @@
 # Changelog
 
-## Unreleased
+## [v0.2.9](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.9) - 2026-10-30
+
+- **Session API in `mzstd-ffi`.** C callers can now compress and
+  decompress incrementally through reusable handles: `mzstd_encoder_create`,
+  `_reset` (with a pledged size or `MZSTD_CONTENT_SIZE_UNKNOWN`),
+  `_process` (`MZSTD_CONTINUE`, `MZSTD_FLUSH`, `MZSTD_END`) and `_free`, and
+  the matching `mzstd_decoder_*` functions (`MZSTD_DECODE_PROCESS`,
+  `MZSTD_DECODE_FINISH`, a `window_log_max` of `10..=31` or `0` for 27).
+  Each process call takes in/out lengths and reports `MZSTD_NEEDS_INPUT`,
+  `MZSTD_NEEDS_OUTPUT` or `MZSTD_FINISHED`. Encoder frames are
+  byte-identical to `ZSTD_compressStream2` for the same inputs, output
+  capacities and operations; the decoder reads concatenated and skippable
+  frames as `ZSTD_decompressStream` does. Pointers, lengths, overlaps and
+  operation values are validated before use, and a panic poisons the handle
+  instead of unwinding into C. A new `session` Criterion benchmark times
+  both against zstd's streaming API with reused contexts.
+
+- **The `fast` levels no longer zero a block's room per dense block.**
+  Promoting a dense full block to the fixed-size sequence cursor resized
+  the store's vectors to a full block and truncated them again every time,
+  writing 384 KiB of zeros per 128 KiB block. The store now keeps one
+  full-block destination, zeroed once, and the promoted block's entries
+  stay in it until the next block. Silesia nci at level -1 with a reused
+  context is 5-6% faster (it had fallen 4.5% behind the main branch),
+  cyclic Alice 2.4-2.9% at levels -5 to 2. Frames are unchanged.
+
+- **Benchmarks refreshed on AMD, against C and the main branch.** The
+  published comparison is a new complete sweep of all 384 encoder and 384
+  decoder cases on a Ryzen 9 7950X, and its pages and charts carry a third
+  series, the main branch measured beside the working tree
+  (`--main-csv` in `level_docs.py`, `plot.py` and `decoder_docs.py`). A new
+  `silesia.py` times C, main and the working tree in random order on whole
+  Silesia files with reused contexts. The earlier Intel sweep and the
+  interim AMD tuning reports are removed. See the
+  [benchmark results](docs/benchmarks/README.md).
+
+- **Reused-context and literal-decoding performance without unsafe.** The
+  row match finder views its kept tables a row further on at every context
+  reset: entries a previous input of similar content left in the
+  never-cleared tag table otherwise shared the new input's tags, and on
+  repeated Alice frames the greedy and lazy levels 4-10 took up to 6.5%
+  longer from finding and dismissing them. The reference salts its hash
+  instead (`ZSTD_advanceHashSalt`), at an XOR per hash; the view costs
+  nothing per position, so cold searches are unchanged. The
+  decoder runs its block loops with AVX2's features on AVX-512 hosts (the
+  compiler vectorized the Huffman streams' lookups into gathers there),
+  decodes large four-stream Huffman sections into a literal buffer of a
+  fixed size that lets the pair loop keep one output position per stream,
+  and reads offset bits with one shift. The `fast` match path extends
+  backwards with the reference's byte loop, compares a match's first word
+  with one bounds test and keeps its sequence cursor's counts in
+  registers: 1.4-1.7% faster on Silesia at levels -1 and 1, still 7-8%
+  behind the reference there. Encoded bytes remain identical to
+  zstd 1.5.7. See the [benchmark results](docs/benchmarks/README.md).
+
+- **Alice performance follow-up without unsafe.** Dense full `fast` blocks
+  promote their sequence writer after 1024 sequences, lazy prefix parsing
+  uses relative positions, and sequence code/width maps share one lookup.
+  The decoder skips zero-width length reads, builds described FSE rows in
+  the selected feature context, and continues Huffman pairs into the tails
+  before exact stream-end validation.
+
+- **AMD performance tuning without unsafe.** The encoder's block
+  pre-splitter runs in the selected SIMD feature context, uses exact 32-bit
+  fingerprint arithmetic and keeps its fixed histograms on the stack. The
+  decoder borrows compile-time predefined FSE tables and symbol rows, avoids
+  an enum-conversion table lookup, and interleaves three Huffman streams
+  while decoding the fourth separately. Encoded bytes remain identical to
+  zstd 1.5.7.
 
 - **Fixed a false `framed_roundtrip` fuzz crash.** With one-byte chunks the
   target writes a chunk per payload byte plus metadata, which exceeded the

@@ -19,6 +19,14 @@ class DecoderPages(unittest.TestCase):
             self.assertIn(f"## {corpus}", page)
         self.assertIn("compressed / original: undefined", page)
 
+    def test_main_series_adds_a_median_and_a_row_per_dataset(self):
+        rows = validate_rows(matrix(), decoding=True)
+        main = validate_rows(matrix(lambda level, corpus: 1000.0, c=900.0), decoding=True)
+        page = level_page(rows, 3, ENVIRONMENT, ["d.csv", "e.json", "r.md"], main)
+        self.assertIn("| mzstd main | 0.900× |", page)
+        self.assertIn("measured on `0123abc`", page)
+        self.assertEqual(page.count("| mzstd main (separate run) | 1 | 0.999–1.001 |"), len(CORPORA))
+
     def test_frames_must_share_one_size_per_level(self):
         rows = matrix()
         rows[1]["compressed_bytes"] = "99"

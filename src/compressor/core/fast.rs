@@ -13,11 +13,14 @@ use fearless_simd_macros::simd;
 use super::cdict::TableLoad;
 use super::match_state::{BlockInput, DictMatchState, MatchState};
 use super::mem::{
-    common_suffix, count_at_simd, count_slices_simd, hash_at, hash_ptr, hash_word, load32, load64,
-    prefetch_l1, probe_pair, probe_window, window_word,
+    count_at_simd, count_behind_simd, count_slices_simd, hash_at, hash_ptr, hash_word, load32,
+    load64, prefetch_l1, probe_pair, probe_window, window_word,
 };
 use super::params::SHORT_CACHE_TAG_BITS;
-use super::seq_store::{SeqStore, offset_to_offbase, repcode_to_offbase};
+use super::seq_store::{
+    FULL_BLOCK_LITERALS, FULL_BLOCK_SEQUENCES, SeqCursor, SeqStore, SeqWrite, offset_to_offbase,
+    repcode_to_offbase,
+};
 use super::window::{HASH_READ_SIZE, WINDOW_START_INDEX};
 
 /// `kSearchStrength`.
@@ -124,6 +127,17 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     rep: &mut [u32; 3],
     block: &BlockInput<'_>,
 ) -> usize {
+    compress_block_with_store::<S, MLS>(simd, ms, seq_store, rep, block)
+}
+
+#[inline(always)]
+fn compress_block_with_store<S: Simd, const MLS: u32>(
+    simd: S,
+    ms: &mut MatchState,
+    seq_store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    block: &BlockInput<'_>,
+) -> usize {
     let cparams = ms.cparams;
     let prefix = block.window.prefix;
     let base = prefix.start();
@@ -175,7 +189,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
         let warm = u64::from(block.start - prefix_start_index) >= 4 << cparams.hash_log;
         macro_rules! scan {
             ($hlog:literal, $branchy:literal, $origin:expr) => {
-                compress_scan::<S, MLS, true, $hlog, $branchy, $origin>(
+                compress_scan_adaptive::<S, MLS, true, $hlog, $branchy, $origin>(
                     simd, table, seq_store, &scan, ip0, reps,
                 )
             };
@@ -213,7 +227,7 @@ fn compress_block_mls<S: Simd, const MLS: u32>(
     } else {
         let scan = scan(base);
         let ip0 = (ip0 - base) as usize;
-        compress_scan::<S, MLS, false, 0, false, 0>(
+        compress_scan_adaptive::<S, MLS, false, 0, false, 0>(
             simd,
             table,
             seq_store,
@@ -272,6 +286,7 @@ fn candidate_matches<const BRANCHY: bool>(history: &[u8], at: u32, word: u32) ->
 
 /// The bytes one `fast` block searches and the parameters it searches them
 /// with.
+#[derive(Clone, Copy)]
 struct Scan<'a> {
     /// The block and the history before it, from window index `origin` on.
     src: &'a [u8],
@@ -289,6 +304,112 @@ struct Scan<'a> {
     step_size: usize,
 }
 
+/// Starts with ordinary vector pushes. A dense first part promotes the
+/// remaining search to initialized slices at an outer-loop boundary, after
+/// the hash insertions and repeat-code chain have finished.
+#[inline(always)]
+fn compress_scan_adaptive<
+    S: Simd,
+    const MLS: u32,
+    const IN_PREFIX: bool,
+    const HLOG: u32,
+    const BRANCHY: bool,
+    const ORIGIN: u32,
+>(
+    simd: S,
+    table: &mut [u32],
+    store: &mut SeqStore,
+    scan: &Scan<'_>,
+    ip: usize,
+    reps: [u32; 2],
+) -> (usize, [u32; 2]) {
+    let mut stopped = false;
+    let eligible = scan.src.len() - scan.start == FULL_BLOCK_LITERALS
+        && store.max_nb_seq == FULL_BLOCK_SEQUENCES
+        && store.max_nb_lit >= FULL_BLOCK_LITERALS;
+    if !eligible {
+        return compress_scan::<S, SeqStore, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN, false>(
+            simd,
+            table,
+            store,
+            scan,
+            ip,
+            reps,
+            &mut stopped,
+        );
+    }
+    let (remaining, reps) = compress_scan::<S, SeqStore, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN, true>(
+        simd,
+        table,
+        store,
+        scan,
+        ip,
+        reps,
+        &mut stopped,
+    );
+    if !stopped {
+        return (remaining, reps);
+    }
+    let ip = scan.src.len() - remaining;
+    let resume = Scan { start: ip, ..*scan };
+    if remaining >= 1 << 16 {
+        store.with_full_block_cursor(|cursor| {
+            compress_cursor_scan::<S, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN>(
+                simd, table, cursor, &resume, ip, reps,
+            )
+        })
+    } else {
+        compress_scan::<S, SeqStore, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN, false>(
+            simd,
+            table,
+            store,
+            &resume,
+            ip,
+            reps,
+            &mut stopped,
+        )
+    }
+}
+
+/// The promoted loop has its own feature entry: the cursor callback may
+/// otherwise remain out of line without inheriting its caller's ISA.
+#[simd]
+#[inline(always)]
+fn compress_cursor_scan<
+    S: Simd,
+    const MLS: u32,
+    const IN_PREFIX: bool,
+    const HLOG: u32,
+    const BRANCHY: bool,
+    const ORIGIN: u32,
+>(
+    simd: S,
+    table: &mut [u32],
+    cursor: &mut SeqCursor<'_>,
+    scan: &Scan<'_>,
+    ip: usize,
+    reps: [u32; 2],
+) -> (usize, [u32; 2]) {
+    let mut stopped = false;
+    // A local cursor, whose address never escapes, keeps its counts in
+    // registers: through `cursor` they would be stored on every sequence,
+    // since the compiler cannot tell the stores into its slices apart from
+    // them.
+    let mut local = cursor.reborrow();
+    let result = compress_scan::<S, SeqCursor<'_>, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN, false>(
+        simd,
+        table,
+        &mut local,
+        scan,
+        ip,
+        reps,
+        &mut stopped,
+    );
+    let counts = local.counts();
+    cursor.set_counts(counts);
+    result
+}
+
 /// The search and match loop of `ZSTD_compressBlock_fast_noDict_generic`
 /// from offset `ip0` of `scan.src`, with the repcodes `reps`. Returns the
 /// length of the trailing literals and the final repcodes.
@@ -301,18 +422,21 @@ struct Scan<'a> {
 #[inline(always)]
 fn compress_scan<
     S: Simd,
+    W: SeqWrite,
     const MLS: u32,
     const IN_PREFIX: bool,
     const HLOG: u32,
     const BRANCHY: bool,
     const ORIGIN: u32,
+    const PAUSE: bool,
 >(
     simd: S,
     table: &mut [u32],
-    seq_store: &mut SeqStore,
+    seq_store: &mut W,
     scan: &Scan<'_>,
     mut ip0: usize,
     reps: [u32; 2],
+    stopped: &mut bool,
 ) -> (usize, [u32; 2]) {
     let Scan { src, step_size, .. } = *scan;
     // `ORIGIN`, when not zero, is `scan.origin` known at compile time; the
@@ -449,7 +573,15 @@ fn compress_scan<
                 rep_offset2 = rep_offset1;
                 rep_offset1 = (ip0 - m0) as u32;
                 offcode = offset_to_offbase(rep_offset1);
-                let back = common_suffix(&src[anchor..ip0], &src[prefix_start..m0]);
+                // `ZSTD_compressBlock_fast`'s backward extension, as a loop
+                // rather than over two cut slices: it rarely takes a step.
+                let mut back = 0;
+                while ip0 - back > anchor && m0 - back > prefix_start {
+                    match (src.get(ip0 - back - 1), src.get(m0 - back - 1)) {
+                        (Some(a), Some(b)) if a == b => back += 1,
+                        _ => break,
+                    }
+                }
                 ip0 -= back;
                 m0 -= back;
                 m_length = back + 4;
@@ -458,8 +590,8 @@ fn compress_scan<
         }
 
         // _match:
-        m_length += count_at_simd(simd, src, ip0 + m_length, match0 + m_length);
-        store_seq_wild(seq_store, src, anchor, ip0 - anchor, offcode, m_length);
+        m_length += count_behind_simd(simd, src, ip0 + m_length, match0 + m_length);
+        seq_store.store_seq_wild(src, anchor, ip0 - anchor, offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
@@ -487,39 +619,13 @@ fn compress_scan<
                 }
             }
         }
+        if PAUSE && seq_store.nb_seq() >= 1024 {
+            *stopped = true;
+            return (iend - anchor, [rep_offset1, rep_offset2]);
+        }
     }
 
     (iend - anchor, [rep_offset1, rep_offset2])
-}
-
-/// [`SeqStore::store_seq_from`] for the fast search: a literal run of at
-/// most 16 bytes is copied as the 16-byte chunk at `anchor` (`ZSTD_copy16`)
-/// when `src` holds that many, and the excess is cut off again.
-///
-/// The chunk is appended straight from `src`, so it is not first copied to
-/// the stack, and the bounds test is `16 <= src.len() - anchor`, which
-/// cannot overflow (on Alice at level 1, 2.5% fewer instructions and 2-3%
-/// less time than the shared helper).
-#[inline(always)]
-fn store_seq_wild(
-    seq_store: &mut SeqStore,
-    src: &[u8],
-    anchor: usize,
-    lit_length: usize,
-    off_base: u32,
-    match_length: usize,
-) {
-    debug_assert!(seq_store.literals.len() + lit_length <= seq_store.max_nb_lit);
-    let literals = &mut seq_store.literals;
-    match src.get(anchor..).and_then(<[u8]>::first_chunk::<16>) {
-        Some(chunk) if lit_length <= 16 => {
-            let start = literals.len();
-            literals.extend_from_slice(chunk);
-            literals.truncate(start + lit_length);
-        }
-        _ => literals.extend_from_slice(&src[anchor..anchor + lit_length]),
-    }
-    seq_store.store_seq_only(lit_length, off_base, match_length);
 }
 
 /// `ZSTD_compressBlock_fast_extDict`: selects the variant compiled for
@@ -1516,6 +1622,103 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn adaptive_cursor_matches_uninterrupted_vector_scan() {
+        // This oracle never enters PAUSE or SeqCursor and calls no C code.
+        // Compare parser decisions as well as the materialized sequences:
+        // a different hash table or final repcode can change a later block.
+        fn check<const IN_PREFIX: bool>(
+            input: &[u8],
+            start: usize,
+            prefix_start: usize,
+            block_size: usize,
+            promotes: Option<bool>,
+        ) {
+            let logical = &input[..start + block_size];
+            let scan = Scan {
+                src: logical,
+                origin: WINDOW_START_INDEX,
+                prefix_start,
+                start,
+                hlog: 13,
+                step_size: 2,
+            };
+            let ip = start + usize::from(start == prefix_start);
+            let mut table = vec![0; 1 << scan.hlog];
+            // Populate a preceding prefix as a streaming block would.
+            for at in (prefix_start..start.saturating_sub(8)).step_by(3) {
+                table[hash_at::<5>(logical, at, scan.hlog)] = scan.origin + at as u32;
+            }
+            let mut empty = SeqStore::default();
+            empty.reserve(FULL_BLOCK_LITERALS, 5);
+            for backend in Backend::available() {
+                if let Some(promotes) = promotes {
+                    let mut paused = empty.clone();
+                    let mut paused_table = table.clone();
+                    let mut stopped = false;
+                    let (remaining, _) = fearless_simd::dispatch!(backend.0, simd =>
+                        compress_scan::<_, SeqStore, 5, IN_PREFIX, 13, false, 0, true>(
+                            simd, &mut paused_table, &mut paused, &scan, ip, [0, 0],
+                            &mut stopped,
+                        )
+                    );
+                    assert!(stopped, "{backend}: fixture must reach the pause");
+                    assert!(paused.nb_seq() >= 1024, "{backend}");
+                    assert_eq!(remaining >= 1 << 16, promotes, "{backend}: {remaining}");
+                    assert_eq!(paused.max_nb_seq, FULL_BLOCK_SEQUENCES);
+                    assert_eq!(paused.max_nb_lit, FULL_BLOCK_LITERALS);
+                }
+                let mut reference = empty.clone();
+                let mut reference_table = table.clone();
+                let mut stopped = false;
+                let expected = fearless_simd::dispatch!(backend.0, simd =>
+                    compress_scan::<_, SeqStore, 5, IN_PREFIX, 13, false, 0, false>(
+                        simd, &mut reference_table, &mut reference, &scan, ip, [0, 0],
+                        &mut stopped,
+                    )
+                );
+                assert!(!stopped);
+                let sequence_bytes: usize = (0..reference.nb_seq())
+                    .map(|at| {
+                        let lengths = reference.sequence_length(at);
+                        (lengths.lit_length + lengths.match_length) as usize
+                    })
+                    .sum();
+                assert_eq!(sequence_bytes + expected.0, block_size, "{backend}");
+
+                let mut optimized = empty.clone();
+                let mut optimized_table = table.clone();
+                let actual = fearless_simd::dispatch!(backend.0, simd =>
+                    compress_scan_adaptive::<_, 5, IN_PREFIX, 13, false, 0>(
+                        simd, &mut optimized_table, &mut optimized, &scan, ip,
+                        [0, 0],
+                    )
+                );
+                assert_eq!(actual, expected, "{backend}");
+                assert_eq!(optimized.sequences(), reference.sequences(), "{backend}");
+                assert_eq!(optimized.literals(), reference.literals(), "{backend}");
+                assert_eq!(optimized.long_length, reference.long_length, "{backend}");
+                assert_eq!(optimized_table, reference_table, "{backend}");
+            }
+        }
+
+        let alice = include_bytes!("../../../testdata/alice29.txt");
+        // Dense from the start: promote after the first 1024 sequences.
+        check::<true>(alice, 0, 0, FULL_BLOCK_LITERALS, Some(true));
+        // A late dense region reaches 1024 after the 64 KiB cutoff and
+        // resumes the vector writer instead of initializing a cursor.
+        let mut late = corpus::random(70_000, 0x512c_0ffe);
+        late.extend_from_slice(&alice[..FULL_BLOCK_LITERALS - late.len()]);
+        check::<true>(&late, 0, 0, FULL_BLOCK_LITERALS, Some(false));
+        // An incomplete block must retain the unpaused vector parser.
+        check::<true>(alice, 0, 0, FULL_BLOCK_LITERALS - 1, None);
+        // A later streaming block has readable history, a nonzero start,
+        // and a clipped history lower bound; it can still use the cursor.
+        let mut history = alice[..4096].to_vec();
+        history.extend_from_slice(&alice[..FULL_BLOCK_LITERALS]);
+        check::<false>(&history, 4096, 128, FULL_BLOCK_LITERALS, Some(true));
+    }
+
+    #[test]
     fn wild_literal_copies_store_what_the_shared_helper_stores() {
         // Runs up to 16 bytes take the chunk while it fits before the end
         // of `src`, longer runs and runs near the end the exact copy.
@@ -1526,13 +1729,17 @@ pub(crate) mod tests {
                 let mut shared = SeqStore::default();
                 wild.reserve(1 << 10, 4);
                 shared.reserve(1 << 10, 4);
-                wild.literals.push(0xAA);
-                shared.literals.push(0xAA);
-                store_seq_wild(&mut wild, &src, anchor, lit_length, 7, 5);
+                wild.store_last_literals(&[0xAA]);
+                shared.store_last_literals(&[0xAA]);
+                SeqWrite::store_seq_wild(&mut wild, &src, anchor, lit_length, 7, 5);
                 shared.store_seq_from(&src, anchor, lit_length, 7, 5);
-                assert_eq!(wild.literals, shared.literals, "{anchor} {lit_length}");
-                assert_eq!(wild.literals[1..], src[anchor..anchor + lit_length]);
-                assert_eq!(wild.sequences, shared.sequences, "{anchor} {lit_length}");
+                assert_eq!(wild.literals(), shared.literals(), "{anchor} {lit_length}");
+                assert_eq!(wild.literals()[1..], src[anchor..anchor + lit_length]);
+                assert_eq!(
+                    wild.sequences(),
+                    shared.sequences(),
+                    "{anchor} {lit_length}"
+                );
             }
         }
     }
@@ -1558,7 +1765,12 @@ pub(crate) mod tests {
             seq_store.reserve(input.len(), cparams.min_match);
             let mut rep = [1, 4, 8];
             let literals = compressor(&mut ms, &mut seq_store, &mut rep, &block);
-            (literals, rep, seq_store.sequences, seq_store.literals)
+            (
+                literals,
+                rep,
+                seq_store.sequences().to_vec(),
+                seq_store.literals().to_vec(),
+            )
         };
         let ours = run(compress_block_dict_match_state);
         assert!(!ours.2.is_empty());

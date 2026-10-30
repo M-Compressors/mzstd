@@ -480,8 +480,8 @@ Invariants each layer relies on:
 - **Bit readers.** Readers start after the end marker of the last byte (a
   zero last byte is rejected); streams are valid only when consumed
   exactly. `BitContainer` (Huffman and sequence streams) is refilled where
-  the reference refills, and once reads pass the start its consumed count
-  stays above 64, so such streams are rejected; the Huffman weight decoder
+  the reference refills, and once reads pass the start its unread-bit count wraps
+  above 64, so such streams are rejected; the Huffman weight decoder
   reads zeros past the start through the same container and checks
   `overflowed` (`BIT_DStream_overflow`) as the reference's FSE decoder does. Reads are
   at most 56 bits (the widest is a 31-bit offset).
@@ -489,9 +489,12 @@ Invariants each layer relies on:
   the probabilities to sum exactly to the table size with no symbol above
   the alphabet; callers then cap the log (LL/ML 9, OF 8, Huffman weights 6).
   `FseTable::from_distribution` follows RFC 8878 section 4.1.1 (and
-  matches Appendix A row for row); `SeqTable::fill` spreads the same way and
-  adds each symbol's baseline and extra-bit count. Every state a table
-  produces indexes that table.
+  matches Appendix A row for row); `SeqTable::fill_rows` spreads the same
+  way and adds each symbol's baseline and extra-bit count from static
+  alphabet rows. Basic sequence modes borrow complete predefined tables
+  built at compile time. Custom tables retain their private allocations;
+  repeat mode reuses the selected static, private or dictionary table.
+  Every state a table produces indexes that table.
 - **Huffman.** Weights above 12 or trees deeper than 12 bits are rejected;
   the implied last weight must complete a power of two and there must be an
   even number, at least two, of weight-1 symbols. The lookup table is
@@ -510,7 +513,7 @@ Invariants each layer relies on:
 - **Headers.** `FrameHeader::parse` reads the fields at the offsets
   `header_size` fixed, through `dictionary_id_size`, `described_window_size`
   and `read_le`; `sequence_count` reads `Number_of_Sequences` before
-  `read_header` updates the tables. These and `BlockHeader::parse` are
+  `read_header_on` updates the tables. These and `BlockHeader::parse` are
   proved against RFC 8878 in [formal verification](formal-verification.md),
   including that none of their indexing can panic.
 - **Frames.** The reserved descriptor bit must be clear; a non-zero

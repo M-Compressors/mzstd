@@ -1,131 +1,119 @@
-# Compression comparison — 2026-10-18 (mzstd 0.2.7)
+# Compression comparison — 2026-10-30
 
 [Benchmark index](README.md) · [Results by level](encoders/README.md)
 
-The [384-row CSV](encoder-comparison.csv) records mzstd 0.2.7 (the working
-tree on `eb10fd0` that becomes this release) against zstd 1.5.7, under the
-Criterion baseline `enc-20261018`. The median speed relative to C is
-**1.112×** over all 192 dataset/level pairs, and mzstd has the lower mean
-latency in **166** of them. The same sweep of the tree before this
-release's changes (`enc-before`, same host, settings and day) measured
-1.086× and 159 pairs. The fastest levels stay the strongest (1.24× at
-levels -5 and -1); Alice text at levels -5 to 1 rose from 0.87-0.89× to
-0.92-0.94×, and at levels 2 and 3 to 0.98× and 1.03×.
+The [384-row CSV](encoder-comparison.csv) records the working tree on
+`0a4fd87` (mzstd 0.2.7 plus the Unreleased changes in the
+[changelog](../../CHANGELOG.md)) against zstd 1.5.7, under the Criterion
+baseline `full-20261030`. The median speed relative to C is **1.256×** over
+all 192 dataset/level pairs, and mzstd has the lower mean latency in
+**179** of them; in all 179 its 95% interval for mean latency lies wholly
+below C's. The main branch (`0a4fd87`), measured in a second process beside
+it ([its CSV](encoder-comparison-2026-10-30/main.csv)), reached 1.254× and
+178 pairs. Every frame is byte-identical to zstd's.
 
 The [environment record](encoder-comparison-environment.json) identifies the
-measured source files and binary by SHA-256. The
-[size manifest](encoder-comparison-2026-10-18/sizes.csv) and
-[raw Criterion samples and estimates](encoder-comparison-2026-10-18/criterion-samples.json.gz)
-are archived with this run. The [changelog](../../CHANGELOG.md) describes the
-encoder changes.
+measured sources and binaries by SHA-256. The
+[size manifest](encoder-comparison-2026-10-30/sizes.csv) and the raw
+Criterion samples and estimates of the
+[working tree](encoder-comparison-2026-10-30/criterion-samples.json.gz) and
+[main](encoder-comparison-2026-10-30/main-criterion-samples.json.gz) are
+archived with this run.
 
 ## Results
 
 ![Median speed and output relative to C by level](encoders/charts/overview.svg)
 
-Speed / C is C mean latency divided by mzstd mean latency for the same input.
-Output / C is mzstd bytes divided by C bytes. Each level takes the median of
-these ratios over eight equally weighted datasets, including empty and tiny
-input. These are medians across datasets, not median Criterion sample times.
-Higher speed and lower output are better.
+Speed / C is C mean latency divided by mzstd mean latency for the same input,
+in the same process. Each level takes the median of these ratios over eight
+equally weighted datasets, including empty and tiny input; higher is better.
+mzstd main is normalized to the C timings of its own process. The
+[level overview](encoders/README.md) lists every level's medians.
 
-| Level | mzstd median speed / C ↑ | mzstd median output / C ↓ |
-| ---: | ---: | ---: |
-| -5 | 1.239× | 1.000× |
-| -1 | 1.245× | 1.000× |
-| 1 | 1.148× | 1.000× |
-| 2 | 1.142× | 1.000× |
-| 3 | 1.100× | 1.000× |
-| 4 | 1.040× | 1.000× |
-| 5 | 1.095× | 1.000× |
-| 6 | 1.115× | 1.000× |
-| 7 | 1.109× | 1.000× |
-| 8 | 1.122× | 1.000× |
-| 9 | 1.128× | 1.000× |
-| 10 | 1.095× | 1.000× |
-| 11 | 1.074× | 1.000× |
-| 12 | 1.075× | 1.000× |
-| 13 | 1.078× | 1.000× |
-| 14 | 1.048× | 1.000× |
-| 15 | 1.071× | 1.000× |
-| 16 | 1.116× | 1.000× |
-| 17 | 1.107× | 1.000× |
-| 18 | 1.110× | 1.000× |
-| 19 | 1.114× | 1.000× |
-| 20 | 1.113× | 1.000× |
-| 21 | 1.116× | 1.000× |
-| 22 | 1.111× | 1.000× |
+The medians over all 24 levels for each dataset:
 
-The unrounded overall median is **1.112091×**. mzstd has a lower mean latency
-in **166 of 192** pairs; in 160 of those, its individual 95% confidence interval
-for mean latency lies wholly below C's. These intervals have no adjustment for
-multiple comparisons.
+| Dataset | mzstd speed / C ↑ | mzstd main speed / C | Range across levels (mzstd) |
+| --- | ---: | ---: | ---: |
+| empty | 8.267× | 8.721× | 5.63–11.22× |
+| tiny-text | 3.618× | 3.604× | 1.51–8.72× |
+| alice29 | 1.019× | 0.985× | 0.94–1.10× |
+| text-1m | 1.085× | 1.079× | 1.03–1.25× |
+| binary-64k | 1.230× | 1.238× | 1.08–1.82× |
+| random-64k | 1.100× | 1.143× | 1.02–1.59× |
+| random-1m | 1.218× | 1.225× | 0.97–2.43× |
+| repeated-1m | 2.390× | 2.104× | 1.47–3.39× |
 
-The medians over all 24 levels for each dataset show the workload differences:
-
-| Dataset | mzstd median speed / C ↑ |
-| --- | ---: |
-| empty | 4.340× |
-| tiny-text | 2.096× |
-| alice29 | 1.021× |
-| text-1m | 1.041× |
-| binary-64k | 1.107× |
-| random-64k | 1.071× |
-| random-1m | 1.048× |
-| repeated-1m | 1.182× |
-
-Text results at selected levels:
+Thirteen pairs remain slower than C: Alice at levels 6 (0.943×), 7
+(0.949×), 4 (0.961×), 8 and 12 (0.967×), 5 (0.972×), 11 (0.976×), 2
+(0.982×), 1 (0.985×), -1 (0.990×) and 9 (0.992×), and random 1 MiB at
+levels 4 (0.972×) and 3 (0.979×). Single cold Alice cells move by about 3%
+between sweeps. Text results at selected levels:
 
 | Dataset | Level | mzstd, MiB/s ↑ | C, MiB/s ↑ | Speed / C ↑ | Frame bytes, both |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| alice29 | 1 | 383.45 | 417.42 | 0.919× | 59,657 |
-| alice29 | 3 | 300.61 | 292.42 | 1.028× | 56,970 |
-| alice29 | 9 | 55.49 | 57.12 | 0.972× | 52,188 |
-| alice29 | 19 | 5.86 | 5.45 | 1.077× | 49,211 |
-| text-1m | 1 | 2718.64 | 2518.65 | 1.079× | 61,206 |
-| text-1m | 3 | 1911.37 | 1786.20 | 1.070× | 55,878 |
-| text-1m | 9 | 422.75 | 430.27 | 0.983× | 52,381 |
-| text-1m | 19 | 38.83 | 34.93 | 1.112× | 49,285 |
+| alice29 | -5 | 533.6 | 498.2 | 1.071× | 85,658 |
+| alice29 | 1 | 419.2 | 425.6 | 0.985× | 59,657 |
+| alice29 | 3 | 305.2 | 285.4 | 1.069× | 56,970 |
+| alice29 | 9 | 58.4 | 58.8 | 0.992× | 52,188 |
+| alice29 | 19 | 6.3 | 5.8 | 1.082× | 49,211 |
+| text-1m | -5 | 4,742 | 3,780 | 1.255× | 96,657 |
+| text-1m | 1 | 3,008 | 2,405 | 1.251× | 61,206 |
+| text-1m | 3 | 1,977 | 1,684 | 1.174× | 55,878 |
+| text-1m | 9 | 454.1 | 436.1 | 1.041× | 52,381 |
+| text-1m | 19 | 41.3 | 37.8 | 1.092× | 49,285 |
 
 Every mzstd frame passed byte-for-byte comparison with zstd and decoded back
 to the original input through zstd before timing. The
 [level pages](encoders/README.md) expose all datasets, timings, throughput and
 95% mean confidence bounds.
 
-## Regression checks
+## Against the main branch
 
-Every case was compared with the sweep of the tree before this release's
-changes (`enc-before`, run the same day with the same settings). Cases
-whose own time rose by more than 3% in the sweep were rerun as separate
-processes, the previous tree's profile driver against this release's, nine
-interleaved pairs each on an idle CPU 2:
+Separate processes per case: the main branch's `profile` driver against
+the working tree's, five seeded AB/BA pairs of 0.1 s per side on one vCPU,
+with iteration counts calibrated from this run's CSV (encoder pairs on
+vCPU 0 while the decoder pairs ran on vCPU 1). Each value is the median
+over pairs of main time / working-tree time; above 1, the working tree is
+faster. [Every pair](encoder-comparison-2026-10-30/paired-main.json.gz)
+is archived.
 
-| Cases | Sweep: this release / previous time | Paired: this release / previous time | Verdict |
-| --- | ---: | ---: | --- |
-| random-1m l-5, l-1 | +14%, +18% | -18%, -22% | faster |
-| random-1m l2, l13-l15, l19, l20 | +4% to +13% | -0.5% to +0.8% | noise |
-| binary-64k l13, l14 | +4%, +7% | +1.1%, +0.5% | noise |
-| alice29 l18 | +5% | -0.1% | noise |
+| Dataset | Median over levels | Lowest level | Highest level |
+| --- | ---: | ---: | ---: |
+| empty | 0.963 | 0.922 | 1.006 |
+| tiny-text | 1.005 | 0.941 | 1.033 |
+| alice29 | 1.007 | 0.995 | 1.092 |
+| text-1m | 1.018 | 0.995 | 1.118 |
+| binary-64k | 1.003 | 0.986 | 1.015 |
+| random-64k | 1.000 | 0.889 | 1.011 |
+| random-1m | 0.999 | 0.969 | 1.019 |
+| repeated-1m | 1.060 | 1.034 | 1.350 |
 
-The same paired runs time Alice 5.0% faster at level 1, 6.5% at level 3
-and 1.4% at level 9, 1 MiB of text 5.5% faster at level 4 and 2.7% at
-level 9. The 1 MiB inputs' cold timings depend on the allocator state the
-long-running Criterion process has reached, which moves them by 5-15%
-between sweeps.
+Over all 192 cases the median is 1.005: 119 are faster, 54 by more than
+2%, and 44 are more than 2% slower. Alice is faster at every level but 12
+(0.995): 9.2% at level -5, 7.3% at -1, 8.2% at 1 and 2-3% at levels 5, 9
+and 10; cyclic Alice 1-12% at levels -5 to 12. The slower cases have two
+causes, both described in the
+[encoder core's known gaps](../../architecture/encoder-core.md#known-gaps).
+Per-call setup costs about 70 instructions more than on main: empty input
+compresses 3.7% slower in the median, the 44-byte text 2-6% slower at
+levels -5 to 10 (and 2-3% faster above). The lazy loop's block-relative
+positions, kept because they make Alice faster with reused contexts, cost
+incompressible data at the row levels through register pressure: random
+64 KiB 3-11% at levels 7-10 (level 10 0.889), random 1 MiB 2-3%.
 
 ## Measurement contract
 
 | Setting | Recorded value |
 | --- | --- |
-| Host | Intel Core i7-13700KF, x86_64, WSL2 |
-| Affinity | One single-threaded process pinned to logical CPU 2; the decoder sweep ran at the same time on logical CPU 6 |
-| Rust | rustc 1.99.0; Cargo release defaults; runtime SIMD dispatch (AVX2 here) |
-| C compiler | GCC 11.4.0; `cc` crate defaults (`-O3`) |
+| Host | AMD Ryzen 9 7950X, Linux KVM guest with two dedicated vCPUs |
+| Affinity | The working tree's Criterion process on vCPU 0 and the main branch's on vCPU 1, side by side; then the decoder suites the same way |
+| Rust | rustc 1.99.1 (LLVM 23.1.1); Cargo release defaults; runtime SIMD dispatch (AVX-512 here) |
+| C compiler | GCC 15.2.0; `cc` crate defaults (`-O3`) |
 | zstd | 1.5.7; submodule `f8745da6ff1ad1e7bab384bd1f9d742439278e99`; single-threaded, no legacy formats, no Huffman assembly |
 | Compression | Level only, complete known input, no dictionary or explicit flush |
 | API | Cold one-shot: `ZSTD_createCCtx` + `ZSTD_compress2` into a `ZSTD_compressBound` buffer against `Compressor::new(level).compress`; construction, allocation, compression and disposal timed |
-| Sampling | 20 samples; 0.2 s warmup; 0.5 s requested measurement per case; Criterion's default 100,000 bootstrap resamples; 95% confidence intervals |
-| Validation | All 192 mzstd frames byte-identical to zstd and decoded to the original input through zstd before timing |
+| Sampling | 20 samples; 0.5 s warmup; 1 s requested measurement per case; Criterion's default 100,000 bootstrap resamples; 95% confidence intervals |
+| Validation | All 192 mzstd frames of both trees byte-identical to zstd and decoded to the original input through zstd before timing |
 
 Inputs are empty, 44-byte text, `testdata/alice29.txt` (152,089 bytes), cyclic
 Alice text at 1 MiB, structured binary at 64 KiB, deterministic pseudorandom
@@ -140,25 +128,29 @@ Run from the repository root and choose a fresh baseline name for new timings.
 These options reproduce the recorded sampling settings:
 
 ```sh
-cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench encoders --locked -- --test
-taskset -c 2 cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench encoders --locked -- --save-baseline my-encoders --warm-up-time 0.2 --measurement-time 0.5 --sample-size 20 --nresamples 2000
+cargo bench --manifest-path benchmarks/comparison/Cargo.toml --bench encoders --locked --no-run
+cd benchmarks/comparison
+taskset -c 0 target/release/deps/encoders-<hash> --bench --save-baseline my-encoders --sample-size 20 --warm-up-time 0.5 --measurement-time 1 --noplot
+cd ../..
 python3 benchmarks/comparison/report.py --baseline my-encoders --csv /tmp/my-encoders.csv
 cp benchmarks/comparison/target/criterion/sizes.csv /tmp/my-encoders-sizes.csv
 ```
 
-Criterion extends slow cases to collect the requested samples. The exporter
-rejects incomplete matrices and mismatched input lengths. Export immediately
-after timing and archive `sizes.csv` with the named baseline: a later preflight
-replaces that shared manifest. The archived gzip file contains each case's
-`benchmark`, `estimates` and `sample` JSON records from Criterion.
+The [benchmark guide](../benchmarking.md#main-branch-series) describes the
+main branch's run beside it and the paired check. Criterion extends slow
+cases to collect the requested samples. The exporter rejects incomplete
+matrices and mismatched input lengths. Export immediately after timing and
+archive `sizes.csv` with the named baseline: a later preflight replaces that
+shared manifest. The archived gzip files hold each case's `benchmark`,
+`estimates` and `sample` JSON records from Criterion.
 
 Use the [benchmark guide](../benchmarking.md#encoder-comparison) to regenerate
-the checked-in pages and charts from the published CSV and environment record.
-Plotting uses Matplotlib 3.10.8 and does not rerun timings.
+the checked-in pages and charts from the published CSVs and environment
+record. Plotting uses Matplotlib 3.10.8 and does not rerun timings.
 
 ## Interpretation limits
 
-This is one complete sweep on one WSL2 host. C and mzstd run consecutively
+This is one complete sweep on one KVM guest. C and mzstd run consecutively
 for each case in a fixed order. Affinity restricts CPU migration but does not
 control frequency, thermal state or host scheduling. Confidence bounds
 do not capture every source of host or allocator variation.
@@ -166,14 +158,14 @@ do not capture every source of host or allocator variation.
 Every dataset/level pair has equal weight, regardless of input size or execution
 time. The median describes this corpus, not a production workload distribution.
 Cold APIs include allocation and allocator state; timings include the effects
-of glibc's changing mmap and trim thresholds within a process.
-
-The previous tree's sweep (`enc-before`, median 1.086×) was run earlier
-the same day with the same sampling, while nothing else ran. The change
-between the two runs is consistent with paired, process-per-case
-measurements of the same binaries, but the two sweeps are not a controlled
-before/after experiment.
+of glibc's changing mmap and trim thresholds within a process. On empty input,
+on the 1 MiB inputs and at levels 13 and above, where each call allocates
+several MiB of tables, the same case's speed / C differs between the two
+processes by up to 40% in either direction, so per-level medians of the
+two trees differ by more than their code does. The paired runs above, not the side-by-side
+medians, measure the change from main.
 
 Streaming, retained contexts and parallel compression have separate root
 benchmarks (`cargo bench --bench compress`, `--bench parallel`) and are outside
-this comparison. See the [harness specification](../../architecture/benchmarking.md).
+this comparison; [Silesia](silesia.md) measures retained contexts on large
+files. See the [harness specification](../../architecture/benchmarking.md).

@@ -5,7 +5,10 @@
 //! but it moves every following block boundary, so it is ported literally,
 //! including its integer rounding of event counts.
 
-use alloc::boxed::Box;
+use fearless_simd::Simd;
+use fearless_simd_macros::simd;
+
+use crate::Backend;
 
 use super::entropy::hist;
 
@@ -23,14 +26,14 @@ const KB: usize = 1 << 10;
 /// Event histogram of a stretch of input (`Fingerprint`).
 #[derive(Clone, Debug)]
 struct Fingerprint {
-    events: Box<[u32; HASH_TABLE_SIZE]>,
+    events: [u32; HASH_TABLE_SIZE],
     nb_events: usize,
 }
 
 impl Fingerprint {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            events: Box::new([0; HASH_TABLE_SIZE]),
+            events: [0; HASH_TABLE_SIZE],
             nb_events: 0,
         }
     }
@@ -51,8 +54,9 @@ const fn hash2<const LOG: u32>(first: u8, second: u8) -> usize {
 /// of the reference's compiled-in sampling rates and hash logs
 /// (`ZSTD_GEN_RECORD_FINGERPRINT`): with both constant, the stride is a
 /// constant and every hashed index provably fits the table.
+#[inline(always)]
 fn record<const RATE: usize, const LOG: u32>(fp: &mut Fingerprint, src: &[u8]) {
-    let events = &mut *fp.events;
+    let events = &mut fp.events;
     events[..1 << LOG].fill(0);
     for pair in src.windows(HASH_LENGTH).step_by(RATE) {
         events[hash2::<LOG>(pair[0], pair[1])] += 1;
@@ -62,23 +66,26 @@ fn record<const RATE: usize, const LOG: u32>(fp: &mut Fingerprint, src: &[u8]) {
 
 /// `fpDistance` over the first `1 << LOG` events.
 ///
-/// Event totals stay below 2^17 (one 128 KiB block), so each product is
-/// formed from two zero-extended 32-bit factors, as the reference's `S64`
-/// products are, and the loop vectorizes.
+/// At most fifteen 8191-event chunks are compared with one 8191-event
+/// chunk. Each product is below 2^30, and their total absolute difference
+/// is at most twice that product, below 2^31. Computing in 32 bits keeps
+/// the reference's exact result while doubling the vector lane count.
+#[inline(always)]
 fn distance<const LOG: u32>(fp1: &Fingerprint, fp2: &Fingerprint) -> u64 {
     let len = 1usize << LOG;
-    let nb1 = i64::from(fp1.nb_events as u32);
-    let nb2 = i64::from(fp2.nb_events as u32);
+    let nb1 = fp1.nb_events as i32;
+    let nb2 = fp2.nb_events as i32;
     fp1.events[..len]
         .iter()
         .zip(&fp2.events[..len])
-        .fold(0u64, |total, (&a, &b)| {
-            total.wrapping_add((i64::from(a) * nb2 - i64::from(b) * nb1).unsigned_abs())
-        })
+        .fold(0u32, |total, (&a, &b)| {
+            total + (a as i32 * nb2 - b as i32 * nb1).unsigned_abs()
+        }) as u64
 }
 
 /// Whether `new` deviates from `reference` enough to cut
 /// (`compareFingerprints`).
+#[inline(always)]
 fn differs<const LOG: u32>(reference: &Fingerprint, new: &Fingerprint, penalty: i32) -> bool {
     let p50 = reference.nb_events as u64 * new.nb_events as u64;
     let deviation = distance::<LOG>(reference, new);
@@ -88,6 +95,7 @@ fn differs<const LOG: u32>(reference: &Fingerprint, new: &Fingerprint, penalty: 
 
 /// `ZSTD_splitBlock_byChunks`: `level` picks the sampling rate and hash log
 /// (`records_fs`, `hashParams`).
+#[inline(always)]
 fn split_by_chunks(block: &[u8], level: usize) -> usize {
     match level {
         0 => split_by_chunks_with::<43, 8>(block),
@@ -98,6 +106,7 @@ fn split_by_chunks(block: &[u8], level: usize) -> usize {
 }
 
 /// [`split_by_chunks`] for one sampling rate and hash log.
+#[inline(always)]
 fn split_by_chunks_with<const RATE: usize, const LOG: u32>(block: &[u8]) -> usize {
     let block_size = block.len();
     debug_assert_eq!(block_size, 128 * KB);
@@ -112,7 +121,10 @@ fn split_by_chunks_with<const RATE: usize, const LOG: u32>(block: &[u8]) -> usiz
         if differs::<LOG>(&past, &new, penalty) {
             return pos;
         }
-        for (acc, &add) in past.events.iter_mut().zip(new.events.iter()) {
+        for (acc, &add) in past.events[..1 << LOG]
+            .iter_mut()
+            .zip(&new.events[..1 << LOG])
+        {
             *acc += add;
         }
         past.nb_events += new.nb_events;
@@ -125,6 +137,7 @@ fn split_by_chunks_with<const RATE: usize, const LOG: u32>(block: &[u8]) -> usiz
 }
 
 /// `ZSTD_splitBlock_fromBorders`: compares the block's ends, then its middle.
+#[inline(always)]
 fn split_from_borders(block: &[u8]) -> usize {
     let block_size = block.len();
     let mut begin = [0u32; 256];
@@ -161,7 +174,15 @@ fn split_from_borders(block: &[u8]) -> usize {
 
 /// Size of the first block to cut from a full 128 KiB `block`
 /// (`ZSTD_splitBlock`); `level` is `0..=4`.
-pub(crate) fn split_block(block: &[u8], level: usize) -> usize {
+pub(crate) fn split_block(block: &[u8], level: usize, backend: Backend) -> usize {
+    fearless_simd::dispatch!(backend.0, simd => split_block_on(simd, block, level))
+}
+
+/// Selects the block boundary inside the encoder's feature context, so
+/// histogram reductions use its native integer arithmetic.
+#[simd]
+#[inline(never)]
+fn split_block_on<S: Simd>(simd: S, block: &[u8], level: usize) -> usize {
     if level == 0 {
         return split_from_borders(block);
     }
@@ -188,17 +209,25 @@ mod tests {
     fn uniform_blocks_are_not_split() {
         let block: Vec<u8> = (0..128 * KB).map(|i| (i % 251) as u8).collect();
         for level in 0..=4 {
-            assert_eq!(split_block(&block, level), 128 * KB, "level {level}");
+            for backend in Backend::available() {
+                assert_eq!(
+                    split_block(&block, level, backend),
+                    128 * KB,
+                    "{backend} level {level}"
+                );
+            }
         }
     }
 
     #[test]
     fn a_change_of_statistics_is_found() {
         let block = two_halves();
-        assert_eq!(split_block(&block, 4), 64 * KB);
-        assert_eq!(split_block(&block, 1), 64 * KB);
-        let cut = split_block(&block, 0);
-        assert!([32 * KB, 64 * KB, 96 * KB].contains(&cut));
+        for backend in Backend::available() {
+            assert_eq!(split_block(&block, 4, backend), 64 * KB);
+            assert_eq!(split_block(&block, 1, backend), 64 * KB);
+            let cut = split_block(&block, 0, backend);
+            assert!([32 * KB, 64 * KB, 96 * KB].contains(&cut));
+        }
     }
 
     #[test]
@@ -289,12 +318,30 @@ mod tests {
         blocks.push(late);
         for (index, block) in blocks.iter().enumerate() {
             for level in 0..4 {
-                assert_eq!(
-                    split_by_chunks(block, level),
-                    reference_by_chunks(block, level),
-                    "block {index}, level {level}"
-                );
+                let expected = reference_by_chunks(block, level);
+                assert_eq!(split_by_chunks(block, level), expected);
+                for backend in Backend::available() {
+                    assert_eq!(
+                        split_block(block, level + 1, backend),
+                        expected,
+                        "{backend} block {index}, level {level}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn distance_preserves_the_largest_chunk_products() {
+        let mut past = Fingerprint::new();
+        let mut new = Fingerprint::new();
+        past.nb_events = 15 * (CHUNK_SIZE - 1);
+        new.nb_events = CHUNK_SIZE - 1;
+        past.events[0] = past.nb_events as u32;
+        new.events[1] = new.nb_events as u32;
+        let expected = 2 * past.nb_events as u64 * new.nb_events as u64;
+        assert_eq!(distance::<10>(&past, &new), expected);
+        assert_eq!(distance::<10>(&new, &past), expected);
+        assert_eq!(distance::<10>(&new, &new), 0);
     }
 }

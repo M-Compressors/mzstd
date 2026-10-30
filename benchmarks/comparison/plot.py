@@ -9,7 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from level_docs import CORPORA, ENCODERS, LEVELS, bars, level_order, load_rows, medians, save_svg
+from level_docs import CORPORA, SERIES, bars, level_order, load_rows, medians, save_svg
 
 
 def style():
@@ -20,12 +20,24 @@ def style():
     })
 
 
-def median_chart(rows, level, path):
+def grouped(ax, order, summaries, metric):
+    """Draw one bar per series at every level, side by side."""
+    series = list(summaries[order[0]])
+    width = .76 / len(series)
+    for index, encoder in enumerate(series):
+        name, color = SERIES[encoder]
+        positions = [i + (index - (len(series) - 1) / 2) * width for i in range(len(order))]
+        ax.bar(positions, [summaries[level][encoder][metric] for level in order],
+               width=width * .95, color=color, label=name)
+    ax.set_xticks(range(len(order)), [str(level) for level in order])
+
+
+def median_chart(rows, level, path, main=None):
     """Compare per-dataset relative speed and size without mixing units or weights."""
     style()
-    values = medians(rows, level)
-    names = [ENCODERS[e][0] for e in values]
-    colors = [ENCODERS[e][1] for e in values]
+    values = medians(rows, level, main)
+    names = [SERIES[e][0] for e in values]
+    colors = [SERIES[e][1] for e in values]
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
     for ax, metric, label in zip(axes, ["speed", "size"],
                                ["Median speed / C · higher is better", "Median output / C · lower is better"]):
@@ -38,19 +50,19 @@ def median_chart(rows, level, path):
     plt.close(fig)
 
 
-def render(rows, output, subtitle):
-    """Write median speed, size and paired overview bars; strongest mzstd levels first."""
+def render(rows, output, subtitle, main=None):
+    """Write median speed, size and grouped overview bars; strongest mzstd levels first."""
     output.mkdir(parents=True, exist_ok=True)
     style()
     order = level_order(rows)
-    summaries = {level: medians(rows, level) for level in order}
+    summaries = {level: medians(rows, level, main) for level in order}
     for kind, metric, label in [("throughput", "speed", "Median speed / C · higher is better"),
                                 ("size", "size", "Median output / C · lower is better")]:
         fig, axes = plt.subplots(6, 4, figsize=(16, 22))
         for ax, level in zip(axes.flat, order):
             values = summaries[level]
-            bars(ax, [ENCODERS[e][0] for e in values],
-                 [v[metric] for v in values.values()], [ENCODERS[e][1] for e in values], "", ratio=True)
+            bars(ax, [SERIES[e][0] for e in values],
+                 [v[metric] for v in values.values()], [SERIES[e][1] for e in values], "", ratio=True)
             ax.set_title(f"Level {level}")
         fig.suptitle(label + f"\nMedian across all {len(CORPORA)} datasets", fontsize=19)
         fig.text(.5, .012, subtitle + "\nEqual dataset weight · strongest mzstd median speed / C first",
@@ -61,11 +73,7 @@ def render(rows, output, subtitle):
     fig, axes = plt.subplots(2, 1, figsize=(16, 8))
     for ax, metric, label in zip(axes, ["speed", "size"],
                                ["Median speed / C · higher is better", "Median output / C · lower is better"]):
-        for index, (encoder, (name, color)) in enumerate(ENCODERS.items()):
-            positions = [i + (index - .5) * .38 for i in range(len(order))]
-            ax.bar(positions, [summaries[level][encoder][metric] for level in order],
-                   width=.36, color=color, label=name)
-        ax.set_xticks(range(len(order)), [str(level) for level in order])
+        grouped(ax, order, summaries, metric)
         ax.set_ylim(bottom=0)
         ax.set_ylabel(label)
         ax.axhline(1, color="#64748b", linestyle="--", linewidth=1)
@@ -74,7 +82,7 @@ def render(rows, output, subtitle):
     axes[1].set_xlabel("Level")
     fig.suptitle(f"Speed and size · median across all {len(CORPORA)} datasets", fontsize=19)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, .94), ncol=len(ENCODERS), frameon=False)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, .94), ncol=len(labels), frameon=False)
     fig.text(.5, .02, subtitle + "\nPer-dataset ratios to zstd C · equal weight · levels ordered by mzstd median speed / C",
              ha="center", fontsize=10)
     fig.tight_layout(rect=(0, .07, 1, .89))
@@ -87,8 +95,9 @@ def main():
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--subtitle", default="Implementation comparison")
+    parser.add_argument("--main-csv", type=Path, help="the same matrix measured on the main branch")
     args = parser.parse_args()
-    render(load_rows(args.csv), args.output, args.subtitle)
+    render(load_rows(args.csv), args.output, args.subtitle, load_rows(args.main_csv) if args.main_csv else None)
 
 
 if __name__ == "__main__":

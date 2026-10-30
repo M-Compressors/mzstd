@@ -6,29 +6,26 @@ import json
 import os
 from pathlib import Path
 
-from level_docs import (CORPORA, ENCODERS, LEVELS, bars, cases, dataset_order, level_order, load_rows,
-                        medians, save_svg, throughput)
+from level_docs import (CORPORA, ENCODERS, LEVELS, SERIES, bars, cases, dataset_order, level_order,
+                        load_rows, main_note, medians, save_svg, throughput)
 
 DECODERS = ENCODERS
 
 
-def overview_chart(rows, path, subtitle):
+def overview_chart(rows, path, subtitle, main=None):
     import matplotlib.pyplot as plt
+    from plot import grouped
 
     order = level_order(rows)
     fig, ax = plt.subplots(figsize=(16, 5))
-    for index, (decoder, (name, color)) in enumerate(DECODERS.items()):
-        positions = [i + (index - .5) * .38 for i in range(len(order))]
-        values = [medians(rows, level)[decoder]["speed"] for level in order]
-        ax.bar(positions, values, width=.36, color=color, label=name)
-    ax.set_xticks(range(len(order)), [str(level) for level in order])
+    grouped(ax, order, {level: medians(rows, level, main) for level in order}, "speed")
     ax.set_ylim(bottom=0)
     ax.set_ylabel("Median decode speed / C · higher is better")
     ax.set_xlabel("Source encoder level (zstd C)")
     ax.axhline(1, color="#64748b", linestyle="--", linewidth=1)
     ax.grid(axis="y", alpha=.18)
     ax.set_axisbelow(True)
-    ax.legend(ncol=len(DECODERS), loc="upper center", bbox_to_anchor=(.5, 1.15), frameon=False)
+    ax.legend(ncol=len(ax.get_legend_handles_labels()[1]), loc="upper center", bbox_to_anchor=(.5, 1.15), frameon=False)
     fig.suptitle(f"Decompression · median across all {len(CORPORA)} datasets", fontsize=18)
     fig.text(.5, .02, subtitle + "\nIdentical compressed inputs · equal dataset weight",
              ha="center", fontsize=10)
@@ -66,7 +63,7 @@ def level_chart(rows, level, path):
     plt.close(fig)
 
 
-def level_page(rows, level, environment, links):
+def level_page(rows, level, environment, links, main=None):
     lines = [f"# Decompression of level {level} frames", "",
              "[Decoder overview](README.md) · [Benchmark index](../README.md)", "",
              f"Recorded run: **{environment['baseline']}** ({environment['date']}).",
@@ -78,8 +75,10 @@ def level_page(rows, level, environment, links):
              "Higher is faster; 1× matches C. No confidence interval",
              "is inferred for this across-dataset median.", "",
              "| Decoder | Median speed / C |", "| --- | ---: |"]
-    for decoder, value in medians(rows, level).items():
-        lines.append(f"| {DECODERS[decoder][0]} | {value['speed']:.3f}× |")
+    for decoder, value in medians(rows, level, main).items():
+        lines.append(f"| {SERIES[decoder][0]} | {value['speed']:.3f}× |")
+    if main:
+        lines += ["", main_note(environment)]
     lines += ["", f"![Decompression by dataset at source level {level}](charts/l{level}.svg)", "",
               "Datasets are ranked by mzstd speed relative to C, highest first.",
               "Throughput counts restored bytes; empty input has latency only. Whiskers and intervals",
@@ -100,11 +99,16 @@ def level_page(rows, level, environment, links):
             lines.append(f"| {DECODERS[row['implementation']][0]} | {row['mean_ns'] / 1000:,.4g} | "
                          f"{row['mean_lower_ns'] / 1000:,.4g}–{row['mean_upper_ns'] / 1000:,.4g} | "
                          f"{speed} | {reference / row['mean_ns']:.3f}× |")
+        if main:
+            c, own = cases(main, level, corpus)
+            lines.append(f"| mzstd main (separate run) | {own['mean_ns'] / 1000:,.4g} | "
+                         f"{own['mean_lower_ns'] / 1000:,.4g}–{own['mean_upper_ns'] / 1000:,.4g} | "
+                         f"{f'{throughput(own):,.2f}' if length else '—'} | {c['mean_ns'] / own['mean_ns']:.3f}× |")
         lines.append("")
     return "\n".join(lines)
 
 
-def generate(rows, environment, output, sources):
+def generate(rows, environment, output, sources, main=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -117,7 +121,7 @@ def generate(rows, environment, output, sources):
     charts.mkdir(exist_ok=True)
     links = [Path(os.path.relpath(path.resolve(), output.resolve())).as_posix() for path in sources]
     overview_chart(rows, charts / "overview.svg",
-                   f"{environment['cpu']} · {environment['date']} · {environment['sampling']['samples']} samples")
+                   f"{environment['cpu']} · {environment['date']} · {environment['sampling']['samples']} samples", main)
     lines = ["# Decoder comparison", "", "[Benchmark index](../README.md)", "",
              f"Recorded run: **{environment['baseline']}** ({environment['date']}).",
              f"[CSV]({links[0]}) · [Environment]({links[1]}) · [Methodology and limits]({links[2]}).", "",
@@ -128,10 +132,12 @@ def generate(rows, environment, output, sources):
              "Both decoders restore identical C-written frames. The level is an encoder setting,",
              "not a decoder setting. Compressed sizes and ratios are properties of those shared inputs,",
              "so there is no decoder size ranking.", "",
-             "| Source level | zstd C | mzstd |", "| --- | ---: | ---: |"]
+             *([main_note(environment), ""] if main else []),
+             "| Source level | " + " | ".join(SERIES[d][0] for d in medians(rows, LEVELS[0], main)) + " |",
+             "| --- |" + " ---: |" * len(medians(rows, LEVELS[0], main))]
     for level in level_order(rows):
-        values = medians(rows, level)
-        lines.append(f"| [{level}](l{level}.md) | " + " | ".join(f"{values[d]['speed']:.3f}×" for d in DECODERS) + " |")
+        values = medians(rows, level, main)
+        lines.append(f"| [{level}](l{level}.md) | " + " | ".join(f"{v['speed']:.3f}×" for v in values.values()) + " |")
     lines += ["", "Open a source level for all datasets, compressed/restored byte counts,",
               "mean latency, confidence bounds and throughput. Measurements include cold construction,",
               "allocation, decoding and disposal. C receives the frame's declared output capacity.",
@@ -139,7 +145,7 @@ def generate(rows, environment, output, sources):
     (output / "README.md").write_text("\n".join(lines))
     for level in LEVELS:
         level_chart(rows, level, charts / f"l{level}.svg")
-        (output / f"l{level}.md").write_text(level_page(rows, level, environment, links))
+        (output / f"l{level}.md").write_text(level_page(rows, level, environment, links, main))
 
 
 def main():
@@ -148,10 +154,12 @@ def main():
     parser.add_argument("--environment", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--main-csv", type=Path, help="the same matrix measured on the main branch")
     args = parser.parse_args()
     rows = load_rows(args.csv, decoding=True)
+    main = load_rows(args.main_csv, decoding=True) if args.main_csv else None
     environment = json.loads(args.environment.read_text())
-    generate(rows, environment, args.output, [args.csv, args.environment, args.report])
+    generate(rows, environment, args.output, [args.csv, args.environment, args.report], main)
     print(f"Generated decoder overview, {len(LEVELS)} level pages and {len(LEVELS) + 1} SVGs from {len(rows)} measurements.")
 
 
