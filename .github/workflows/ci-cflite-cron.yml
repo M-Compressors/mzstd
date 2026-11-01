@@ -16,8 +16,9 @@ jobs:
   batch:
     name: batch fuzzing
     runs-on: ubuntu-latest
-    # GitHub-hosted jobs stop at six hours, image and fuzzer builds included;
-    # 5.5 hours of fuzzing leaves room for the build and the corpus upload.
+    # GitHub-hosted jobs stop at six hours, image and fuzzer builds included.
+    # The build takes up to 30 minutes, so 5 hours of fuzzing leaves room for
+    # it and the corpus uploads; 5.5 hours ran into the limit.
     timeout-minutes: 360
     steps:
       - name: build fuzzers
@@ -29,7 +30,7 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 19800
+          fuzz-seconds: 18000
           mode: batch
           sanitizer: address
           language: rust
@@ -55,9 +56,12 @@ jobs:
           # Each target's merge must finish within its share of this budget,
           # which starts at an even split and grows by what earlier targets
           # leave unused. Merging a day's corpus at batch speed takes about an
-          # hour in total and over ten minutes for the slowest targets
-          # (compressor_lifecycle, parallel); 600 s timed out on the first.
-          fuzz-seconds: 10800
+          # hour in total. `parallel` is the slowest, about 4 inputs a second,
+          # since each input compresses nine times: 3387 inputs outgrew the
+          # 812 s share 10800 s gave it. 18000 s gives it about 1370 s and,
+          # with the build of up to 35 minutes, stays inside the job limit
+          # even if every target used its whole share.
+          fuzz-seconds: 18000
           mode: prune
           language: rust
 

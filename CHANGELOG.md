@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **The daily ClusterFuzzLite jobs fit their budgets again.** Corpus
+  pruning timed out merging the `parallel` target's corpus: 3387 inputs,
+  at about four a second, outgrew the 812 s share that 10800 s gave it.
+  Pruning now gets 18000 s, about 1370 s for `parallel`. Batch fuzzing gets
+  5 hours instead of 5.5, which together with a build of up to 30 minutes
+  ran into the six-hour job limit and got the job cancelled. The published
+  crate is unchanged.
+
 ## [v0.2.9](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.9) - 2026-10-30
 
 - **Session API in `mzstd-ffi`.** C callers can now compress and

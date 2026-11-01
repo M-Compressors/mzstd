@@ -110,9 +110,9 @@ sequenceDiagram
     PR->>CF: build (address), run code-change, 600 s
     Store-->>CF: latest corpus and coverage report
     CF-->>PR: job fails on a crash, with the reproducer
-    Cron->>CF: batch: build (address), fuzz 19800 s, targets in parallel
+    Cron->>CF: batch: build (address), fuzz 18000 s, targets in parallel
     CF->>Store: grown corpus, crashes
-    Cron->>CF: prune: minimize corpus, 10800 s
+    Cron->>CF: prune: minimize corpus, 18000 s
     CF->>Store: pruned corpus
     Cron->>CF: coverage: build (coverage), report
     CF->>Store: coverage report
@@ -128,15 +128,21 @@ the targets it runs.
 In `ci-cflite-cron.yml` the jobs are chained: pruning follows batch fuzzing
 (ClusterFuzzLite requires pruning whenever batch fuzzing runs), and coverage
 follows pruning, so the report reflects the pruned corpus. A failed batch job
-still lets pruning and coverage run. Batch fuzzing gets 5.5 hours, shared by
+still lets pruning and coverage run. Batch fuzzing gets 5 hours, shared by
 all targets, which run side by side on the runner's cores
 (`parallel-fuzzing: true`); the job's six-hour limit leaves the rest for the
-image and fuzzer builds and the corpus upload. Pruning gets 10800 seconds.
-Each target's merge must finish within its share of that budget: an even
-split at the start, growing by whatever earlier targets leave unused. A
-day's corpus takes about an hour to merge at batch speed, and the slowest
-targets (`compressor_lifecycle`, `parallel`) take over ten minutes each.
-With 600 seconds the first target timed out and none were pruned. Every
+image and fuzzer builds (up to 30 minutes) and the corpus uploads. With 5.5
+hours the job hit the limit on days the build was slow. Pruning gets 18000
+seconds, which with a build of up to 35 minutes fits the job's limit even if
+every target used its whole share. Each target's merge must finish within its
+share of that budget: an even split at the start, growing by whatever earlier
+targets leave unused. A day's corpus takes about an hour to merge at batch
+speed. `parallel` is the slowest, at about four inputs a second, since each
+input compresses nine times, and a quarter of the inputs are at levels 16
+to 22, which take over half the time. Its corpus
+grows by about 150 inputs a day: at 3387 inputs it outgrew the 812-second
+share that 10800 seconds gave it, and 18000 seconds give it about 1370. With
+600 seconds the first target timed out and none were pruned. Every
 `run_fuzzers` step sets `language: rust`, because the action defaults to
 C++.
 
