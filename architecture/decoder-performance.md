@@ -281,9 +281,16 @@ flowchart TD
   `read_header_on` to `fill_rows_on`; table construction therefore uses
   the selected target features without detecting the CPU per table or row.
   Dictionary parsing outside a block selects its backend once per table.
+  `read_header_on` is `#[inline(never)]`. Being generic over the token, it
+  was otherwise inlined into the block decoder that also holds the
+  sequence loop, and with AVX-512 in the baseline the loop's code then took
+  9% more instructions per decode (1645.0M against 1498.0M on silesia.tar
+  at `--fast=1`) and 8-12% more time at every level. Portable builds were
+  unaffected.
 - `Executor<const GROW: bool>`: fixed outputs (`decompress_to_slice`,
   streaming `History`) compile to the loop above with `execute_exactly`
-  inline and cold. Growing outputs (`VecOutput`, `UninitOutput`) leave the
+  inline and cold, and so does `UninitOutput`, which zeroes a block's room
+  before the block. Growing outputs (`VecOutput`) leave the
   loop with any sequence the wildcopies cannot take (no room for the
   overlength, a match before the output or past the window); the cold
   part of `SequenceTables::execute` appends it when it is at least
@@ -493,6 +500,19 @@ zeroing each block's room at once
 | `-9` | 1468 | 1612 | 1616 | 1694 |
 | `-19` | 1363 | 1456 | 1470 | 1535 |
 
+Keeping `read_header_on` out of line (the "fix" columns; same host,
+three interleaved rounds, best of 18 decodes per value) then made the
+native build faster than the portable one at every level:
+
+| level | v0.2.5 native | v0.2.10 native | fix native | v0.2.10 portable | fix portable |
+| --- | --- | --- | --- | --- | --- |
+| `--fast=5` | 2314 | 2313 | 2594 | 2443 | 2455 |
+| `--fast=1` | 2042 | 2061 | 2301 | 2192 | 2197 |
+| `-1` | 1343 | 1625 | 1765 | 1724 | 1708 |
+| `-3` | 1253 | 1486 | 1654 | 1597 | 1591 |
+| `-9` | 1354 | 1630 | 1766 | 1713 | 1705 |
+| `-19` | 1315 | 1463 | 1614 | 1552 | 1556 |
+
 Portable builds never run the serial loop (their block loops use AVX2), so
 their gain is the zeroing alone. With the zeroing held fixed, the serial
 loop takes level `-1` from 1372 to 1622 MB/s in the native build and leaves
@@ -505,12 +525,16 @@ which already matches the reference's 21 GB/s.
 
 ## Known gaps
 
-- With AVX-512 in the compile-time baseline (`-C target-cpu=native` on a
-  Ryzen 9 7950X), `mzstd_decompress` still decodes silesia.tar about 5%
-  slower than a portable build of the same source at every level (see
-  [Measurements](#measurements)): the serial pair loop gives up the
-  lockstep loop's interleaving, and the whole decoder is compiled with
-  AVX-512 enabled, which no dispatch can take back.
+- The block decoder inlines the whole sequence loop, and its code moves
+  with whatever else is inlined into it: v0.2.9's generic
+  `read_header_on` cost 8-12% in AVX-512 builds alone. Check changes to
+  `block`, `literals` and `sequences` with `-C target-cpu=native` as well
+  as a portable build, by instruction counts per decode as well as time.
+- On a Zen 4 EPYC 9554, lzbench measured v0.2.10 8% slower than 0.2.5 at
+  the `--fast` levels and within 3% at levels 1-19 (inikep/lzbench#363);
+  the same EPYC already measured 0.2.6's per-block zeroing 1-3% slower
+  than 0.2.5's whole-destination zeroing, the reverse of the Ryzen 9
+  7950X. The out-of-line `read_header_on` is not yet measured there.
 
 - Literal-heavy inputs decode slowest against the reference: Silesia x-ray
   at level 1 0.85x ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30,

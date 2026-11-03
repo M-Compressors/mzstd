@@ -1,5 +1,20 @@
 # Changelog
 
+## [v0.2.11](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.11) - 2026-11-03
+
+- **Native builds decode 8-12% faster.** With AVX-512 in the compile-time
+  baseline (`-C target-cpu=native` on Zen 4, as lzbench builds), 0.2.9's
+  generic `read_header_on` was inlined into the block decoder that also
+  holds the sequence loop, and the loop's code took 9% more instructions
+  (silesia.tar at `--fast=1`: 1645.0M against 1498.0M per decode, with
+  the same branches). The header parser is now kept out of line. Through
+  `mzstd_decompress` on silesia.tar (Ryzen 9 7950X, fat LTO, best of 18),
+  native builds decode 12% faster at `--fast=5` and `--fast=1`, 9% at `-1`
+  and `-9`, 11% at `-3` and 10% at `-19`, ahead of 0.2.5 by 12-32% and
+  now ahead of portable builds by 3-6%. Portable builds are unchanged
+  (within 1%). This is the `--fast` slowdown lzbench still measured with
+  0.2.10 (inikep/lzbench#363). Output and errors are unchanged.
+
 ## [v0.2.10](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.10) - 2026-11-03
 
 - **`mzstd_decompress` and `decompress_to_uninit` are fast again with
