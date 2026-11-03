@@ -51,6 +51,16 @@ vectorized the four Huffman streams' independent lookups across lanes
 a pair loop written as the reference's took 101.8 µs on Alice level 1
 compiled for AVX-512 against 87.2 µs for AVX2 (Ryzen 9 7950X).
 
+That choice cannot hold where AVX-512 is in the compile-time baseline
+(`-C target-cpu=native` on Zen 4 or Ice Lake and later, as lzbench
+builds): `fearless_simd::dispatch!` promotes every level to `Avx512`
+there (`Level::__dispatch_target`), and target features can only be added,
+so the block loops always see AVX-512. `HuffmanTable::decode_streams` and
+`decode_streams_shared` therefore also ask their own feature context
+(`serial`, folded per backend) and, given AVX-512, decode the fixed-buffer
+pair loop one stream at a time (`pair_rounds_serial`, see
+[Huffman literals](#huffman-literals)), which the compiler leaves scalar.
+
 ## Bit readers
 
 ```mermaid
@@ -113,9 +123,12 @@ flowchart TD
     Fast -->|yes| Sel{prefers_pairs: HUF_selectDecoder}
     Sel -->|X1| Single[single_rounds: 5 symbols per stream per round, 4 if 12-bit tree]
     Sel -->|X2, tree up to 11 bits| Fixed{buffer of FIXED_OUT bytes?}
-    Fixed -->|yes| PairsFixed[build_pairs if stale; pair_rounds_fixed: one masked position per stream, streams 1-3 interleaved, stream 4 with the refills]
+    Fixed -->|yes| Avx{AVX-512 features?}
+    Avx -->|no| PairsFixed[build_pairs if stale; pair_rounds_fixed: one masked position per stream, streams 1-3 interleaved, stream 4 with the refills]
+    Avx -->|yes| PairsSerial[build_pairs if stale; pair_rounds_serial: one stream at a time, each refill behind a branch]
     Fixed -->|no| Pairs[build_pairs if stale; pair_rounds: per-round windows, streams 1-3 interleaved, then stream 4]
     PairsFixed --> Back
+    PairsSerial --> Back
     Single --> Back[Sentinels back to containers]
     Pairs --> Back
     Back --> Tails[decode_tail per stream: exact end check]
@@ -180,6 +193,22 @@ flowchart TD
   `olimit` five symbols per affordable round), so no round counter is
   live. On Alice level 1 the round executes 242 instructions instead of
   295 (the reference: 221), and decoding takes 2.6% less time.
+- `pair_rounds_serial` replaces `pair_rounds_fixed` in AVX-512 feature
+  contexts. Given AVX-512, LLVM's SLP vectorizer packs the lockstep loop's
+  four branch-free containers into one `ymm` register: one `vpsrlq` makes
+  four lookup indices, `vpgatherqd` loads four rows, `vpsllvq` consumes
+  them, every row is extracted again for its scalar store, and the four
+  refills become a `vpgatherqq`. That runs the four streams as one
+  dependency chain through the gathers. The serial loop runs the same
+  rounds with the same bounds over the same masked positions, but each
+  stream makes its five lookups and then refills with `Sentinel::reload`,
+  whose bounds test is a branch the compiler cannot remove (the clamp in
+  `reload_within` lets it prove every refill in bounds, which merges the
+  four streams into one basic block). Each stream's chain then ends its own
+  block, SLP cannot pack them, and the processor still overlaps the four
+  chains. With `-C target-cpu=native` on a Ryzen 9 7950X the decoder then
+  has no gather left, and silesia.tar at level `-1` decodes 18% faster
+  (see [Measurements](#measurements)).
 - A code of `b` bits fills a run of `1 << (11 - b)` pair rows whose `j`th
   row continues with the code at row `j << b`, the same series for every
   code of that length (the reference's `HUF_fillDTableX2Level2` per rank).
@@ -337,7 +366,7 @@ flowchart LR
     Direct -->|yes| Slice[SliceOutput: frame cut at its declared end]
     Direct -->|no, or any error| Session[incremental session over History]
     ToUninit[decompress_to_uninit] --> DirectU{decode_to_uninit: same test}
-    DirectU -->|yes| Uninit[UninitOutput: BorrowedBuf zeroed 4 KiB at a time on demand, cut at the declared end]
+    DirectU -->|yes| Uninit[UninitOutput: BorrowedBuf zeroed a block's room before each compressed block, cut at the declared end]
     DirectU -->|no, or any error| SessionU[process_uninit over History]
     Into[decompress / decompress_into] --> Cut[decode_all: VecOutput, declared frames cut at their end]
     Cut -->|any error| Uncut[reset, rerun with VecOutput uncut: defines the error]
@@ -381,16 +410,16 @@ flowchart TD
 - Raw and RLE blocks are appended in one pass (`Output::place`):
   `extend_from_slice` or `resize` with the run byte write straight into spare
   capacity. Compressed blocks write through `BlockOutput` (`block.rs`): the
-  buffer's initialized prefix, which `VecOutput` and `UninitOutput` extend
-  on demand (`grow`, 4 KiB of zeros at a time, up to the block's room cut
-  at the frame's end) and `VecOutput` also by `append` (cut at the
+  buffer's initialized prefix, which `VecOutput` extends on demand
+  (`grow`, 4 KiB of zeros at a time, up to the block's room cut at the
+  frame's end) and by `append` (cut at the
   output's end, then `extend_from_slice` for the literals and doubling
   `extend_from_within` for the match). Sequences of 1 KiB or more, a
   block's trailing literals and literal-only blocks are therefore written
   once; shorter sequences still need zeroed room for the wildcopies' 32
   bytes of overlength, since safe Rust cannot hand the decoder
-  uninitialized memory. Caller slices and `History` are fixed
-  (`grows() == false`).
+  uninitialized memory. Caller slices, `UninitOutput` and `History` are
+  fixed (`grows() == false`).
 
 ```mermaid
 flowchart TD
@@ -402,8 +431,10 @@ flowchart TD
     Append --> Loop
     Exact --> Loop
 ```
-- `UninitOutput` is `SliceOutput` over a `BorrowedBuf`: it zeroes its
-  prefix on demand, 4 KiB at a time (cut at the frame's end), and `place` writes raw and RLE blocks once, over the zeroed
+- `UninitOutput` is `SliceOutput` over a `BorrowedBuf`: `reserve` zeroes a
+  compressed block's whole room (cut at the frame's end) before the block,
+  which then runs the fixed sequence loop, and `place` writes raw and RLE
+  blocks once, over the zeroed
   bytes and then appended. See
   [uninitialized output](decoder-uninit-output.md).
 - `decompress_to_slice` tries the direct path and, when a frame has no
@@ -444,12 +475,42 @@ instructions per sequence against the reference's 125, mostly bounds
 checks and bit-count masks) and the pair Huffman loop; the loop has since
 reached the reference's count (see the known gaps).
 
+`mzstd_decompress` over silesia.tar (211,957,760 bytes, streams from the
+zstd 1.5.7 CLI with `-T1`), best of six one-shot calls into a reused
+destination, one pinned core of a Ryzen 9 7950X, cdylibs with fat LTO and
+one codegen unit, MB/s averaged over two interleaved rounds (2026-11-03).
+"native" is `-C target-cpu=native`, as lzbench builds; "portable" is the
+default target. "before" is v0.2.9; "after" adds `pair_rounds_serial` and
+zeroing each block's room at once
+([uninitialized output](decoder-uninit-output.md)):
+
+| level | native before | native after | portable before | portable after |
+| --- | --- | --- | --- | --- |
+| `--fast=5` | 2105 | 2302 | 2292 | 2448 |
+| `--fast=1` | 1881 | 2050 | 2080 | 2196 |
+| `-1` | 1296 | 1622 | 1631 | 1707 |
+| `-3` | 1317 | 1490 | 1515 | 1571 |
+| `-9` | 1468 | 1612 | 1616 | 1694 |
+| `-19` | 1363 | 1456 | 1470 | 1535 |
+
+Portable builds never run the serial loop (their block loops use AVX2), so
+their gain is the zeroing alone. With the zeroing held fixed, the serial
+loop takes level `-1` from 1372 to 1622 MB/s in the native build and leaves
+the other levels within 1.5%.
+
 XXH64 checksums are not vectorized: each of its four lanes is a serial
 multiply-rotate-multiply chain, and AVX2 has no 64-bit vector multiply. A
 `u64x4` kernel measured 11.8 GB/s against 20.9 GB/s for the scalar code,
 which already matches the reference's 21 GB/s.
 
 ## Known gaps
+
+- With AVX-512 in the compile-time baseline (`-C target-cpu=native` on a
+  Ryzen 9 7950X), `mzstd_decompress` still decodes silesia.tar about 5%
+  slower than a portable build of the same source at every level (see
+  [Measurements](#measurements)): the serial pair loop gives up the
+  lockstep loop's interleaving, and the whole decoder is compiled with
+  AVX-512 enabled, which no dispatch can take back.
 
 - Literal-heavy inputs decode slowest against the reference: Silesia x-ray
   at level 1 0.85x ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30,

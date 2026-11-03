@@ -126,8 +126,9 @@ decoder then reads earlier output as history and its 16- and 32-byte copies
 may read bytes ahead of what they have written. `decompress_to_uninit` keeps
 that direct path with `UninitOutput`, which wraps `dst` in a `BorrowedBuf`.
 The buffer's filled prefix is what the decoder may see. It is grown with
-zeros (`BorrowedCursor::append_fill`) only just ahead of the decoder and
-never past the current frame's declared end.
+zeros (`BorrowedCursor::append_fill`) one compressed block's room at a
+time, just before that block, and never past the current frame's declared
+end.
 
 ```mermaid
 flowchart TD
@@ -154,19 +155,24 @@ stateDiagram-v2
 
 - `begin_frame` accepts a frame only with a declared size that fits in the
   rest of `dst`, as `SliceOutput` does, and records `frame_end`.
-- `reserve(block_max)` zeroes nothing: it bounds the block's room at
-  `min(filled + block_max + WILDCOPY_OVERLENGTH, frame_end)` and hands the
-  block itself over as its `BlockOutput`. The sequence loop then extends
-  the zeroed prefix on demand (`grow`, 4 KiB at a time, never past that
-  bound) as it reaches the prefix's end, and the block's trailing literals
-  are written through `put`. Each byte is zeroed at most once, and only
-  inside a frame whose size is declared, so on success nothing past
-  `written` has been written. The cut is at most a block plus the copies'
-  overlength, where `SliceOutput` hands over the whole frame; decoded
-  bytes are the same, and a block that would pass `frame_end` fails
-  `OutputFull` either way. Unlike `VecOutput`, it cannot append long
-  sequences without zeroing them first: `BorrowedBuf` cannot read its
-  filled part while appending to it.
+- `reserve(block_max)` extends the zeroed prefix to the block's room,
+  `min(filled + block_max + WILDCOPY_OVERLENGTH, frame_end)`, and hands
+  the output over as the block's `BlockOutput`. Its `grows()` is `false`
+  and `grow` never extends it, so the sequence loop runs the fixed
+  `Executor::<false>` over the room, as for `decompress_to_slice`, with no
+  stops for more room, and the block's trailing literals are written
+  through `put`. Bytes zeroed for an earlier block's room are not zeroed
+  again, so each byte is zeroed at most once, and only inside a frame whose
+  size is declared: on success nothing past `written` has been written.
+  The cut is at most a block plus the copies' overlength, where
+  `SliceOutput` hands over the whole frame; decoded bytes are the same, and
+  a block that would pass `frame_end` fails `OutputFull` either way.
+  Unlike `VecOutput`, it cannot append long sequences without zeroing them
+  first: `BorrowedBuf` cannot read its filled part while appending to it.
+- v0.2.7 to v0.2.9 zeroed the room 4 KiB at a time as the growing sequence
+  loop reached it. A whole block's room fits in the second-level cache, and
+  the fixed loop needs no room tests: `mzstd_decompress` over silesia.tar
+  decodes 5-9% faster with the room zeroed at once (see Measurements).
 - `place` writes raw and RLE blocks in one pass: bytes already zeroed for an
   earlier `reserve` are overwritten through `filled_mut`, the rest is
   appended (`BorrowedCursor::append` or `append_fill` with the run byte). A
@@ -208,6 +214,17 @@ random data (raw blocks, never zeroed). Streaming `process_uninit` over 4 MiB
 of mixed data took 2.83 ms, against 2.81 ms for `process`; `process` itself
 was unchanged from before this path existed (2.84 ms → 2.81 ms).
 
+Through `mzstd_decompress`, silesia.tar (211,957,760 bytes; streams from
+the zstd 1.5.7 CLI with `-T1`), best of six one-shot calls into a reused,
+already-touched destination, one pinned core of a Ryzen 9 7950X, cdylib
+built with `-C target-cpu=native`, fat LTO and one codegen unit
+(2026-11-03): zeroing each block's room at once instead of 4 KiB at a time
+decoded 2,326 MB/s instead of 2,131 at `--fast=5` (+9.1%), 2,058 instead
+of 1,915 at `--fast=1`, 1,372 instead of 1,307 at `-1`, 1,421 instead of
+1,340 at `-3`, 1,600 instead of 1,495 at `-9` and 1,475 instead of 1,391 at
+`-19` (the Huffman change in [decoder performance](decoder-performance.md)
+held fixed).
+
 ## Verification
 
 - `tests/decoder_uninit.rs`: `process_uninit` alone and alternating with
@@ -221,7 +238,8 @@ was unchanged from before this path existed (2.84 ms → 2.81 ms).
   where the direct path gives up midway), truncated, empty and trailing input,
   and an output limit. The dictionary one-shot is covered as well.
 - Unit tests: `history` (`Sink` delivery into an offset of an uninitialized
-  slice) and `stream` (`UninitOutput` zeroing bounds, `place` across and past
+  slice) and `stream` (`UninitOutput` zeroing each block's room up to the
+  frame's end without growing, `place` across and past
   the zeroed prefix, `decode_to_uninit` sentinels, `process_uninit` delivery).
 - AFL: `decode_streaming`, `decode_roundtrip` and `decode_dictionary` drive
   sessions alternating `process` and `process_uninit` and check that nothing
@@ -230,9 +248,8 @@ was unchanged from before this path existed (2.84 ms → 2.81 ms).
 
 ## Known gaps
 
-- `decompress_to_uninit` zeroes compressed blocks' output, 4 KiB at a
-  time just ahead of the sequence loop, before decoding into it, so those
-  bytes are written twice. Safe code cannot hand the decoder memory it has
+- `decompress_to_uninit` zeroes compressed blocks' output, a block's room
+  at a time, before decoding into it, so those bytes are written twice. Safe code cannot hand the decoder memory it has
   not initialized, and `BorrowedBuf` cannot read its filled part while
   appending, so the appends `decompress` uses for long sequences are not
   available here. Raw and RLE blocks are written once.

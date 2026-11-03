@@ -58,7 +58,7 @@ run --lib \
     compressor::core::output::tests::uninit_output_keeps_written_bytes_when_it_grows \
     compressor::core::output::tests::uninit_output_stops_at_its_capacity \
     compressor::core::output::tests::destinations_copy_and_expose_their_tails \
-    decompressor::core::stream::tests::uninit_output_zeroes_on_demand_within_the_block_and_frame \
+    decompressor::core::stream::tests::uninit_output_zeroes_each_block_room_within_the_frame \
     decompressor::core::stream::tests::uninit_output_places_raw_and_rle_blocks_over_and_past_the_zeroed_prefix \
     decompressor::core::stream::tests::decode_to_uninit_writes_nothing_past_the_output
 

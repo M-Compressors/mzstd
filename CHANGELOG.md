@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## [v0.2.10](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.10) - 2026-11-03
+
+- **`mzstd_decompress` and `decompress_to_uninit` are fast again with
+  `-C target-cpu=native`.** lzbench builds that way, and there 0.2.9
+  decoded silesia.tar 2-15% slower than 0.2.5 on a Zen 4 EPYC
+  (inikep/lzbench#363). Two separate causes:
+  - With AVX-512 in the compile-time baseline, `fearless_simd` dispatches
+    every level as AVX-512, so the 0.2.9 switch to AVX2 features for the
+    block loops never took effect, and the compiler packed the
+    fixed-buffer Huffman pair loop's four streams into gathers. In
+    AVX-512 contexts that loop now decodes one stream at a time, each
+    refill behind a branch (`pair_rounds_serial`). The decoder then
+    contains no gathers.
+  - Since 0.2.7, uninitialized one-shot output was zeroed 4 KiB at a time
+    by a sequence loop that stopped for more room. Each compressed
+    block's room is now zeroed before the block, still at most once and
+    never past the frame's declared end, so the block runs the same fixed
+    loop as `decompress_to_slice`.
+
+  Measured through `mzstd_decompress` on silesia.tar, one core of a
+  Ryzen 9 7950X, fat LTO, best of six. Native builds are 9% faster at
+  `--fast=5` and `--fast=1`, 25% at `-1`, 13% at `-3`, 10% at `-9` and 7%
+  at `-19`. That is level with 0.2.5 at the `--fast` levels and 13-24%
+  ahead of it at levels 1-19. Portable builds gain 4-7% from the zeroing
+  alone. A native build still decodes about 5% slower than a portable one
+  (see the decoder performance known gaps). Output and errors are
+  unchanged.
 
 - **The daily ClusterFuzzLite jobs fit their budgets again.** Corpus
   pruning timed out merging the `parallel` target's corpus: 3387 inputs,
