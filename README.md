@@ -78,12 +78,21 @@ capacity from the frame header.
 
 </details>
 
+### External benchmarks
+
+- [lzbench](https://github.com/inikep/lzbench)
+- [TurboBench](https://github.com/powturbo/TurboBench)
+
+## Usage
+
+### Install
+
 ```toml
 [dependencies]
 mzstd = "0.2"
 ```
 
-## Usage
+### Examples
 
 ```rust
 use mzstd::{Compressor, Decompressor, EncoderConfig, Level};
