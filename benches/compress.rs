@@ -13,7 +13,9 @@
 //! long literal and match lengths), synthetic text and structured binary,
 //! random bytes, and a 64-byte prefix that isolates per-call cost.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use hotpath::criterion::{
+    BenchmarkId, Config, Criterion, Throughput, criterion_group, criterion_main,
+};
 use mzstd::{Compressor, EncoderConfig, EncoderStatus, InputSize, Level, Operation};
 use std::hint::black_box;
 use std::mem::MaybeUninit;
@@ -261,7 +263,7 @@ fn uninit_output(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10);
+    config = Config::default().sample_size(10);
     targets = compress, streaming, uninit_output
 }
 criterion_main!(benches);

@@ -322,6 +322,24 @@ for regressions, and report intervals and noisy cases alongside improvements.
     valgrind -q --tool=callgrind --instr-atstart=no \
     target/release/examples/profile_compressor testdata/alice29.txt
   ```
+- **Criterion benchmarks per stage.** `benches/compress.rs` and
+  `benches/decompress.rs` import Criterion through `hotpath::criterion`, so
+  they can produce the same reports. With `HOTPATH_CRITERION_ITERATIONS` set,
+  one benchmark id runs exactly that many times in Criterion's test mode and
+  writes one hotpath report; without it, `cargo bench` is unchanged. The
+  bench's setup and byte-identity checks run before the profiler starts:
+
+  ```sh
+  HOTPATH_CRITERION_ITERATIONS=200 cargo bench --locked --bench decompress --features hotpath-alloc \
+    -- --test --exact decompress/text-4MiB/level-3/mzstd
+  ```
+
+  The `hotpath criterion` workflow runs the ids listed in its matrix this way,
+  in merged mode, as one hotpath Cloud series each. Adding an id takes one
+  matrix entry (series, bench target, Criterion id and iteration count) and
+  one entry in the `criterion` matrix of `hotpath-relay.yml`. A group's
+  `config` names `hotpath::criterion::Config`, the plain Criterion type, since
+  the adapter's `Criterion` wrapper has no `default()`.
 - **Code.** `cargo asm --lib --release '<symbol>'` shows what a kernel compiled
   to; the SIMD-dispatched kernels appear as `vectorize_avx2::<…::{closure}>`
   symbols.

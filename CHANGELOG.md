@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **hotpath 0.31 and Criterion benchmarks on hotpath Cloud**, ported from
+  mbrotli. The optional `hotpath` dependency is updated to 0.31.0, whose
+  Callgrind mode leaves the profiler's own overhead out of the instruction
+  counts. `benches/compress.rs` and `benches/decompress.rs` now import
+  Criterion through `hotpath::criterion` (a `hotpath` dev-dependency with
+  `criterion-0-8`); `cargo bench` behaves as before unless
+  `HOTPATH_CRITERION_ITERATIONS` is set. The new `hotpath criterion` workflow
+  runs `compress/text-1MiB/mzstd/3` and `decompress/text-4MiB/level-3/mzstd`
+  in merged mode and uploads each as its own hotpath Cloud series, pull
+  requests through `hotpath-relay.yml`, which now uses
+  `hotpath-rs/hotpath-relay` v1.0.0 directly. The published crate is
+  unchanged.
+
 ## [v0.2.11](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.11) - 2026-11-03
 
 - **Native builds decode 8-12% faster.** With AVX-512 in the compile-time

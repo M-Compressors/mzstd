@@ -11,7 +11,9 @@
 //! trained dictionary, each decoder holding the dictionary already parsed,
 //! and a small-frame group the same records compressed without one.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use hotpath::criterion::{
+    BenchmarkId, Config, Criterion, Throughput, criterion_group, criterion_main,
+};
 use mzstd::dictionary::DecodeDictionary;
 use mzstd::{DecodeOperation, DecodeProgress, DecoderSession, DecoderStatus, Decompressor};
 use std::hint::black_box;
@@ -249,7 +251,7 @@ fn dictionary(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10);
+    config = Config::default().sample_size(10);
     targets = one_shot, streaming, dictionary
 }
 criterion_main!(benches);

@@ -29,6 +29,9 @@ graph TD
     Push --> HB["hotpath-benchmark.yml: profile_compressor natively, then under Callgrind (merged)"]
     HB -->|"push: OIDC upload"| Cloud[(hotpath Cloud)]
     HB -->|"pull request: report artifact"| Relay["hotpath-relay.yml (workflow_run)"]
+    Push --> HC["hotpath-criterion.yml: one Criterion id per matrix entry, natively then under Callgrind (merged)"]
+    HC -->|"push: OIDC upload"| Cloud
+    HC -->|"pull request: criterion-<series> artifact"| Relay
     Relay -->|"OIDC upload"| Cloud
 ```
 
@@ -37,7 +40,8 @@ graph TD
 | `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
 | `ci-lean.yml` | push to `main`, pull requests | `scripts/extract_lean.py --check`: the Charon/Aeneas translation of the verified items matches the Rust source. `lake exe cache get` and `lake build` in `verification/lean`: the RFC 8878 proofs and the axiom audit. See [formal verification](formal-verification.md). |
 | `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run on `testdata/alice29.txt` in merged mode: natively for timing and allocations, then under `valgrind --tool=callgrind --instr-atstart=no` with `HOTPATH_MERGE_REPORT` pointing at the native report, which adds instruction counts. `jq` checks that the merged report has both icount and timing data. A push uploads the merged report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
-| `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.2 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
+| `hotpath-criterion.yml` | push to `main`, pull requests | One job per matrix entry (`compress/text-1MiB/mzstd/3` and `decompress/text-4MiB/level-3/mzstd`, 200 iterations each): the Criterion bench built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on the same pinned toolchain and Valgrind, run with `--bench --test --exact <id>` and `HOTPATH_CRITERION_ITERATIONS`, natively and then under Callgrind in merged mode. `jq` also checks that the report names the Criterion id. A push uploads each report as its own hotpath Cloud series (`compress-text-1MiB-mzstd-3`, `decompress-text-4MiB-level-3-mzstd`); a pull request leaves it as the `criterion-<series>` artifact. See [hotpath Cloud](#hotpath-cloud). |
+| `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` or `hotpath criterion` | `hotpath-rs/hotpath-relay` (v1.0.0, pinned by commit) uploads a successful pull request run's report with the base repository's OIDC token, so the pull request jobs never need write permissions: the `relay` job the `compressor-report`, the `criterion` job one `criterion-<series>` artifact per series of the `hotpath criterion` matrix. The workflow has no default permissions; each job gets `actions: read`, `id-token: write` and `pull-requests: read`, and a newer run for the same branch cancels an older one. |
 | `ci-cflite-pr.yml` | pull requests touching `src/`, `zstd-ffi/`, `fuzz/`, `Cargo.toml`, `.clusterfuzzlite/`, `.dockerignore` or the workflow | ClusterFuzzLite libFuzzer/ASan run on the changed code, 600 s. See [ClusterFuzzLite](#clusterfuzzlite). |
 | `ci-cflite-cron.yml` | daily, manual | ClusterFuzzLite batch fuzzing (5.5 h), corpus pruning and a coverage report. |
 | `ci-coverage.yml` | manual | `cargo llvm-cov --workspace --release` with `--fail-under-functions 100` over repository-owned sources (zstd-ffi and the vendored C excluded); HTML report as an artifact. |
@@ -70,6 +74,33 @@ allocations are judged (0.5% and 1% thresholds, functions above 0.05% of the
 total), wall time is reported but not judged. The thresholds come from
 mbrotli's measured run-to-run spread and have not been re-measured for this
 crate.
+
+`hotpath-criterion.yml` applies the same merged mode to selected Criterion
+benchmarks. `benches/compress.rs` and `benches/decompress.rs` import Criterion
+through `hotpath::criterion` (the `criterion-0-8` feature of the `hotpath`
+dev-dependency). Without `HOTPATH_CRITERION_ITERATIONS` the adapter forwards to
+Criterion unchanged; with it set, the one benchmark that `--test --exact`
+selects runs its routine exactly that many times inside one Criterion
+iteration, and the hotpath guard, which also starts Callgrind's
+instrumentation, wraps only those iterations. The bench's setup, including its
+byte-identity checks against zstd, runs earlier and is not counted. The report
+records the Criterion id, iteration count and Criterion version in
+`meta.criterion`. Each matrix entry is its own hotpath Cloud series, judged by
+the same `hotpath/policy.toml`. The matrix and the relay's `criterion` matrix
+list the same series names and are kept in sync by hand.
+
+```mermaid
+flowchart TD
+    Env{HOTPATH_CRITERION_ITERATIONS set?}
+    Env -->|no| Plain[Criterion samples and reports as usual]
+    Env -->|yes| Filter{exactly one id selected by --test --exact?}
+    Filter -->|none ran| Fail1[exit 1: no report written]
+    Filter -->|second routine starts| Fail2[panic: one benchmark per process]
+    Filter -->|one| Setup[bench setup and byte-identity checks, unprofiled]
+    Setup --> Guard[hotpath guard starts, Callgrind instrumentation on]
+    Guard --> Loop[routine runs N times inside one Criterion iteration]
+    Loop --> Report[report with meta.criterion written on guard drop]
+```
 
 ```mermaid
 sequenceDiagram
