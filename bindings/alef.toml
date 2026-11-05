@@ -1,0 +1,72 @@
+# alef (https://github.com/xberg-io/alef) generates the Python, Node.js and
+# WebAssembly packages from the `mzstd-bindings` facade. This directory is
+# its own Cargo workspace, excluded from the repository workspace, so the
+# files alef owns at its project root (`rustfmt.toml`, `poly.toml`,
+# `.cargo/config.toml`) cannot reach `mzstd` itself.
+#
+# Regenerate after changing the facade:  cd bindings && alef generate
+# Check freshness (CI does):              cd bindings && alef verify
+
+[workspace]
+languages = ["python", "node", "wasm"]
+alef_version = "0.122.2"
+
+# The package READMEs are written by hand: they are the PyPI and npm landing
+# pages. `docs/reference/` is alef's per-language API reference (`alef docs`).
+[workspace.ownership]
+user_owned = [
+  "packages/python/README.md",
+  "crates/mzstd-bindings-node/README.md",
+  "crates/mzstd-bindings-wasm/README.md",
+]
+
+# `LICENSE` here is LICENSE-MIT followed by LICENSE-APACHE from the repository
+# root; alef copies it into every package.
+[workspace.package_metadata]
+description = "Zstandard (RFC 8878) compression and decompression in safe Rust; byte-identical to zstd 1.5.7"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/M-Compressors/mzstd"
+issues = "https://github.com/M-Compressors/mzstd/issues"
+keywords = ["zstd", "zstandard", "compression", "decompression"]
+
+[workspace.scaffold]
+description = "Zstandard (RFC 8878) compression and decompression in safe Rust; byte-identical to zstd 1.5.7"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/M-Compressors/mzstd"
+homepage = "https://github.com/M-Compressors/mzstd"
+keywords = ["zstd", "zstandard", "compression", "decompression"]
+
+[[crates]]
+name = "mzstd-bindings"
+core_import = "mzstd_bindings"
+sources = [
+  "../mzstd-bindings/src/lib.rs",
+  "../mzstd-bindings/src/error.rs",
+  "../mzstd-bindings/src/stream.rs",
+]
+version_from = "../Cargo.toml"
+# The facade's error enum keeps typed `#[source]` errors for Rust callers;
+# the bindings carry only their messages, which is the lossy conversion
+# this code reports.
+suppress_validation_codes = ["lossy_sanitized_surface"]
+
+[crates.python]
+pip_name = "mzstd"
+# The native extension, imported by the pure-Python `mzstd` package.
+module_name = "_mzstd"
+# Compression is CPU-bound: let other Python threads run meanwhile.
+release_gil = true
+
+[crates.python.stubs]
+output = "packages/python/mzstd/"
+
+[crates.node]
+package_name = "mzstd"
+# Native packages are published for the platforms `release.yml` builds;
+# musl and Windows on Arm users can use `mzstd-wasm` meanwhile.
+exclude_platforms = ["linux-x64-musl", "linux-arm64-musl", "win32-arm64-msvc"]
+
+[crates.wasm]
+package_name = "mzstd-wasm"
+# Export `StreamCompressor`, not `WasmStreamCompressor`, as Node.js does.
+type_prefix = ""

@@ -2,10 +2,11 @@
 
 GitHub Actions workflows live in `.github/workflows`. Every job checks out
 submodules recursively, because the C reference in
-`zstd-ffi/vendor/zstd` is needed to build the test oracle. The
-ClusterFuzzLite jobs are the exception: their actions check out the
-repository themselves, and `.clusterfuzzlite/build.sh` fetches the
-submodule.
+`zstd-ffi/vendor/zstd` is needed to build the test oracle. The exceptions
+are the ClusterFuzzLite jobs, whose actions check out the repository
+themselves while `.clusterfuzzlite/build.sh` fetches the submodule, and the
+binding jobs of `ci-bindings.yml` and `release.yml`, which never build the
+oracle.
 
 ```mermaid
 graph TD
@@ -16,6 +17,7 @@ graph TD
     CI --> OCF["overflow-correction: core differential suites with MZSTD_OVERFLOW_CORRECT_FREQUENTLY"]
     CI --> Fuzz["fuzz: fmt/clippy of fuzz/afl, regression replay with and without framed"]
     CI --> LibFuzzer["libfuzzer: fmt/clippy of fuzz/libfuzzer with and without framed"]
+    Push --> Bind["ci-bindings.yml: alef verify; Python, Node.js and WASM packages built and tested per platform"]
     Push --> Lean["ci-lean.yml: Lean translation drift check, Lean proofs and axiom audit"]
     PR[pull request touching code] --> CFPR["ci-cflite-pr.yml: ClusterFuzzLite on the changed code"]
     Daily[daily schedule or manual] --> CFCron["ci-cflite-cron.yml: batch, prune, coverage"]
@@ -25,7 +27,7 @@ graph TD
     Tag[v* tag or manual] --> Camp["ci-fuzz.yml: bounded AFL campaign per target"]
     Tag --> Miri["ci-miri.yml: Miri over SIMD kernels and BorrowedBuf output"]
     Tag --> ASan["ci-sanitizer.yml: AddressSanitizer over integration and kernel tests"]
-    Manual --> Rel["release.yml: trusted publishing from a v* tag"]
+    Manual --> Rel["release.yml from a v* tag: build every package, then crates.io, then PyPI and npm (trusted publishing)"]
     Push --> HB["hotpath-benchmark.yml: profile_compressor natively, then under Callgrind (merged)"]
     HB -->|"push: OIDC upload"| Cloud[(hotpath Cloud)]
     HB -->|"pull request: report artifact"| Relay["hotpath-relay.yml (workflow_run)"]
@@ -35,6 +37,7 @@ graph TD
 | Workflow | Trigger | Checks |
 | --- | --- | --- |
 | `ci.yml` | push to `main`, pull requests | `cargo fmt --check`. Clippy with `-D warnings` for all features, for the default features plus hotpath, and for each codec with `std` and with `no_std`. Rustdoc with `-D warnings` for the same configurations. `cargo package`. A bare-metal build. Release-mode tests on three platforms and on the MSRV, each with the default features, with all features (alloc only) and with `framed` (which adds the std framed adapters and seek reader). Clippy and rustdoc also cover `framed` with each codec. The overflow-correction mode. Fuzz package lint and regression replay. libFuzzer adapter lint. |
+| `ci-bindings.yml` | push to `main`, pull requests | `alef verify` in `bindings/` with alef built by `bindings/scripts/install-alef.sh` (cached by version and patch hash): generated files and versions match `mzstd-bindings` and `Cargo.toml`. The Python wheel built with maturin and tested with pytest on Linux x86-64 and arm64, macOS and Windows at Python 3.11, and on Linux at 3.14; the sdist built, installed from source and tested. The Node.js addon built and tested with `node --test` on the same four platforms. Every wasm-pack target built, and the `nodejs` one tested with the shared JavaScript suite. See [language bindings](bindings.md#tests). |
 | `ci-lean.yml` | push to `main`, pull requests | `scripts/extract_lean.py --check`: the Charon/Aeneas translation of the verified items matches the Rust source. `lake exe cache get` and `lake build` in `verification/lean`: the RFC 8878 proofs and the axiom audit. See [formal verification](formal-verification.md). |
 | `hotpath-benchmark.yml` | push to `main`, pull requests | `profile_compressor` built with `hotpath-alloc,hotpath-callgrind,hotpath-cloud` on pinned Rust 1.99.1 and Valgrind 3.26.0, run on `testdata/alice29.txt` in merged mode: natively for timing and allocations, then under `valgrind --tool=callgrind --instr-atstart=no` with `HOTPATH_MERGE_REPORT` pointing at the native report, which adds instruction counts. `jq` checks that the merged report has both icount and timing data. A push uploads the merged report to hotpath Cloud as the `compressor` benchmark's baseline (`id-token: write`). A pull request runs read-only and leaves the JSON report as the `compressor-report` artifact. See [hotpath Cloud](#hotpath-cloud). |
 | `hotpath-relay.yml` | `workflow_run` of `hotpath benchmark` | hotpath's reusable relay workflow (pinned to v0.29.2 by commit) uploads a pull request's `compressor-report` with the base repository's OIDC token, so the pull request job never needs write permissions. |
@@ -45,11 +48,12 @@ graph TD
 | `ci-fuzz.yml` | `v*` tags, manual | `prepare-seeds.sh`, then `campaign.sh` for each target, the three framed targets included (600 s by default); findings uploaded as `findings-<target>.tar.gz`, since AFL file names contain `:`, which `upload-artifact` rejects. |
 | `ci-miri.yml` | `v*` tags, manual | `scripts/miri.sh` on nightly: exact-named tests for the vector kernels and `BorrowedBuf` output under Miri, interpreted for x86-64 with `MIRI_TARGET_CPU=native`, so the runner's CPU picks the backends. See [memory checks](#memory-checks). |
 | `ci-sanitizer.yml` | `v*` tags, manual | Nightly `-Zsanitizer=address` release builds, LeakSanitizer included: every integration test with `framed` (the two that forget an owning guard on purpose without leak detection), then the kernel and uninitialized-output unit modules on the runner's own backends. |
-| `release.yml` | manual from a `v*` tag | Tag/version match, then `cargo publish` through crates.io trusted publishing. |
+| `release.yml` | manual from a `v*` tag | The tag matches `mzstd`, `mzstd-bindings` and every binding manifest. Wheels (manylinux2014 x86-64 and aarch64, macOS x86-64 and arm64, Windows x64), the sdist, the five Node.js addons and the WASM package are built, and tested where the runner can load them. Only then `cargo publish` through crates.io trusted publishing, followed by PyPI and npm trusted publishing (npm with provenance), each skipping versions already uploaded. See [language bindings](bindings.md#release). |
 
 All Cargo invocations that build the workspace pass `--locked`, because
 `Cargo.lock` is committed so that benchmark baselines and campaigns are
-reproducible.
+reproducible. The binding workspace has its own committed
+`bindings/Cargo.lock`, which maturin's builds use with `--locked`.
 
 ## hotpath Cloud
 
@@ -232,3 +236,7 @@ LeakSanitizer unless `ASAN_OPTIONS=detect_leaks=1` is set.
 - ClusterFuzzLite builds for x86-64 only, so its runs reach the x86 backends
   the runner supports, not NEON.
 - Benchmark numbers from shared runners are smoke tests, not evidence.
+- The release-only binding paths (manylinux containers, `--use-napi-cross`,
+  cross-built macOS x86-64 and Linux arm64 Node.js addons, and the
+  publishing steps) run only in `release.yml`; `ci-bindings.yml` builds
+  natively on each runner.

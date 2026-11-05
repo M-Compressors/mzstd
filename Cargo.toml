@@ -19,6 +19,8 @@ exclude = [
     "fuzz/**",
     "hotpath/**",
     "mzstd-ffi/**",
+    "mzstd-bindings/**",
+    "bindings/**",
     "scripts/**",
     "specifications/**",
     "target/**",
@@ -154,8 +156,8 @@ hotpath-callgrind = ["hotpath", "hotpath/hotpath-callgrind"]
 hotpath-cloud = ["hotpath", "hotpath/hotpath-cloud"]
 
 [workspace]
-members = ["zstd-ffi", "mzstd-ffi"]
+members = ["zstd-ffi", "mzstd-ffi", "mzstd-bindings"]
 # The fuzz packages pull in AFL's and libFuzzer's runtimes; keeping them out of
 # the workspace leaves `cargo test` and `cargo clippy` unaffected by them.
-exclude = ["benchmarks/comparison", "fuzz/afl", "fuzz/libfuzzer"]
+exclude = ["benchmarks/comparison", "bindings", "fuzz/afl", "fuzz/libfuzzer"]
 resolver = "3"

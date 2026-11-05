@@ -1,0 +1,6 @@
+# alef seeds this file only when it is missing; this one replaces its
+# `1.99` pin with stable, which the generated crates build with.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

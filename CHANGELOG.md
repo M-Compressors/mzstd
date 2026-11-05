@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Python, Node.js and WebAssembly packages.** `pip install mzstd`,
+  `npm install mzstd` and `npm install mzstd-wasm` provide one-shot
+  `compress`/`decompress` (with an optional output cap), dictionary
+  variants, `compress_bound`, and `StreamCompressor`/`StreamDecompressor`
+  for data that arrives in pieces. Frames are byte-identical to zstd
+  1.5.7's `ZSTD_compress2` and, for streams fed the same chunks,
+  `ZSTD_compressStream2`. The packages are generated with
+  [alef](https://github.com/xberg-io/alef) from the new, unpublished
+  `mzstd-bindings` facade and are built, tested and published by
+  `release.yml` after the crate: abi3 wheels for Python 3.11+ on Linux
+  (glibc, x86-64 and arm64), macOS and Windows x64 plus an sdist; Node.js
+  22+ addons for the same platforms; and a WebAssembly package with `web`,
+  `bundler`, `nodejs` and `deno` builds. See `architecture/bindings.md`.
+
 ## [v0.2.11](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.11) - 2026-11-03
 
 - **Native builds decode 8-12% faster.** With AVX-512 in the compile-time

@@ -1,22 +1,35 @@
 name: Release
 
-# Run by hand: pick a `v*` tag in "Use workflow from". The crate is published
-# through crates.io trusted publishing, so no API token is stored; the job
-# exchanges its GitHub OIDC identity for a short-lived crates.io token.
+# Run by hand: pick a `v*` tag in "Use workflow from". One run releases the
+# crate and the packages alef generates from it (architecture/bindings.md):
+#
+#   version ──> python wheels, sdist, node addons, wasm ──> crates.io ──> PyPI
+#                                                                    └──> npm
+#
+# Every package is built and checked before anything is published, so a
+# build failure stops the release while every registry still has the old
+# version. The registries are published to only after crates.io accepted the
+# crate. Nothing stores a long-lived token: crates.io, PyPI and npm each
+# exchange this workflow's GitHub OIDC identity for a short-lived one
+# (trusted publishing, configured once per registry for `release.yml` and
+# the `release` environment). Until a first npm release exists, npm cannot
+# trust a workflow yet; set an `NPM_TOKEN` secret for that first run and
+# delete it afterwards.
 on:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
-  publish:
-    name: publish mzstd to crates.io
+  version:
+    name: tag matches every package version
     runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - name: require a release tag
         if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
@@ -24,19 +37,248 @@ jobs:
           echo "::error::Run this workflow from a v* tag, not '$GITHUB_REF_NAME'."
           exit 1
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: compare the tag with the crate and binding manifests
+        id: check
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          python3 - "$version" <<'EOF'
+          import json, pathlib, subprocess, sys, tomllib
+
+          version = sys.argv[1]
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          found = {f"crate {p['name']}": p["version"] for p in metadata["packages"]
+                   if p["name"] in ("mzstd", "mzstd-bindings")}
+          bindings = pathlib.Path("bindings")
+          pyproject = tomllib.loads((bindings / "packages/python/pyproject.toml").read_text())
+          found["pypi mzstd"] = pyproject["project"]["version"]
+          for manifest in [bindings / "crates/mzstd-bindings-node/package.json",
+                           bindings / "crates/mzstd-bindings-wasm/package.json",
+                           *sorted((bindings / "crates/mzstd-bindings-node/npm").glob("*/package.json"))]:
+              package = json.loads(manifest.read_text())
+              found[f"npm {package['name']}"] = package["version"]
+              for name, pinned in package.get("optionalDependencies", {}).items():
+                  found[f"npm {package['name']} -> {name}"] = pinned
+          stale = {name: v for name, v in found.items() if v != version}
+          for name, v in found.items():
+              print(f"{name}: {v}")
+          if stale:
+              print(f"::error::Not at {version}: {', '.join(stale)}. Bump Cargo.toml and "
+                    "mzstd-bindings/Cargo.toml, then run `alef all` in bindings/.")
+              sys.exit(1)
+          EOF
+
+  python-wheels:
+    name: wheel ${{ matrix.target }} on ${{ matrix.os }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `test` marks the runners that can import the wheel they built.
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_17", test: true }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_17", test: true }
+          - { os: macos-latest, target: x86_64, test: false }
+          - { os: macos-latest, target: aarch64, test: true }
+          - { os: windows-latest, target: x64, test: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/packages/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --locked --out dist
+      - name: pytest against the wheel
+        if: matrix.test
+        shell: bash
+        run: |
+          python -m pip install pytest
+          python -m pip install --no-index --find-links bindings/packages/python/dist mzstd
+          cd bindings/tests/python && python -m pytest -q
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/packages/python/dist/*.whl
+          if-no-files-found: error
+
+  python-sdist:
+    name: python sdist
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/packages/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-sdist
+          path: bindings/packages/python/dist/*.tar.gz
+          if-no-files-found: error
+
+  node-addons:
+    name: node addon ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `--use-napi-cross` links Linux addons against glibc 2.17, so they
+          # load on older distributions than the runner's.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, flags: --use-napi-cross, test: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, flags: --use-napi-cross, test: false }
+          - { os: macos-latest, target: x86_64-apple-darwin, test: false }
+          - { os: macos-latest, target: aarch64-apple-darwin, test: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, test: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build the addon
+        working-directory: bindings/crates/mzstd-bindings-node
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.flags }}
+      - name: node --test against the addon
+        if: matrix.test
+        working-directory: bindings/tests/js
+        env:
+          MZSTD_MODULE: ../../crates/mzstd-bindings-node/index.js
+        run: node --test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-addon-${{ matrix.target }}
+          path: bindings/crates/mzstd-bindings-node/*.node
+          if-no-files-found: error
+
+  wasm:
+    name: wasm package
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: npm install --global wasm-pack@0.15.1
+      - name: build every wasm-pack target
+        working-directory: bindings/crates/mzstd-bindings-wasm
+        run: npm run build:all
+      - name: node --test against the nodejs build
+        working-directory: bindings/tests/js
+        env:
+          MZSTD_MODULE: ../../crates/mzstd-bindings-wasm/pkg/nodejs/mzstd_bindings_wasm.js
+        run: node --test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasm-pkg
+          path: bindings/crates/mzstd-bindings-wasm/pkg
+          if-no-files-found: error
+
+  publish:
+    name: publish mzstd to crates.io
+    needs: [version, python-wheels, python-sdist, node-addons, wasm]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - name: check the tag matches the package version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "mzstd") | .version')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match mzstd $version."
-            exit 1
-          fi
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - run: cargo publish --package mzstd
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  pypi:
+    name: publish mzstd to PyPI
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      # `skip-existing` lets a re-run finish a partly uploaded release.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  npm:
+    name: publish mzstd and mzstd-wasm to npm
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install --global npm@11
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: node-addon-*
+          path: bindings/crates/mzstd-bindings-node/artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm-pkg
+          path: bindings/crates/mzstd-bindings-wasm/pkg
+      # Fails unless every target in package.json has its addon.
+      - name: move each addon into its platform package
+        working-directory: bindings/crates/mzstd-bindings-node
+        run: npx --yes -p @napi-rs/cli@3.10.12 napi artifacts --output-dir artifacts
+      # Platform packages first: the main package depends on them. Scripts
+      # are skipped because the packages are complete as downloaded, and a
+      # version that is already on npm is skipped so a re-run can finish a
+      # partly published release.
+      - name: npm publish
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish() {
+            name=$(node -p "require('./$1/package.json').name")
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already published"
+            else
+              npm publish "./$1" --access public --provenance --ignore-scripts
+            fi
+          }
+          cd bindings/crates
+          for platform in mzstd-bindings-node/npm/*/; do
+            publish "${platform%/}"
+          done
+          publish mzstd-bindings-node
+          publish mzstd-bindings-wasm

@@ -1,0 +1,28 @@
+diff --git a/src/backends/napi/gen_bindings/functions/return_wrapping.rs b/src/backends/napi/gen_bindings/functions/return_wrapping.rs
+index 3b6e982bc..166dd617e 100644
+--- a/src/backends/napi/gen_bindings/functions/return_wrapping.rs
++++ b/src/backends/napi/gen_bindings/functions/return_wrapping.rs
+@@ -40,6 +40,23 @@ pub(in crate::backends::napi::gen_bindings) fn napi_wrap_return(
+         TypeRef::Duration => format!("{expr}.as_millis() as i64"),
+         TypeRef::Json => json_value_return(expr, returns_ref),
+         TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Json) => json_value_return(expr, returns_ref),
++        // NAPI returns bytes as `Buffer`, built from `Vec<u8>` with `From`; the shared wrapper's
++        // `.to_vec()` leaves a `Vec<u8>` that does not type-check against the `Buffer` signature,
++        // exactly as `napi_wrap_return_fn` already handles for free functions. ~keep
++        TypeRef::Bytes => {
++            if returns_ref {
++                format!("{expr}.to_vec().into()")
++            } else {
++                format!("{expr}.into()")
++            }
++        }
++        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Bytes) => {
++            if returns_ref {
++                format!("{expr}.map(|b| b.to_vec().into())")
++            } else {
++                format!("{expr}.map(Into::into)")
++            }
++        }
+         TypeRef::Named(n) if n == type_name && self_is_opaque => {
+             let already_arc = expr == "self.inner"
+                 || expr == "self.inner.clone()"

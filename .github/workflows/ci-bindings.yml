@@ -1,0 +1,142 @@
+name: Bindings
+
+# The Python, Node.js and WebAssembly packages that alef generates from
+# `mzstd-bindings` (see architecture/bindings.md). The facade itself is a
+# member of the repository workspace and is tested by ci.yml; these jobs
+# check that the generated tree is current and that each package builds and
+# passes its own tests on every platform it is released for.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  generated:
+    name: alef output is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: read the pinned alef version
+        id: alef
+        run: echo "version=$(sed -n 's/^alef_version = "\(.*\)"$/\1/p' bindings/alef.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: bindings/target/alef
+          key: alef-${{ runner.os }}-${{ steps.alef.outputs.version }}-${{ hashFiles('bindings/alef-patches/**', 'bindings/scripts/install-alef.sh') }}
+      - run: bindings/scripts/install-alef.sh
+      - name: alef verify
+        working-directory: bindings
+        run: |
+          export PATH="$PWD/target/alef/bin:$PATH"
+          alef verify
+
+  python:
+    name: python ${{ matrix.python }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # The abi3 wheel's floor; the newest release is checked once.
+        python: ["3.11"]
+        include:
+          - os: ubuntu-latest
+            python: "3.14"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+      - name: build and install the wheel
+        working-directory: bindings/packages/python
+        shell: bash
+        run: |
+          python -m pip install "maturin>=1,<2" pytest
+          maturin build --release --locked --out dist
+          python -m pip install --no-index --find-links dist mzstd
+      # Run outside packages/python so `import mzstd` loads the installed
+      # wheel, not the source tree without its native module.
+      - name: pytest
+        working-directory: bindings/tests/python
+        run: python -m pytest -q
+
+  python-sdist:
+    name: python sdist builds from source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+      - name: build the sdist, then install it with a source build
+        working-directory: bindings/packages/python
+        run: |
+          python -m pip install "maturin>=1,<2" pytest
+          maturin sdist --out dist
+          python -m pip install --no-binary mzstd dist/mzstd-*.tar.gz
+      - name: pytest
+        working-directory: bindings/tests/python
+        run: python -m pytest -q
+
+  node:
+    name: node on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+      - name: build the addon
+        working-directory: bindings/crates/mzstd-bindings-node
+        run: npm run build
+      - name: node --test
+        working-directory: bindings/tests/js
+        env:
+          MZSTD_MODULE: ../../crates/mzstd-bindings-node/index.js
+        run: node --test
+
+  wasm:
+    name: wasm on node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings
+      - run: npm install --global wasm-pack@0.15.1
+      - name: build every wasm-pack target
+        working-directory: bindings/crates/mzstd-bindings-wasm
+        run: npm run build:all
+      - name: node --test
+        working-directory: bindings/tests/js
+        env:
+          MZSTD_MODULE: ../../crates/mzstd-bindings-wasm/pkg/nodejs/mzstd_bindings_wasm.js
+        run: node --test

@@ -1,0 +1,35 @@
+{
+  "name": "mzstd-win32-x64-msvc",
+  "version": "0.2.11",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/M-Compressors/mzstd.git"
+  },
+  "homepage": "https://github.com/M-Compressors/mzstd",
+  "bugs": {
+    "url": "https://github.com/M-Compressors/mzstd/issues"
+  },
+  "keywords": [
+    "compression",
+    "decompression",
+    "zstandard",
+    "zstd"
+  ],
+  "main": "mzstd-bindings-node.win32-x64-msvc.node",
+  "files": [
+    "mzstd-bindings-node.win32-x64-msvc.node"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">= 22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

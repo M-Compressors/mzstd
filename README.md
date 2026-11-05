@@ -92,6 +92,18 @@ capacity from the frame header.
 mzstd = "0.2"
 ```
 
+The same encoder and decoder are published for other languages, generated
+with [alef](https://github.com/xberg-io/alef) from the
+[`mzstd-bindings`](mzstd-bindings/README.md) facade and released together
+with each crate version: one-shot calls, streams and dictionaries.
+
+| Language | Package | Install |
+| --- | --- | --- |
+| Python 3.11+ | [`mzstd`](bindings/packages/python/README.md) | `pip install mzstd` |
+| Node.js 22+ | [`mzstd`](bindings/crates/mzstd-bindings-node/README.md) | `npm install mzstd` |
+| WebAssembly (browsers, bundlers, Node.js, Deno) | [`mzstd-wasm`](bindings/crates/mzstd-bindings-wasm/README.md) | `npm install mzstd-wasm` |
+| C | [`mzstd-ffi`](mzstd-ffi/README.md) | build the `mzstd-ffi` crate |
+
 ### Examples
 
 ```rust

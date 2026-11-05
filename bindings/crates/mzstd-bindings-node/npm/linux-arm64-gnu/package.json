@@ -1,0 +1,38 @@
+{
+  "name": "mzstd-linux-arm64-gnu",
+  "version": "0.2.11",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/M-Compressors/mzstd.git"
+  },
+  "homepage": "https://github.com/M-Compressors/mzstd",
+  "bugs": {
+    "url": "https://github.com/M-Compressors/mzstd/issues"
+  },
+  "keywords": [
+    "compression",
+    "decompression",
+    "zstandard",
+    "zstd"
+  ],
+  "main": "mzstd-bindings-node.linux-arm64-gnu.node",
+  "files": [
+    "mzstd-bindings-node.linux-arm64-gnu.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">= 22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

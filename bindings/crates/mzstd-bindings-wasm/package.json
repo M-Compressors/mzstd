@@ -1,0 +1,54 @@
+{
+  "name": "mzstd-wasm",
+  "version": "0.2.11",
+  "private": false,
+  "description": "Zstandard (RFC 8878) compression and decompression in safe Rust; byte-identical to zstd 1.5.7",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M-Compressors/mzstd",
+    "directory": "crates/mzstd-bindings-wasm"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "files": [
+    "pkg",
+    "*.wasm",
+    "*.d.ts",
+    "README.md"
+  ],
+  "main": "pkg/nodejs/mzstd_bindings_wasm.js",
+  "module": "pkg/web/mzstd_bindings_wasm.js",
+  "types": "pkg/nodejs/mzstd_bindings_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/nodejs/mzstd_bindings_wasm.d.ts",
+      "browser": "./pkg/web/mzstd_bindings_wasm.js",
+      "import": "./pkg/nodejs/mzstd_bindings_wasm.js",
+      "require": "./pkg/nodejs/mzstd_bindings_wasm.js",
+      "default": "./pkg/nodejs/mzstd_bindings_wasm.js"
+    }
+  },
+  "engines": {
+    "node": ">= 22"
+  },
+  "scripts": {
+    "build": "wasm-pack build --target nodejs --out-dir pkg/nodejs",
+    "build:ci": "wasm-pack build --release --target nodejs --out-dir pkg/nodejs",
+    "build:wasm:web": "wasm-pack build --release --target web --out-dir pkg/web",
+    "build:wasm:bundler": "wasm-pack build --release --target bundler --out-dir pkg/bundler",
+    "build:wasm:nodejs": "wasm-pack build --release --target nodejs --out-dir pkg/nodejs",
+    "build:wasm:deno": "wasm-pack build --release --target deno --out-dir pkg/deno",
+    "build:all": "npm run build:wasm:web && npm run build:wasm:bundler && npm run build:wasm:nodejs && npm run build:wasm:deno && find pkg -name .gitignore -delete",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "test:coverage": "vitest run --coverage",
+    "clean": "rm -rf pkg dist"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5",
+    "@vitest/coverage-v8": "^5.0.5"
+  }
+}

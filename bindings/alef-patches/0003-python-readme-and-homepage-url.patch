@@ -1,0 +1,43 @@
+diff --git a/src/scaffold/languages/python.rs b/src/scaffold/languages/python.rs
+index e08562f61..bb185b37c 100644
+--- a/src/scaffold/languages/python.rs
++++ b/src/scaffold/languages/python.rs
+@@ -363,10 +363,20 @@ pub(crate) fn scaffold_python(api: &ApiSurface, config: &ResolvedCrateConfig) ->
+         )
+     };
+ 
++    // PEP 621 has no `homepage` key in `[project]`: build backends reject or drop it, so the
++    // homepage goes under `[project.urls]` next to the repository. ~keep
+     let homepage_toml = if meta.homepage.is_empty() {
+         String::new()
+     } else {
+-        format!("homepage = \"{}\"\n", meta.homepage)
++        format!("urls.homepage = \"{}\"\n", meta.homepage)
++    };
++    // A package README becomes the PyPI long description. maturin takes it only from
++    // `[project] readme` once `[project]` exists, so a README next to `pyproject.toml` is
++    // otherwise left off the published page. ~keep
++    let readme_toml = if std::path::Path::new(&pkg_dir).join("README.md").is_file() {
++        "readme = \"README.md\"\n".to_string()
++    } else {
++        String::new()
+     };
+ 
+     let dependencies_toml = match config.python.as_ref().map(|p| &p.pip_dependencies) {
+@@ -428,7 +438,7 @@ requires = [ "{maturin_build_requires}" ]
+ name = "{pip_name}"
+ version = "{version}"
+ description = "{description}"
+-{keywords}{license_toml}{authors}requires-python = ">=3.11"
++{keywords}{readme}{license_toml}{authors}requires-python = ">=3.11"
+ classifiers = [
+   "Programming Language :: Python :: 3 :: Only",
+   "Programming Language :: Python :: 3.11",
+@@ -516,6 +526,7 @@ open-unpacking = false
+         license_toml = license_toml,
+         authors = authors_toml,
+         keywords = keywords_toml,
++        readme = readme_toml,
+         homepage = homepage_toml,
+         dependencies = dependencies_toml,
+         sdist_include = sdist_include_toml,

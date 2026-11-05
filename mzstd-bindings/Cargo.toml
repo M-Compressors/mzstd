@@ -1,0 +1,27 @@
+[package]
+name = "mzstd-bindings"
+version = "0.2.11"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Binding-friendly facade over mzstd: the API surface alef turns into Python, Node.js and WebAssembly packages"
+repository = "https://github.com/M-Compressors/mzstd"
+homepage = "https://github.com/M-Compressors/mzstd"
+readme = "README.md"
+keywords = ["zstd", "zstandard", "compression", "bindings"]
+categories = ["compression"]
+# The facade is an input to the binding generator, not a crate for Rust
+# callers: they depend on `mzstd` directly.
+publish = false
+
+[dependencies.mzstd]
+path = ".."
+version = "0.2.11"
+default-features = false
+features = ["std", "compression", "decompression"]
+
+[dependencies.thiserror]
+version = "2"
+
+[dev-dependencies.zstd-ffi]
+path = "../zstd-ffi"

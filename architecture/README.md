@@ -36,6 +36,8 @@ graph TD
     IO --> Decode
     Ref["zstd-ffi: zstd 1.5.7 + oracle + corpus"] -. tests, benches, fuzzing .-> Root
     CABI["mzstd-ffi: C ABI crate, one-shot and sessions"] --> Root
+    Facade["mzstd-bindings: binding facade, one-shot, streams, dictionaries"] --> Root
+    Bind["bindings/ (excluded workspace): alef-generated Python, Node.js and WASM packages"] --> Facade
     Fuzz["fuzz/afl (excluded package)"] -.-> Root
     Fuzz -.-> Ref
     LibFuzz["fuzz/libfuzzer (excluded package): ClusterFuzzLite adapters"] -.-> Fuzz
@@ -69,6 +71,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed a block's room before each compressed block, the shared outcome mapping, the C ABI and their contract. |
 | [Decoder fast paths](decoder-performance.md) | SIMD dispatch (including AVX-512 baseline builds), bit containers, Huffman stream scheduling, static and custom FSE tables, sequence loops, wildcopies, direct slice output and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
+| [Language bindings](bindings.md) | `mzstd-bindings` and the alef-generated `mzstd` (PyPI, npm) and `mzstd-wasm` packages: layout and ownership, the facade's surface and stream pump, error mapping, the patched generator, tests and the release pipeline. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: one-shot and session functions, handle lifecycle, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
 | [CI](ci.md) | Workflows and the checks they run; ClusterFuzzLite pull request and daily fuzzing; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`; hotpath Cloud merged-mode (native plus Callgrind) benchmarks. |

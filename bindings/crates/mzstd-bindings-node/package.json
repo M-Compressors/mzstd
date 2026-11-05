@@ -1,0 +1,69 @@
+{
+  "name": "mzstd",
+  "version": "0.2.11",
+  "description": "Zstandard (RFC 8878) compression and decompression in safe Rust; byte-identical to zstd 1.5.7",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/M-Compressors/mzstd.git"
+  },
+  "homepage": "https://github.com/M-Compressors/mzstd",
+  "bugs": {
+    "url": "https://github.com/M-Compressors/mzstd/issues"
+  },
+  "keywords": [
+    "compression",
+    "decompression",
+    "zstandard",
+    "zstd"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "binding.cjs",
+    "index.mjs",
+    "index.d.ts",
+    "*.node"
+  ],
+  "optionalDependencies": {
+    "mzstd-linux-x64-gnu": "0.2.11",
+    "mzstd-linux-arm64-gnu": "0.2.11",
+    "mzstd-darwin-x64": "0.2.11",
+    "mzstd-darwin-arm64": "0.2.11",
+    "mzstd-win32-x64-msvc": "0.2.11"
+  },
+  "napi": {
+    "packageName": "mzstd",
+    "binaryName": "mzstd-bindings-node",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "npx --yes -p @napi-rs/cli@^3.10.9 napi build --platform --no-js --dts index.native.d.ts --release",
+    "artifacts": "npx --yes -p @napi-rs/cli@^3.10.9 napi artifacts",
+    "prepublishOnly": "npx --yes -p @napi-rs/cli@^3.10.9 napi prepublish -t npm --skip-optional-publish"
+  },
+  "engines": {
+    "node": ">= 22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.9"
+  }
+}

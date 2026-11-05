@@ -1,0 +1,97 @@
+diff --git a/src/backends/pyo3/gen_bindings/mod.rs b/src/backends/pyo3/gen_bindings/mod.rs
+index 7de09c949..bf9f8f069 100644
+--- a/src/backends/pyo3/gen_bindings/mod.rs
++++ b/src/backends/pyo3/gen_bindings/mod.rs
+@@ -329,6 +329,9 @@ impl Backend for ConfiguredPyo3Backend {
+         // uses) needs this -- `cfg_unsendable` backs opaque-type method generation, which this fix
+         // does not touch. ~keep
+         cfg.error_converters = Some(&error_converters);
++        // Opaque-type methods take the same typed converters, so a failing method raises the
++        // same `{Variant}Error` its free-function counterpart does. ~keep
++        cfg_unsendable.error_converters = Some(&error_converters);
+ 
+         // Track emitted #[pyclass] struct names to prevent duplicate definitions (E0255/E0428).
+         let mut emitted_pyclass_names: AHashSet<&str> = AHashSet::new();
+diff --git a/src/codegen/generators/methods/instance.rs b/src/codegen/generators/methods/instance.rs
+index 7472f819f..909a70b33 100644
+--- a/src/codegen/generators/methods/instance.rs
++++ b/src/codegen/generators/methods/instance.rs
+@@ -153,10 +153,11 @@ pub fn gen_method(
+             && crate::codegen::shared::is_opaque_delegatable_type(&method.return_type)
+         {
+             // NOTE: Only executed when has_serde=true, ensuring serde_json calls are gated.
++            // Typed `{error}_to_py_err` converter when the pyo3 backend registered one, as
++            // free functions already do (alef #452); generic `PyRuntimeError` otherwise. ~keep
++            let pyo3_err_conv = crate::codegen::generators::binding_helpers::resolve_err_conv(cfg, method.error_type.as_deref());
+             let err_conv = match cfg.async_pattern {
+-                AsyncPattern::Pyo3FutureIntoPy => {
+-                    ".map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))"
+-                }
++                AsyncPattern::Pyo3FutureIntoPy => pyo3_err_conv.as_str(),
+                 AsyncPattern::NapiNativeAsync => ".map_err(alef_napi_err)",
+                 AsyncPattern::WasmNativeAsync => ".map_err(alef_wasm_err)",
+                 AsyncPattern::TokioBlockOn => {
+@@ -200,10 +201,11 @@ pub fn gen_method(
+             );
+             let core_call = format!("core_self.{}({call_args})", method.name);
+             if method.error_type.is_some() {
++                // Typed `{error}_to_py_err` converter when the pyo3 backend registered one, as
++                // free functions already do (alef #452); generic `PyRuntimeError` otherwise. ~keep
++                let pyo3_err_conv = crate::codegen::generators::binding_helpers::resolve_err_conv(cfg, method.error_type.as_deref());
+                 let err_conv = match cfg.async_pattern {
+-                    AsyncPattern::Pyo3FutureIntoPy => {
+-                        ".map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))"
+-                    }
++                    AsyncPattern::Pyo3FutureIntoPy => pyo3_err_conv.as_str(),
+                     AsyncPattern::NapiNativeAsync => ".map_err(alef_napi_err)",
+                     AsyncPattern::WasmNativeAsync => ".map_err(alef_wasm_err)",
+                     AsyncPattern::TokioBlockOn => {
+@@ -330,10 +332,11 @@ pub fn gen_method(
+                 _ => String::new(),
+             };
+             if method.error_type.is_some() {
++                // Typed `{error}_to_py_err` converter when the pyo3 backend registered one, as
++                // free functions already do (alef #452); generic `PyRuntimeError` otherwise. ~keep
++                let pyo3_err_conv = crate::codegen::generators::binding_helpers::resolve_err_conv(cfg, method.error_type.as_deref());
+                 let err_conv = match cfg.async_pattern {
+-                    AsyncPattern::Pyo3FutureIntoPy => {
+-                        ".map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))"
+-                    }
++                    AsyncPattern::Pyo3FutureIntoPy => pyo3_err_conv.as_str(),
+                     AsyncPattern::NapiNativeAsync => ".map_err(alef_napi_err)",
+                     AsyncPattern::WasmNativeAsync => ".map_err(alef_wasm_err)",
+                     _ => ".map_err(|e| e.to_string())",
+@@ -448,10 +451,11 @@ pub fn gen_method(
+     } else {
+         let core_call = make_core_call(&method.name);
+         if method.error_type.is_some() {
++            // Typed `{error}_to_py_err` converter when the pyo3 backend registered one, as
++            // free functions already do (alef #452); generic `PyRuntimeError` otherwise. ~keep
++            let pyo3_err_conv = crate::codegen::generators::binding_helpers::resolve_err_conv(cfg, method.error_type.as_deref());
+             let err_conv = match cfg.async_pattern {
+-                AsyncPattern::Pyo3FutureIntoPy => {
+-                    ".map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))"
+-                }
++                AsyncPattern::Pyo3FutureIntoPy => pyo3_err_conv.as_str(),
+                 AsyncPattern::NapiNativeAsync => ".map_err(alef_napi_err)",
+                 AsyncPattern::WasmNativeAsync => ".map_err(alef_wasm_err)",
+                 AsyncPattern::TokioBlockOn => {
+diff --git a/src/codegen/generators/methods/static_methods.rs b/src/codegen/generators/methods/static_methods.rs
+index ba96633f6..ed7c97db4 100644
+--- a/src/codegen/generators/methods/static_methods.rs
++++ b/src/codegen/generators/methods/static_methods.rs
+@@ -156,10 +156,11 @@ pub fn gen_static_method(
+     } else {
+         let core_call = format!("{core_type_path}::{}({call_args})", actual_method_name);
+         if method.error_type.is_some() {
++            // Typed `{error}_to_py_err` converter when the pyo3 backend registered one, as
++            // free functions already do (alef #452); generic `PyRuntimeError` otherwise. ~keep
++            let pyo3_err_conv = crate::codegen::generators::binding_helpers::resolve_err_conv(cfg, method.error_type.as_deref());
+             let err_conv = match cfg.async_pattern {
+-                AsyncPattern::Pyo3FutureIntoPy => {
+-                    ".map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))"
+-                }
++                AsyncPattern::Pyo3FutureIntoPy => pyo3_err_conv.as_str(),
+                 AsyncPattern::NapiNativeAsync => ".map_err(alef_napi_err)",
+                 AsyncPattern::WasmNativeAsync => ".map_err(alef_wasm_err)",
+                 AsyncPattern::TokioBlockOn => {

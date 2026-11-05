@@ -1,0 +1,45 @@
+# alef ownership record -- COMMIT THIS FILE, do not add it to .gitignore.
+#
+# Lists the alef-generated paths whose format cannot carry an `alef:hash:`
+# provenance marker (`package.json`, `*.jar`, ...). Every other format proves
+# alef's ownership from the marker in the file itself and never appears here.
+# Without this list committed, a fresh clone cannot tell an alef-generated
+# `package.json` from a hand-written one and refuses to regenerate it.
+#
+# Ownership is a fact about history, not about content: a path lands here only
+# because alef created the file, or because a human ran `alef adopt` on it.
+# Nothing here is inferred by comparing bytes against generated output -- a
+# hand-written file that happens to match must never be claimed. Do not hand-add
+# entries; run `alef adopt <path>`, read the diff it prints, and let it write.
+
+owned_paths = [
+  ".gitattributes",
+  "crates/mzstd-bindings-node/.gitignore",
+  "crates/mzstd-bindings-node/LICENSE",
+  "crates/mzstd-bindings-node/README.md",
+  "crates/mzstd-bindings-node/binding.cjs",
+  "crates/mzstd-bindings-node/index.mjs",
+  "crates/mzstd-bindings-node/npm/darwin-arm64/package.json",
+  "crates/mzstd-bindings-node/npm/darwin-x64/package.json",
+  "crates/mzstd-bindings-node/npm/linux-arm64-gnu/package.json",
+  "crates/mzstd-bindings-node/npm/linux-arm64-musl/package.json",
+  "crates/mzstd-bindings-node/npm/linux-x64-gnu/package.json",
+  "crates/mzstd-bindings-node/npm/linux-x64-musl/package.json",
+  "crates/mzstd-bindings-node/npm/win32-arm64-msvc/package.json",
+  "crates/mzstd-bindings-node/npm/win32-x64-msvc/package.json",
+  "crates/mzstd-bindings-node/package.json",
+  "crates/mzstd-bindings-wasm/LICENSE",
+  "crates/mzstd-bindings-wasm/README.md",
+  "crates/mzstd-bindings-wasm/package.json",
+  "docs/reference/api-python.md",
+  "docs/reference/api-rust.md",
+  "docs/reference/api-typescript.md",
+  "docs/reference/api-wasm.md",
+  "docs/reference/configuration.md",
+  "docs/reference/errors.md",
+  "docs/reference/types.md",
+  "packages/python/LICENSE",
+  "packages/python/README.md",
+  "packages/python/mzstd/_mzstd.pyi",
+  "packages/python/mzstd/py.typed",
+]

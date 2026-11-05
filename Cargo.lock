@@ -711,6 +711,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mzstd-bindings"
+version = "0.2.11"
+dependencies = [
+ "mzstd",
+ "thiserror",
+ "zstd-ffi",
+]
+
+[[package]]
 name = "mzstd-ffi"
 version = "0.2.11"
 dependencies = [

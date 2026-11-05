@@ -42,3 +42,12 @@ fuzz/libfuzzer/coverage/
 
 # Python bytecode from the benchmark report scripts.
 __pycache__/
+
+# Build output of the alef-generated bindings (see bindings/README.md).
+/bindings/target/
+/bindings/crates/mzstd-bindings-wasm/pkg/
+/bindings/crates/mzstd-bindings-node/*.node
+/bindings/crates/mzstd-bindings-node/index.native.d.ts
+/bindings/crates/mzstd-bindings-node/node_modules/
+/bindings/crates/mzstd-bindings-wasm/node_modules/
+/bindings/packages/python/.venv/
