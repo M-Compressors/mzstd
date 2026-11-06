@@ -276,6 +276,17 @@ fn count_tail(a: &[u8], b: &[u8], matched: usize) -> usize {
     }
 }
 
+/// How many bytes `a` and `b` share at their ends: how far a match extends
+/// backwards when `a` ends at its position and `b` at its candidate.
+#[inline(always)]
+pub(crate) fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
 /// The two segments of history visible to one block.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Window<'a> {
@@ -320,11 +331,10 @@ impl Window<'_> {
         if a >= boundary {
             return self.count_2segments(a, b, limit, boundary, boundary);
         }
-        let mut n = 0u32;
-        while a + n < limit && self.byte_at(a + n) == self.byte_at(b + n) {
-            n += 1;
-        }
-        n as usize
+        (a..limit)
+            .zip(b..)
+            .take_while(|&(x, y)| self.byte_at(x) == self.byte_at(y))
+            .count()
     }
 
     /// `ZSTD_count_2segments`: a match starting in `ext` at `m` continues
@@ -604,6 +614,18 @@ pub(crate) fn hash3_ptr(mem: &Mem<'_>, index: u32, h_bits: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_suffix_stops_at_the_first_difference_or_the_shorter_side() {
+        assert_eq!(common_suffix(b"", b""), 0);
+        assert_eq!(common_suffix(b"abc", b""), 0);
+        assert_eq!(common_suffix(b"", b"abc"), 0);
+        assert_eq!(common_suffix(b"xbc", b"ybc"), 2);
+        assert_eq!(common_suffix(b"abc", b"abd"), 0);
+        assert_eq!(common_suffix(b"bc", b"abc"), 2);
+        assert_eq!(common_suffix(b"abc", b"bc"), 2);
+        assert_eq!(common_suffix(b"abc", b"abc"), 3);
+    }
 
     #[test]
     fn candidate_words_reject_stale_indices_and_partial_tails() {

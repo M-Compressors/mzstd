@@ -123,24 +123,24 @@ fn normalize_m2(
     let low_threshold = (total >> table_log) as u32;
     let mut low_one = ((total * 3) >> (table_log + 1)) as u32;
 
-    for s in 0..symbols {
-        if count[s] == 0 {
-            norm[s] = 0;
+    for (n, &c) in norm[..symbols].iter_mut().zip(count) {
+        if c == 0 {
+            *n = 0;
             continue;
         }
-        if count[s] <= low_threshold {
-            norm[s] = low_prob_count;
+        if c <= low_threshold {
+            *n = low_prob_count;
             distributed += 1;
-            total -= count[s] as usize;
+            total -= c as usize;
             continue;
         }
-        if count[s] <= low_one {
-            norm[s] = 1;
+        if c <= low_one {
+            *n = 1;
             distributed += 1;
-            total -= count[s] as usize;
+            total -= c as usize;
             continue;
         }
-        norm[s] = NOT_YET_ASSIGNED;
+        *n = NOT_YET_ASSIGNED;
     }
     let mut to_distribute = (1u32 << table_log) - distributed;
 
@@ -151,11 +151,11 @@ fn normalize_m2(
     if total / to_distribute as usize > low_one as usize {
         // Risk of rounding to zero.
         low_one = ((total * 3) / (to_distribute as usize * 2)) as u32;
-        for s in 0..symbols {
-            if norm[s] == NOT_YET_ASSIGNED && count[s] <= low_one {
-                norm[s] = 1;
+        for (n, &c) in norm[..symbols].iter_mut().zip(count) {
+            if *n == NOT_YET_ASSIGNED && c <= low_one {
+                *n = 1;
                 distributed += 1;
-                total -= count[s] as usize;
+                total -= c as usize;
             }
         }
         to_distribute = (1u32 << table_log) - distributed;
@@ -165,12 +165,12 @@ fn normalize_m2(
         // Every symbol is rare: give the remainder to the most frequent.
         let mut max_v = 0;
         let mut max_c = 0;
-        for (s, &c) in count.iter().enumerate().take(symbols) {
+        count[..symbols].iter().enumerate().for_each(|(s, &c)| {
             if c > max_c {
                 max_v = s;
                 max_c = c;
             }
-        }
+        });
         norm[max_v] += to_distribute as i16;
         return Ok(());
     }
@@ -805,6 +805,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn secondary_normalization_matches_the_reference_on_its_rare_branches() {
+        // A long tail of ones leaves the rest too little of the table, so
+        // the low threshold is raised and a second pass catches the 600.
+        let mut raised = [1u32; 16];
+        raised[13] = 600;
+        raised[14] = 4693;
+        raised[15] = 4694;
+        // Every symbol rounds up to two cells, then counts as rare.
+        let all_rare = [1u32; 22];
+        for count in [&raised[..], &all_rare[..]] {
+            let total: usize = count.iter().map(|&c| c as usize).sum();
+            for low_prob in [false, true] {
+                let mut norm = alloc::vec![0i16; count.len()];
+                let log =
+                    normalize_count(&mut norm, 5, count, total, count.len() as u32 - 1, low_prob);
+                let (expected, expected_log) =
+                    zstd_ffi::oracle::fse_normalize_count(count, total, 5, low_prob)
+                        .expect("the reference normalizes");
+                assert_eq!(log, Ok(expected_log as u32), "{count:?}");
+                assert_eq!(norm, expected, "{count:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rare_symbols_give_the_remainder_to_the_first_most_frequent() {
+        let mut count = [10u32; 24];
+        count[0] = 9;
+        count[2] = 11;
+        count[3] = 11;
+        let mut norm = [0i16; 24];
+        assert_eq!(normalize_m2(&mut norm, 5, &count, 241, 23, 1), Ok(()));
+        let mut expected = [1i16; 24];
+        expected[2] = 9;
+        assert_eq!(norm, expected);
     }
 
     #[test]

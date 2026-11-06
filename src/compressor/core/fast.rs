@@ -13,8 +13,8 @@ use fearless_simd_macros::simd;
 use super::cdict::TableLoad;
 use super::match_state::{BlockInput, DictMatchState, MatchState};
 use super::mem::{
-    count_at_simd, count_behind_simd, count_slices_simd, hash_at, hash_ptr, hash_word, load32,
-    load64, prefetch_l1, probe_pair, probe_window, window_word,
+    common_suffix, count_at_simd, count_behind_simd, count_slices_simd, hash_at, hash_ptr,
+    hash_word, load32, load64, prefetch_l1, probe_pair, probe_window, window_word,
 };
 use super::params::SHORT_CACHE_TAG_BITS;
 use super::seq_store::{
@@ -878,13 +878,8 @@ fn compress_block_ext_dict_mls<S: Simd, const MLS: u32>(
                 // The match extends backwards within its own segment, down
                 // to the segment's lowest valid index (offset 0 there).
                 let (history, at) = locate(idx);
-                let mut at = at as usize;
-                let mut back = 0;
-                while ip0 > anchor && at > 0 && src[ip0 - 1] == history[at - 1] {
-                    ip0 -= 1;
-                    at -= 1;
-                    back += 1;
-                }
+                let back = common_suffix(&src[anchor..ip0], &history[..at as usize]);
+                ip0 -= back;
                 match0 = idx - back as u32;
                 m_length = back + 4;
             }
@@ -1152,16 +1147,11 @@ fn compress_block_dms_mls<S: Simd, const MLS: u32>(
                     let offset = curr
                         .wrapping_sub(dict_match_index)
                         .wrapping_sub(dict.index_delta);
-                    let mut dict_match = dict_offset as usize;
-                    let mut length = dict.count_2segments(simd, src, ip0 + 4, dict_match + 4) + 4;
-                    while ip0 > anchor
-                        && dict_match > 0
-                        && src[ip0 - 1] == dict.bytes[dict_match - 1]
-                    {
-                        ip0 -= 1;
-                        dict_match -= 1;
-                        length += 1;
-                    }
+                    let dict_match = dict_offset as usize;
+                    let forward = dict.count_2segments(simd, src, ip0 + 4, dict_match + 4) + 4;
+                    let back = common_suffix(&src[anchor..ip0], &dict.bytes[..dict_match]);
+                    ip0 -= back;
+                    let length = forward + back;
                     offset_2 = offset_1;
                     offset_1 = offset;
                     seq_store.store_seq_from(
@@ -1181,14 +1171,12 @@ fn compress_block_dms_mls<S: Simd, const MLS: u32>(
                 match_index.wrapping_sub(prefix_start_index),
                 read32(ip0),
             ) {
-                let mut m = (match_index - prefix_start_index) as usize;
+                let m = (match_index - prefix_start_index) as usize;
                 let offset = (ip0 - m) as u32;
-                let mut length = count_at_simd(simd, src, ip0 + 4, m + 4) + 4;
-                while ip0 > anchor && m > 0 && src[ip0 - 1] == src[m - 1] {
-                    ip0 -= 1;
-                    m -= 1;
-                    length += 1;
-                }
+                let forward = count_at_simd(simd, src, ip0 + 4, m + 4) + 4;
+                let back = common_suffix(&src[anchor..ip0], &src[..m]);
+                ip0 -= back;
+                let length = forward + back;
                 offset_2 = offset_1;
                 offset_1 = offset;
                 seq_store.store_seq_from(

@@ -14,6 +14,46 @@
   requests through `hotpath-relay.yml`, which now uses
   `hotpath-rs/hotpath-relay` v1.0.0 directly. The published crate is
   unchanged.
+- **Simple loops rewritten with iterators**, with no change in behaviour.
+  Index and accumulator loops in `entropy::{fse, hist, huf, read, sequences}`,
+  `split_block`, `mem`, `fast` (backward extension in the external-dictionary
+  and dictionary-match-state scans, through a new private
+  `mem::common_suffix`), `shared::xxhash`'s digest, the framing metadata
+  checks, the seek reader and the decoder's Huffman fills now
+  use `zip`, `take`, `for_each`, `fold`, `any`, `rposition`,
+  `take_while().count()`, `fill` and `as_chunks`. Each site keeps whichever of
+  a slice and `take` executes fewer instructions; `take` also removes the panic
+  branch where it wins, and on a violated length invariant truncates instead of
+  panicking. Rewrites that cost instructions or read worse were rolled back and
+  these loops stay as they were: `common_suffix` in the hot `double_fast` and
+  `lazy` scans (slicing before the loop on every match, up to +7.5%
+  instructions at level 3) and in `double_fast`'s dictionary scan (+0.7%),
+  `fold` for the Huffman round budget (+0.34% decoding), `filter` in
+  `huf::sort` (+8.7% of its own instructions), `fold` in `ldm`'s one-shot XXH64
+  (+2.3% of its own), and the histogram merge and `val_per_rank` zips, which
+  gained nothing and read worse. `skip`/`take` and checked slices in `fast`'s
+  backward extension were tried too and cost +2.8% to +4.3% on a level 1
+  external dictionary, so those sites keep slices. `ldm` no longer ports
+  `ZSTD_ldm_gear_reset`: the reference hashes into a local and leaves the state
+  unchanged, so the call had no effect. Output is byte-identical to
+  the previous commit on 47,352 records (850,659,076 bytes): every file of
+  `testdata/` and `zstd-ffi/vendor/zstd` at levels -7, -5, -3, -2, -1 and 1 to
+  22, streaming sessions, dictionaries, explicit parameters, LDM, parallel and
+  framed output, every available backend (SSE2 to AVX-512) on synthetic inputs,
+  and decoder results on golden, corrupted and truncated frames.
+  `perf stat -e instructions:u`, median of three runs on five files of that
+  corpus, AVX-512 host, release binaries with `codegen-units=1`: compression
+  -0.009% in total (45 file and level pairs), decompression -0.004% (15 pairs),
+  dictionary compression -0.53% (6 cases; `fast` at level 1 -2.3% with an
+  external dictionary, -0.7% with an attached one), LDM, streaming and
+  checksums -0.005% (4 cases); none of the 70 cases executes more instructions.
+  One unit is used because the default 16 move inlining between untouched
+  functions: removing the gear reset alone gives -1.38% on LDM at level 3 with
+  16 units and -0.0004% with one. With 16 units the totals are -0.007%, -0.004%,
+  -0.53% and -0.15%, worst case +0.006%. Callgrind on `profile_compressor
+  testdata/alice29.txt` (16 units, AVX2): 3,746,062,454 instructions before,
+  3,745,600,282 after. Timing was not measured. Two tests now reach the rare
+  branches of `normalize_m2`.
 
 ## [v0.2.11](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.11) - 2026-11-03
 
