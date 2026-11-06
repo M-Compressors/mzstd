@@ -434,8 +434,7 @@ fn resolve_off_codes(d_rep: &mut [u32; REP_NUM], c_rep: &mut [u32; REP_NUM], sto
         LongLength::Literal(pos) => pos as usize,
         _ => nb_seq,
     };
-    for idx in 0..nb_seq {
-        let seq = &mut store.sequences_mut()[idx];
+    for (idx, seq) in store.sequences_mut()[..nb_seq].iter_mut().enumerate() {
         let ll0 = seq.lit_length == 0 && idx != long_lit_len_idx;
         let off_base = seq.off_base;
         if offbase_is_repcode(off_base) {

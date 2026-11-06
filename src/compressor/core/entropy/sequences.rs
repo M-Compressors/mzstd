@@ -100,14 +100,16 @@ fn ncount_cost(count: &[u32], max: u32, nb_seq: usize, fse_log: u32) -> Result<u
 
 /// Entropy bound of `count` in bits (`ZSTD_entropyCost`).
 fn entropy_cost(count: &[u32], max: u32, total: usize) -> usize {
-    let mut cost: u32 = 0;
-    for &c in &count[..=max as usize] {
-        let mut norm = ((256 * c as usize) / total) as u32;
-        if c != 0 && norm == 0 {
-            norm = 1;
-        }
-        cost = cost.wrapping_add(c.wrapping_mul(INVERSE_PROBABILITY_LOG256[norm as usize]));
-    }
+    let cost = count[..=max as usize]
+        .iter()
+        .copied()
+        .fold(0u32, |cost, c| {
+            let mut norm = ((256 * c as usize) / total) as u32;
+            if c != 0 && norm == 0 {
+                norm = 1;
+            }
+            cost.wrapping_add(c.wrapping_mul(INVERSE_PROBABILITY_LOG256[norm as usize]))
+        });
     (cost >> 8) as usize
 }
 
@@ -143,12 +145,15 @@ pub(crate) fn cross_entropy_cost(
     max: u32,
 ) -> usize {
     let shift = 8 - accuracy_log;
-    let mut cost = 0usize;
-    for s in 0..=max as usize {
-        let norm_acc = if norm[s] != -1 { norm[s] as u32 } else { 1 };
-        let norm256 = norm_acc << shift;
-        cost += count[s] as usize * INVERSE_PROBABILITY_LOG256[norm256 as usize] as usize;
-    }
+    let cost = count
+        .iter()
+        .zip(norm)
+        .take(max as usize + 1)
+        .fold(0usize, |cost, (&c, &n)| {
+            let norm_acc = if n != -1 { n as u32 } else { 1 };
+            let norm256 = norm_acc << shift;
+            cost + c as usize * INVERSE_PROBABILITY_LOG256[norm256 as usize] as usize
+        });
     cost >> 8
 }
 

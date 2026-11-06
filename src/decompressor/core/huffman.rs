@@ -382,9 +382,10 @@ fn single_rounds<const K: usize>(
                 done += K;
                 continue;
             };
-            for count in &mut decoded[..stopped] {
-                *count = K;
-            }
+            decoded
+                .iter_mut()
+                .take(stopped)
+                .for_each(|count| *count = K);
             break 'rounds;
         }
     }
@@ -726,9 +727,7 @@ fn fill_long_runs(
     for &symbol in symbols {
         let chunk = [row(symbol, nb_bits); 16];
         if let Some(run) = rows.get_mut(start..start + len) {
-            for rows in run.as_chunks_mut::<16>().0 {
-                *rows = chunk;
-            }
+            run.as_chunks_mut::<16>().0.fill(chunk);
         }
         start += len;
     }
