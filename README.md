@@ -80,8 +80,50 @@ capacity from the frame header.
 
 ### External benchmarks
 
-- [lzbench](https://github.com/inikep/lzbench)
-- [TurboBench](https://github.com/powturbo/TurboBench)
+#### lzbench
+
+<details>
+<summary>lzbench 2.4.1 results for mzstd 0.2.11 and zstd 1.5.7</summary>
+
+[lzbench](https://github.com/inikep/lzbench) is a long-running open-source
+in-memory benchmark: every codec is built from source into one binary with the
+same compiler and flags and runs on the same data and machine. We ran lzbench
+master at [`a6fa8aa`][lzbench-commit] (lzbench 2.4.1, gcc 15.2, C and Rust
+codecs built with `-march=native`) on the 211 MB `silesia.tar` of the
+[Silesia corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia),
+pinned to one thread of an AMD Ryzen 9 7950X VDS, with `-t8,8`.
+[Command and raw output][lzbench-run].
+
+mzstd 0.2.11 against zstd 1.5.7; bold marks the faster result. Ratio is the
+compressed size as a percentage of the input and matches for both: every frame
+is byte-identical.
+
+| Level | Compress mzstd | Compress zstd | Decompress mzstd | Decompress zstd | Ratio, % |
+| ----: | -------------: | ------------: | ---------------: | --------------: | -------: |
+| -22      |  **2.19 MB/s** |     2.00 MB/s |        1418 MB/s |   **1590 MB/s** | 24.67 |
+| -18      |  **4.58 MB/s** |     4.17 MB/s |        1713 MB/s |   **1859 MB/s** | 25.15 |
+| -15      |  **8.21 MB/s** |     7.95 MB/s |        1954 MB/s |   **2102 MB/s** | 26.83 |
+| -11      |      37.9 MB/s | **40.0 MB/s** |        1879 MB/s |   **2037 MB/s** | 27.35 |
+| -8       |      95.4 MB/s |  **103 MB/s** |        1886 MB/s |   **2011 MB/s** | 28.17 |
+| -5       |       198 MB/s |  **207 MB/s** |        1722 MB/s |   **1847 MB/s** | 29.60 |
+| -3       |       354 MB/s |  **363 MB/s** |        1728 MB/s |   **1869 MB/s** | 31.20 |
+| -2       |       505 MB/s |  **528 MB/s** |        1784 MB/s |   **1940 MB/s** | 32.70 |
+| -1       |       601 MB/s |  **643 MB/s** |        1867 MB/s |   **2122 MB/s** | 34.53 |
+| --fast=1 |       661 MB/s |  **711 MB/s** |        2522 MB/s |   **2689 MB/s** | 41.01 |
+| --fast=3 |       747 MB/s |  **809 MB/s** |        2683 MB/s |   **2841 MB/s** | 44.63 |
+| --fast=5 |       826 MB/s |  **882 MB/s** |        2863 MB/s |   **3034 MB/s** | 48.61 |
+
+**Summary:** byte-identical output at every level; **3–10% faster**
+compression at levels 15–22, 2.5–7.7% slower at levels -5 to 11, and
+decompression 5.6–12% behind C. A repeat of levels 1 and 3 reproduced every
+speed within 2%. lzbench compresses the whole archive as one frame, so it
+measures large-input throughput; the medians above also weight empty and tiny
+inputs, where mzstd is much faster.
+
+</details>
+
+#### TurboBench
+Results available [here](https://github.com/powturbo/TurboBench).
 
 ## Usage
 
@@ -276,3 +318,5 @@ conditions.
 [decoder-bench-chart]: ./docs/benchmarks/decoders/charts/overview.svg
 [decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
 [silesia]: ./docs/benchmarks/silesia.md
+[lzbench-commit]: https://github.com/inikep/lzbench/tree/a6fa8aa758932a02841c0cc68c07e5abf8870951
+[lzbench-run]: ./docs/benchmarks/lzbench-2026-11-08.md

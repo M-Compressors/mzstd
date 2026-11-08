@@ -57,6 +57,15 @@ level 12, with level -1 (1.006) and dfast level 3 (0.997) unchanged in the
 median.
 [Report](silesia.md).
 
+## lzbench — 2026-11-08
+
+lzbench master `a6fa8aa` (2.4.1), gcc 15.2 with `-march=native`, `silesia.tar`
+as one frame on one vCPU of the AMD Ryzen 9 7950X VDS: mzstd 0.2.11 writes
+byte-identical output to zstd 1.5.7 at every level, compresses 3–10% faster at
+levels 15–22 and 2.5–7.7% slower at levels -5 to 11, and decompresses
+5.6–12% slower at every level.
+[Command, environment and raw output](lzbench-2026-11-08.md).
+
 ## How to interpret the results
 
 The cold suites time construction, allocation, the call and disposal.

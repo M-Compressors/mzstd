@@ -8,6 +8,13 @@
   inheriting the repository's default `GITHUB_TOKEN` permissions, which
   resolves CodeQL's `actions/missing-workflow-permissions` alerts. None of
   them writes to the repository; the published crate is unchanged.
+- **lzbench results in the README.** The external-benchmarks list is replaced
+  by an lzbench table: lzbench master `a6fa8aa` (2.4.1) on `silesia.tar`,
+  mzstd 0.2.11 against zstd 1.5.7 at levels -5 to 22, with byte-identical
+  sizes, faster compression at 15-22 and slower compression below 15 and
+  decompression at every level. The command, environment, raw output and a
+  repeatability check are in `docs/benchmarks/lzbench-2026-11-08.md`.
+  Documentation only; the crate is unchanged.
 - **hotpath 0.31 and Criterion benchmarks on hotpath Cloud**, ported from
   mbrotli. The optional `hotpath` dependency is updated to 0.31.0, whose
   Callgrind mode leaves the profiler's own overhead out of the instruction
