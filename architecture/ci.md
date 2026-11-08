@@ -51,6 +51,13 @@ graph TD
 | `ci-sanitizer.yml` | `v*` tags, manual | Nightly `-Zsanitizer=address` release builds, LeakSanitizer included: every integration test with `framed` (the two that forget an owning guard on purpose without leak detection), then the kernel and uninitialized-output unit modules on the runner's own backends. |
 | `release.yml` | manual from a `v*` tag | Tag/version match, then `cargo publish` through crates.io trusted publishing. |
 
+`ci.yml`, `ci-lean.yml`, `ci-coverage.yml`, `ci-benchmarks.yml`,
+`ci-fuzz.yml`, `ci-miri.yml` and `ci-sanitizer.yml` declare
+`permissions: contents: read` at the workflow level: they only check out,
+build, test and upload artifacts, so their `GITHUB_TOKEN` needs nothing
+more. The ClusterFuzzLite workflows use `read-all`, and the hotpath and
+release workflows grant permissions per job.
+
 All Cargo invocations that build the workspace pass `--locked`, because
 `Cargo.lock` is committed so that benchmark baselines and campaigns are
 reproducible.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Read-only token for the CI workflows.** `ci.yml`, `ci-lean.yml`,
+  `ci-coverage.yml`, `ci-benchmarks.yml`, `ci-fuzz.yml`, `ci-miri.yml` and
+  `ci-sanitizer.yml` now declare `permissions: contents: read` instead of
+  inheriting the repository's default `GITHUB_TOKEN` permissions, which
+  resolves CodeQL's `actions/missing-workflow-permissions` alerts. None of
+  them writes to the repository; the published crate is unchanged.
 - **hotpath 0.31 and Criterion benchmarks on hotpath Cloud**, ported from
   mbrotli. The optional `hotpath` dependency is updated to 0.31.0, whose
   Callgrind mode leaves the profiler's own overhead out of the instruction
