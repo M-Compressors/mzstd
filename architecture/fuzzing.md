@@ -49,7 +49,7 @@ the payload, so every target shares one seed corpus.
 | Target | Oracle |
 | --- | --- |
 | `differential_c` | `Compressor::compress` equals `ZSTD_compress2` with the same parameters, and the frame decodes. |
-| `output_capacity` | `compress_to_slice` into an arbitrary capacity returns the reference's frame, or `OutputTooSmall` exactly when `ZSTD_compress2` fails; `compress_to_uninit` into the same capacity returns the same result and frame. |
+| `output_capacity` | `compress_to_slice` into an arbitrary capacity returns the reference's frame, or `OutputTooSmall` exactly when `ZSTD_compress2` fails (a reference write past the capacity counts as a failure; see [encoder verification](encoder-verification.md#destinations-the-reference-overruns)); `compress_to_uninit` into the same capacity returns the same result and frame. |
 | `encoder_session` | A session driven by random chunks, flushes and output capacity, with calls alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
 | `compressor_lifecycle` | Reuse, `reconfigure` and `trim(ReleaseAll)` never change a frame. |
 | `parallel` | Parallel frames decode with the reference and are identical for 1–8 tasks run in reverse order, whether the batch borrows the input or reads it from a `SeekSource` through `prepare_source` with each task on a detached thread. A session (windows 1–4, an optional flush, calls alternating `process` and `process_uninit`, which must leave every byte past `produced` untouched) and the `ParallelEncoderWriter`/`ParallelEncoderReader` adapters (one executor thread each) decode; with a declared size, or an input within one segment, and no flush they equal the batch frame; the writer always equals the session driven with the same writes and flush. |
@@ -184,6 +184,25 @@ found no crashes or hangs: `differential_c` 1,470 new corpus items,
 3,365, `parallel` 185, `parameter_parsing` 3,683, `decompress` 387,
 `decode_streaming` 1,119, `decode_roundtrip` 226, `decode_dictionary`
 1,174, `compress_dictionary` 2,746.
+
+The CI campaign for the 0.2.12 tag (2026-11-09) failed in
+`output_capacity`, again on the oracle rather than mzstd. With
+`ZSTD_c_targetCBlockSize`, zstd 1.5.7's `ZSTD_compressSubBlock_literal` and
+`ZSTD_compressSubBlock_sequences` copy the Huffman and FSE table
+descriptions without checking the room left, so `ZSTD_compress2` into a
+destination somewhat smaller than the frame wrote past the
+`compress2_capacity` buffer and corrupted the heap. Persistent mode runs
+many inputs in one process, so the abort landed on a later, innocent
+input: the CI crash does not reproduce alone, while a short local run
+from it found inputs that crash deterministically in `ZSTD_freeCCtx`.
+`compress2_capacity` now passes the capacity with a guard band behind it
+and reports a write into the band as `CAPACITY_OVERRUN`; mzstd returns
+`OutputTooSmall` at each such capacity. Both inputs are kept as
+`regressions/output_capacity/{target-block-reference-overrun,ci-2026-11-09-after-reference-overrun}.bin`,
+`zstd-ffi/tests/oracle_capacity_overrun.rs` covers the oracle, and
+`tests/compressor_target_block.rs` compares mzstd at every capacity of
+such frames. A 5-minute run from the findings afterwards found no crashes
+(2,420 new corpus items), where 45 seconds had found 13 before.
 
 ## libFuzzer adapters and ClusterFuzzLite
 

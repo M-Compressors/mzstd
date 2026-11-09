@@ -72,12 +72,46 @@ build copies small functions into each test binary that calls them, and
 calls through those copies are not credited to `src/`. The report then shows
 public functions as missed even though tests call them.
 
+## Destinations the reference overruns
+
+zstd 1.5.7 does not always stay inside the destination of a one-shot call.
+With `ZSTD_c_targetCBlockSize`, `ZSTD_compress2` compresses straight into
+the caller's buffer, and the sub-block writer copies the Huffman and FSE
+table descriptions without checking the room left; the writers after it
+then see a wrapped-around capacity. `oracle::compress2_capacity` therefore
+allocates the capacity plus a guard band of `ZSTD_compressBound(len)` and
+one block, fills it with a marker byte, passes only the capacity to the
+reference, and reports `CAPACITY_OVERRUN` when the band changed or the
+reported size exceeds the capacity. Streaming calls are not affected: the
+reference compresses into its own buffer unless the room left covers
+`ZSTD_compressBound` of the input.
+
+```mermaid
+flowchart TD
+    A["compress2_capacity(input, params, capacity)"] --> B["buffer = capacity + compressBound(len) + 128 KiB, filled with 0xA5"]
+    B --> C["ZSTD_compress2(dst, capacity, ...)"]
+    C --> D{"guard band changed, or size > capacity?"}
+    D -->|yes| E["Err(CAPACITY_OVERRUN)"]
+    D -->|no| F{"reference error?"}
+    F -->|yes| G["Err(error name)"]
+    F -->|no| H["Ok(frame)"]
+```
+
+mzstd never writes past its destination; at every capacity the reference
+overruns it returns `EncodeError::OutputTooSmall`
+(`tests/compressor_target_block.rs`,
+`capacities_the_reference_overruns_fail_with_output_too_small`), so the
+comparisons treat an overrun as the reference failing.
+
 ## Known gaps
 
 - Comparing against the reference catches any change in output. It cannot
   show that the reference's own heuristics are good.
 - Inputs above a few megabytes are covered only by the parallel tests and
   the overflow-correction mode, not by the level matrix.
+- Where zstd 1.5.7 overruns a target-block destination, there is no
+  reference result to compare with; only mzstd's `OutputTooSmall` is
+  checked there.
 
 ## OpenZL integration
 

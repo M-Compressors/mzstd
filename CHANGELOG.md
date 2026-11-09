@@ -2,6 +2,20 @@
 
 ## [v0.2.12](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.12) - 2026-11-09
 
+- **Fuzzing: the `output_capacity` oracle no longer corrupts the heap.**
+  With `ZSTD_c_targetCBlockSize`, zstd 1.5.7's sub-block writer
+  (`ZSTD_compressSubBlock_literal`, `ZSTD_compressSubBlock_sequences`)
+  copies table descriptions without checking the room left, so
+  `ZSTD_compress2` into a destination somewhat smaller than the frame
+  wrote past the buffer of `zstd_ffi::oracle::compress2_capacity`; the CI
+  fuzz campaign for v0.2.12 aborted on the corruption. The oracle now puts
+  a guard band after the capacity it passes and returns the new
+  `oracle::CAPACITY_OVERRUN` error when the reference writes into it or
+  reports more than the capacity. mzstd itself was not affected: it
+  returns `OutputTooSmall` at every such capacity, which
+  `tests/compressor_target_block.rs` now checks capacity by capacity.
+  New `zstd-ffi/tests/oracle_capacity_overrun.rs`, and two inputs in
+  `fuzz/afl/regressions/output_capacity/`.
 - **`ZSTD_c_targetCBlockSize` is implemented.** A target compressed block
   size cuts each block into sub-blocks of about that many compressed bytes,
   so a receiver can start decoding before a whole 128 KiB block has

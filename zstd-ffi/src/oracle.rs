@@ -473,12 +473,33 @@ pub fn compress2(input: &[u8], params: &Params) -> Result<Vec<u8>, String> {
     compress2_with_params(input, params).map(|(output, _)| output)
 }
 
+/// The error [`compress2_capacity`] reports when the reference wrote past
+/// the capacity it was given.
+pub const CAPACITY_OVERRUN: &str = "reference wrote past dstCapacity";
+
+/// Fill byte of the guard band after a [`compress2_capacity`] destination.
+const GUARD_BYTE: u8 = 0xA5;
+
+/// The largest block (`ZSTD_BLOCKSIZE_MAX`).
+const BLOCK_SIZE_MAX: usize = 1 << 17;
+
 /// `ZSTD_compress2` into a destination of exactly `capacity` bytes.
+///
+/// zstd 1.5.7 does not always stay inside that destination: with
+/// `ZSTD_c_targetCBlockSize`, `ZSTD_compressSubBlock_literal` and
+/// `ZSTD_compressSubBlock_sequences` copy the Huffman and FSE table
+/// descriptions without checking the room left, and the writers after
+/// them then see a wrapped-around capacity. The destination is therefore
+/// followed by a guard band large enough for a whole frame plus one
+/// discarded block attempt, and a call that writes into it, or reports
+/// more than `capacity` bytes, fails with [`CAPACITY_OVERRUN`] instead of
+/// corrupting the heap.
 ///
 /// # Errors
 ///
 /// Returns the reference's error name, including `Destination buffer is too
-/// small` when the frame does not fit.
+/// small` when the frame does not fit, or [`CAPACITY_OVERRUN`] when the
+/// reference wrote past `capacity`.
 pub fn compress2_capacity(
     input: &[u8],
     params: &Params,
@@ -486,19 +507,25 @@ pub fn compress2_capacity(
 ) -> Result<Vec<u8>, String> {
     let mut cctx = CCtx::new();
     cctx.configure(params)?;
-    let mut output = vec![0u8; capacity];
-    // SAFETY: both buffers are valid for the lengths passed and do not
-    // overlap; the context is live.
-    let written = check(unsafe {
+    let guard = compress_bound(input.len()) + BLOCK_SIZE_MAX;
+    let mut output = vec![GUARD_BYTE; capacity + guard];
+    // SAFETY: `output` is valid for `capacity + guard` bytes, more than the
+    // `capacity` passed and more than any frame of `input` (see above), and
+    // does not overlap `input`; the context is live.
+    let result = check(unsafe {
         ZSTD_compress2(
             cctx.0,
             output.as_mut_ptr().cast(),
-            output.len(),
+            capacity,
             input.as_ptr().cast(),
             input.len(),
         )
-    })?;
-    output.truncate(written);
+    });
+    let overran = output[capacity..].iter().any(|&byte| byte != GUARD_BYTE);
+    if overran || result.as_ref().is_ok_and(|&written| written > capacity) {
+        return Err(String::from(CAPACITY_OVERRUN));
+    }
+    output.truncate(result?);
     Ok(output)
 }
 

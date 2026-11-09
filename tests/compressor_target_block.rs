@@ -527,6 +527,55 @@ fn output_capacity_boundaries_agree_with_the_reference() {
     }
 }
 
+/// zstd 1.5.7 writes past a destination somewhat smaller than a
+/// target-block frame (see `zstd-ffi/tests/oracle_capacity_overrun.rs`):
+/// at every capacity where the reference overruns, mzstd stays inside the
+/// buffer and fails with `OutputTooSmall`, and at every other capacity
+/// it matches the reference. The 1,273-byte input reproduces the
+/// `output_capacity` fuzz finding of 2026-11-09.
+#[test]
+fn capacities_the_reference_overruns_fail_with_output_too_small() {
+    let config = config(4, MAX)
+        .with_checksum(true)
+        .with_content_size(false)
+        .with_params(
+            mzstd::CompressionParams::default()
+                .with_search_log(4)
+                .with_hash_log(12)
+                .with_chain_log(12),
+        );
+    let params = reference(4, MAX)
+        .with(ZSTD_c_checksumFlag, 1)
+        .with(ZSTD_c_contentSizeFlag, 0)
+        .with(ZSTD_c_searchLog, 4)
+        .with(ZSTD_c_hashLog, 12)
+        .with(ZSTD_c_chainLog, 12);
+    let inputs = [
+        corpus::text(1_273, 76),
+        corpus::text(1_300, 7),
+        corpus::mixed(5_000, 77),
+    ];
+    let mut overruns = 0;
+    let mut encoder = Compressor::new(config).unwrap();
+    for src in &inputs {
+        let frame = oracle::compress2(src, &params).unwrap();
+        assert!(encoder.compress(src).unwrap() == frame);
+        for capacity in 0..frame.len() + 16 {
+            let theirs = oracle::compress2_capacity(src, &params, capacity);
+            let mut out = vec![0xa5; capacity];
+            let ours = encoder.compress_to_slice(src, &mut out);
+            match (&ours, &theirs) {
+                (Ok(written), Ok(theirs)) => assert!(out[..*written] == theirs[..]),
+                (Err(mzstd::EncodeError::OutputTooSmall { .. }), Err(error)) => {
+                    overruns += usize::from(error == oracle::CAPACITY_OVERRUN);
+                }
+                _ => panic!("capacity {capacity}: {ours:?} vs {theirs:?}"),
+            }
+        }
+    }
+    assert!(overruns > 0, "the inputs reach the reference's overrun");
+}
+
 // ---- streaming --------------------------------------------------------
 
 /// Drives a session with a fresh 128 KiB output buffer per call, as
