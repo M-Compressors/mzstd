@@ -199,7 +199,13 @@ the call.
 `EncoderWriter` wraps a `Write` sink: `write` feeds `Continue`, `flush` feeds
 `Flush` and drains, and `finish`/`try_finish` feed `End`, returning the sink.
 `finish` reports a failure as `FinishError`, which keeps the writer so the
-caller can retry or recover the sink. `EncoderReader` wraps a `Read` source
+caller can retry or recover the sink. Compressed bytes stay in the
+writer's buffer until the sink takes them. A `write` whose input the
+session has taken returns that count even when delivering the output then
+fails (`drain_accepted`), so the caller never offers those bytes again;
+the next `write`, `flush` or `finish` delivers the pending bytes first and
+reports the failure if it persists. A failure before any input is taken
+is returned as the error. `EncoderReader` wraps a `Read` source
 and yields the compressed frame; it drives the session with `End` once the
 source is exhausted. Both use internal buffers of one block.
 `EncoderWriter` pulls compressed bytes into an owned buffer of

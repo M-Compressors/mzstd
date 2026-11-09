@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **The decoder accepts every Huffman literal section zstd 1.5.7 accepts.**
+  `Decompressor` rejected with `InvalidData { kind: HuffmanStream }` frames
+  that `ZSTD_decompress` decodes: the reference's fast four-stream Huffman
+  decoder (`HUF_decompress4X{1,2}_usingDTable_internal_fast`, used for
+  trees of at most 11 bits and streams of at least eight bytes) checks only
+  the regenerated length, so a stream may stop short of its first bit or
+  read on into the bytes before it; its pair decoder caps the bits a
+  stream's last pair reads; and a treeless block decodes with the decoder
+  type of the table it reuses. This was documented as a deliberate
+  exception. A section the exact decoder rejects is now decoded again by
+  `decompressor::core::huffman::reference`, a scalar port of the
+  reference's stream decoders and fast C loops, whose verdict and literals
+  stand; the table records the reference's decoder type (`TableKind`: the
+  `HUF_selectDecoder` choice for four streams, single symbols for one, pairs
+  for a dictionary's tree). Sections the exact decoder accepts decode as
+  before, and the port is out of line and runs only on error paths. 19
+  fuzz finds from a downstream crate, 67,500 damaged reference frames,
+  24,000 damaged dictionary frames and 300,000 synthetic sections now get
+  the reference's verdict and bytes (before: 9,838 and 954 of the damaged
+  frames were rejected where the reference decodes them). New fixtures in
+  `testdata/huffman-stream-ends`, `tests/decoder_huffman_ends.rs`, unit
+  tests, and five `fuzz/afl/regressions/decompress/huffman-stream-end-*`
+  inputs; `decoder_corruption` now requires the reference's verdict on
+  every damaged frame. On x86-64 hosts without BMI2, and 32-bit or
+  big-endian ones, the reference itself takes its general path and rejects
+  these sections; this decoder follows the fast path everywhere.
+- **`EncoderWriter::write` no longer reports a sink failure for input it
+  has taken.** When the session had consumed input and delivering the
+  compressed bytes then failed (for example with `WouldBlock`), `write`
+  returned the error, so a caller retrying the same bytes fed them twice:
+  the frame was corrupted, or with `InputSize::Exact` failed with
+  `InputSizeMismatch`. `write` now returns the consumed count; the bytes
+  stay pending and the next `write`, `flush` or `finish` reports the
+  failure if it persists. Failures before any input is taken are returned
+  as before. `ParallelEncoderWriter` and the framed `ResourceWriter`
+  already behaved this way; tests with a sink that refuses every other
+  write now cover all three.
 - **Read-only token for the CI workflows.** `ci.yml`, `ci-lean.yml`,
   `ci-coverage.yml`, `ci-benchmarks.yml`, `ci-fuzz.yml`, `ci-miri.yml` and
   `ci-sanitizer.yml` now declare `permissions: contents: read` instead of

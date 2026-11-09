@@ -1913,6 +1913,86 @@ impl std::io::Write for Scripted {
     }
 }
 
+/// A sink that refuses every other write with `WouldBlock` and takes the
+/// whole buffer otherwise.
+#[cfg(not(feature = "no_std"))]
+#[derive(Debug, Default)]
+struct Alternating {
+    bytes: Vec<u8>,
+    refuse: bool,
+    refused: usize,
+}
+
+#[cfg(not(feature = "no_std"))]
+impl std::io::Write for Alternating {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.refuse = !self.refuse;
+        if self.refuse {
+            self.refused += 1;
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "no_std"))]
+#[test]
+fn resource_writes_that_hit_a_blocking_sink_report_the_bytes_already_accepted() {
+    use std::io::{ErrorKind, Write};
+    let blocked = |error: &FramedEncodeError| matches!(error, FramedEncodeError::Io(e) if e.kind() == ErrorKind::WouldBlock);
+    let payload = corpus::text(400_000, 12);
+    let stream: StreamConfig = InputSize::Exact(payload.len() as u64).into();
+    let items = [FramedItem::Resource(FramedResource {
+        stream,
+        ..FramedResource::from(payload.as_slice())
+    })];
+    let mut owner = FramedCompressor::new(chunked(64 << 10)).expect("config");
+    let expected = owner.compress(items.as_slice().into()).expect("compress");
+    let mut writer = owner
+        .framed_writer(Alternating::default(), FramedEncodeStreamConfig::default())
+        .expect("writer");
+    let mut resource = loop {
+        match writer.resource(ResourceOptions::default(), stream) {
+            Ok(resource) => break resource,
+            Err(error) => assert!(blocked(&error), "{error}"),
+        }
+    };
+    let mut offered = 0;
+    for chunk in payload.chunks(30_000) {
+        let mut chunk = chunk;
+        while !chunk.is_empty() {
+            match resource.write(chunk) {
+                Ok(taken) => {
+                    offered += taken;
+                    chunk = &chunk[taken..];
+                }
+                Err(error) => assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}"),
+            }
+        }
+    }
+    assert_eq!(offered, payload.len());
+    while let Err(error) = resource.try_finish() {
+        assert!(blocked(&error), "{error}");
+    }
+    drop(resource);
+    let bytes = loop {
+        match writer.finish() {
+            Ok(sink) => break sink,
+            Err(failure) => {
+                assert!(blocked(&failure.error), "{}", failure.error);
+                writer = failure.writer;
+            }
+        }
+    };
+    assert!(bytes.refused > 1, "the sink refused deliveries");
+    assert_eq!(bytes.bytes, expected);
+}
+
 #[cfg(not(feature = "no_std"))]
 #[test]
 fn writer_transport_retries_short_interrupted_and_blocked_writes() {

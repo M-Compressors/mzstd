@@ -124,6 +124,15 @@ trained dictionary at several levels (also read as raw content, and with a
 12-bit window at level 22), with raw text, an empty dictionary (which must
 behave as none; this seed caught the first encoder mismatch) and the
 rejections: raw bytes as the Zstandard format and a truncated dictionary.
+`regressions/decompress/huffman-stream-end-*.bin` are frames whose Huffman
+streams are not consumed exactly and which zstd 1.5.7 accepts through its
+fast four-stream path (found by a downstream crate's fuzzer, four of them
+cut down to their literals and zeroed byte by byte); the target now
+decodes them and compares the bytes with the reference's. The
+`decompress` target checks only that what this decoder accepts the
+reference accepts identically; the other direction is checked by
+`tests/decoder_huffman_ends.rs` and `tests/decoder_corruption.rs`, since
+the documented exceptions make it false for arbitrary input.
 
 The [comparison benchmark](benchmarking.md)'s cases are regressions too.
 `tests/benchmark_corpora.rs` generates its eight inputs with the

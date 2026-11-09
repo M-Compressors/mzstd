@@ -8,7 +8,7 @@ mod decoder_support;
 use decoder_support::{
     Rng, compress, decode_fixed, mixed, params, records, reference_decompress, text,
 };
-use mzstd::{DecodeError, Decompressor, InvalidDataKind};
+use mzstd::{DecodeError, Decompressor};
 
 /// A few frames that between them use every block and table mode.
 fn sample_frames() -> Vec<(String, Vec<u8>)> {
@@ -72,8 +72,6 @@ fn compare(decoder: &mut Decompressor, input: &[u8], label: &str) -> (bool, bool
 fn corrupted_frames_never_panic_and_agree_with_the_reference() {
     let mut decoder = Decompressor::default();
     let mut rng = Rng::new(0xc0ffee);
-    let mut stricter = 0;
-    let mut trials = 0;
     for (name, frame) in sample_frames() {
         // Every single-bit flip of the first 64 bytes, then random damage.
         let header_bits = frame.len().min(64) * 8;
@@ -93,34 +91,11 @@ fn corrupted_frames_never_panic_and_agree_with_the_reference() {
             cases.push(damaged);
         }
         for (index, damaged) in cases.iter().enumerate() {
-            trials += 1;
             let label = format!("{name} case {index}");
-            match compare(&mut decoder, damaged, &label) {
-                (ours, reference) if ours == reference => {}
-                (true, false) => panic!("{label}: accepted what the reference rejects"),
-                _ => {
-                    // The reference's fast four-stream Huffman decoder only
-                    // checks the regenerated length, not that each stream
-                    // is consumed exactly as RFC 8878 requires; that is the
-                    // one check this decoder makes and it does not.
-                    let error = decoder.decompress(damaged).expect_err(&label);
-                    assert!(
-                        matches!(
-                            error,
-                            DecodeError::InvalidData {
-                                kind: InvalidDataKind::HuffmanStream
-                            }
-                        ),
-                        "{label}: rejected with {error:?} where the reference decodes"
-                    );
-                    stricter += 1;
-                }
-            }
+            // Including Huffman streams that are not consumed exactly,
+            // which the reference's fast four-stream decoder accepts.
+            let (ours, reference) = compare(&mut decoder, damaged, &label);
+            assert_eq!(ours, reference, "{label}: verdicts agree");
         }
     }
-    // The leniency only shows in frames without a checksum, and rarely.
-    assert!(
-        stricter * 20 < trials,
-        "{stricter} of {trials} stricter verdicts"
-    );
 }

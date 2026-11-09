@@ -132,6 +132,9 @@ flowchart TD
     Single --> Back[Sentinels back to containers]
     Pairs --> Back
     Back --> Tails[decode_tail per stream: exact end check]
+    Tail1 --> Verdict{exact?}
+    Tails --> Verdict
+    Verdict -->|no| Reference["decode_as_reference (cold, out of line): huffman::reference"]
 ```
 
 - Single rows are built for 12-bit lookups whatever the tree depth (each
@@ -218,7 +221,15 @@ flowchart TD
 - Selected pair streams continue with four pair lookups per refill while
   the remaining output has an 11-byte window. Every stream then finishes
   with the single-symbol table in the cautious loop and must be consumed
-  exactly; pair decoding never decides how a stream ends.
+  exactly; pair decoding never decides how a stream ends. A section that
+  fails that check is decoded again by the scalar port of the reference
+  (`huffman::reference`, see
+  [Huffman stream ends](decompressor.md#huffman-stream-ends)), whose
+  verdict stands. It is `#[cold]` and `#[inline(never)]`, and only error
+  paths reach it, so the loops above and the sections they accept are
+  unchanged; the hot path's choice of pair loops (`prefers_pairs` over the
+  streams' size) is independent of the reference's decoder type, which
+  only the port uses.
 - The loops reach a table through `TableAccess`: the decoder's own table
   (`&mut HuffmanTable`, `decode_streams`) builds its pair rows on first
   use, a dictionary's shared table (`&HuffmanTable`,

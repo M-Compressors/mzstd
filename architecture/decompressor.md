@@ -40,6 +40,7 @@ graph TD
         Block --> Literals[literals: LiteralsDecoder, Literals]
         Block --> Sequences[sequences: SequenceTables, execute]
         Literals --> Huffman[huffman: HuffmanTable, X1 and pair rounds]
+        Huffman --> HufRef["huffman::reference: the reference's stream-end verdicts, TableKind"]
         Huffman --> Fse[fse: distributions, FseTable, SeqTable, weights]
         Sequences --> Fse
         Sequences --> Copy[copy: wildcopies, short-offset shuffles]
@@ -461,7 +462,7 @@ flowchart TD
     Lit -->|RLE| Fill[fill literal buffer]
     Lit -->|Compressed| Tree[read Huffman tree: direct or FSE weights] --> Streams
     Lit -->|Treeless| Prev{previous tree?} -->|no| E3[LiteralsSection]
-    Prev -->|yes| Streams[decode 1 stream or 4 with jump table]
+    Prev -->|yes| Streams[decode 1 stream or 4 with jump table; see Huffman stream ends]
     Borrow --> Seq
     Fill --> Seq
     Streams --> Seq[Sequences header: count, modes]
@@ -478,8 +479,9 @@ flowchart TD
 Invariants each layer relies on:
 
 - **Bit readers.** Readers start after the end marker of the last byte (a
-  zero last byte is rejected); streams are valid only when consumed
-  exactly. `BitContainer` (Huffman and sequence streams) is refilled where
+  zero last byte is rejected); sequence streams are valid only when
+  consumed exactly, and Huffman streams whenever the reference accepts
+  them (see [Huffman stream ends](#huffman-stream-ends)). `BitContainer` (Huffman and sequence streams) is refilled where
   the reference refills, and once reads pass the start its unread-bit count wraps
   above 64, so such streams are rejected; the Huffman weight decoder
   reads zeros past the start through the same container and checks
@@ -502,7 +504,8 @@ Invariants each layer relies on:
   then symbol. Rows are replicated to a 12-bit lookup.
 - **Literals.** Regenerated size at most the block maximum; four streams
   need at least six literals and a 6-byte jump table plus four non-empty
-  streams; the Huffman table persists across blocks of one frame.
+  streams; the Huffman table persists across blocks of one frame, with the
+  decoder type (`TableKind`) the reference read it for.
 - **Sequences.** Repeat mode needs an earlier table in the frame; an RLE
   symbol must be in its alphabet. Each sequence is checked before it is
   executed: literal length within the remaining literals, block output
@@ -523,17 +526,87 @@ Invariants each layer relies on:
   may never exceed a declared content size and must equal it after the
   last block; the checksum is the low 32 bits of XXH64 with seed 0.
 
+## Huffman stream ends
+
+RFC 8878 calls a Huffman stream faulty unless decoding it consumes every
+bit exactly. zstd 1.5.7 (`huf_decompress.c`) does not always check that,
+and this decoder accepts exactly what it accepts:
+
+- **Fast four-stream path.** `HUF_decompress4X{1,2}_usingDTable_internal_fast`
+  runs for four streams when the tree is at most 11 bits deep (its table
+  log is then `HUF_DECODER_FAST_TABLELOG`), every stream holds at least
+  eight bytes, and the fourth segment is not empty. Its C loops read each
+  stream as a continuation of the bytes before it, down to the jump
+  table; each stream is then finished by `HUF_decodeStreamX{1,2}` over a
+  reader whose start is the jump table, and only the regenerated length is
+  checked. A stream may therefore stop short of its first bit, or read on
+  into the previous stream, the jump table and, past them, the wrapped
+  container of `BIT_lookBitsFast`. The one rejection after the loop
+  (`HUF_initRemainingDStream`) is a stream whose loop position moved more
+  than a word before its own start, which depends on how many rounds the
+  loop ran: those round counts (`ip[0] - ilowest` over 7, and the outputs'
+  room over 5 or 10) and the loop's exit when one position crosses
+  another are ported as they are. The fast path also opens streams whose
+  last byte is zero.
+- **Pair decoding.** `HUF_decodeLastSymbolX2` caps the bits a stream's
+  last pair lookup consumes at the container's end, so a stream whose last
+  lookup reads past its bits still ends exactly. This applies on every
+  path that decodes pairs, including the general four-stream body and a
+  single stream.
+- **Decoder type.** A `Compressed_Literals_Block` reads its tree for
+  single symbols when it has one stream (`HUF_decompress1X1_DCtx_wksp`)
+  and as `HUF_selectDecoder` chooses for four, from the literal count and
+  the section size including the tree; a dictionary's tree is read for
+  pairs (`ZSTD_loadDEntropy`). A `Treeless_Literals_Block` keeps the type
+  of the table it reuses. `HuffmanTable` records it as a `TableKind`,
+  which `literals` and `dictionary` set after each read.
+
+```mermaid
+flowchart TD
+    Entry[HuffmanTable::decode_streams / decode_streams_shared] --> Exact[exact decoder: SIMD fast loops, exact end checks]
+    Exact -->|Ok| Done[literals]
+    Exact -->|HuffmanStream| Cold["decode_as_reference (cold): huffman::reference::decode"]
+    Cold --> Streams{four streams?}
+    Streams -->|no| One["HUF_decompress1X{1,2}: decode, BIT_endOfDStream"]
+    Streams -->|yes| Init{"HUF_DecompressFastArgs_init"}
+    Init -->|section under 10 bytes, or length4 past it| Reject[HuffmanStream]
+    Init -->|"table log 12, a stream under 8 bytes, or op[3] at the end"| General["HUF_decompress4X{1,2} body: per-stream readers, BIT_endOfDStream"]
+    Init -->|supported| Loop["fast C loop, X1 or X2 by TableKind"]
+    Loop --> Remaining{"each stream: op within its segment, ip at most a word before its start?"}
+    Remaining -->|no| Reject
+    Remaining -->|yes| Tail["HUF_decodeStream{X1,X2} from the jump table, no end check"]
+    Tail --> Done
+    One -->|ended exactly| Done
+    One -->|no| Reject
+    General -->|every stream ended exactly| Done
+    General -->|no| Reject
+```
+
+The exact decoder stays the only hot path. Whatever it accepts the
+reference accepts with the same literals: an exactly consumed stream reads
+only its own bits, which every reference path decodes to the same
+symbols, and no reference check fails on it. Only a section it rejects
+reaches `huffman::reference`, a scalar port that follows the reference's
+control flow statement for statement over a model of `BIT_DStream_t`
+(`BitStream`) and the fast loops' sentinel containers; its verdict and
+literals are final. The port builds `HUF_DEltX2` rows on demand from the
+single-symbol rows (a pair when both codes fit in the table log), which
+is how `HUF_fillDTableX2` fills them, also for 12-bit trees the pair rows
+of the hot path do not serve.
+
+The reference takes these paths on 64-bit little-endian hosts and, on
+x86-64 builds with dynamic BMI2 dispatch, only where the CPU has BMI2;
+elsewhere it uses the general body and rejects what the fast path
+accepts. This decoder follows the fast path on every host, so its verdicts
+do not depend on the machine.
+
 ## Compatibility with the reference decoder
 
 Valid frames decode identically. On malformed input the verdicts match the
-reference's, with these deliberate exceptions:
+reference's, Huffman literal streams that are not consumed exactly
+included (see [Huffman stream ends](#huffman-stream-ends)), with these
+deliberate exceptions:
 
-- **Huffman stream ends.** The reference's fast four-stream Huffman path
-  checks only the regenerated length, not that each stream is consumed
-  exactly (its final reads are bounded by the start of the whole literals
-  section). RFC 8878 calls such streams faulty and this decoder rejects
-  them with `HuffmanStream`; the reference may accept them, with garbage
-  output, in frames without a checksum.
 - **Offsets beyond the window.** Offsets are limited to the window as well
   as to the frame's output, deterministically, in every API. The
   reference's one-shot decoder only checks the latter, and its streaming

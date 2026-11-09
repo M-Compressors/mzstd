@@ -218,6 +218,71 @@ fn writers_retry_interrupted_sinks() {
     assert_eq!(sink.written, reference);
 }
 
+/// A sink that refuses every other write with `WouldBlock` and takes the
+/// whole buffer otherwise.
+#[derive(Default)]
+struct Alternating {
+    written: Vec<u8>,
+    refuse: bool,
+    refused: usize,
+}
+
+impl Write for Alternating {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.refuse = !self.refuse;
+        if self.refuse {
+            self.refused += 1;
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        self.written.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn writes_that_hit_a_blocking_sink_report_the_bytes_already_accepted() {
+    // Several blocks, so most writes produce output after the session has
+    // taken their input; a write that then reports the sink's refusal as
+    // an error would have its bytes offered again.
+    let input = corpus::text(700_000, 10);
+    let mut encoder = Compressor::default();
+    let expected = encoder.compress(&input).expect("compresses");
+    let declared = InputSize::Exact(input.len() as u64).into();
+    let mut writer = encoder.writer(Alternating::default(), declared);
+    let mut offered = 0;
+    for chunk in input.chunks(40_000) {
+        let mut chunk = chunk;
+        while !chunk.is_empty() {
+            match writer.write(chunk) {
+                Ok(taken) => {
+                    offered += taken;
+                    chunk = &chunk[taken..];
+                }
+                Err(error) => assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}"),
+            }
+        }
+    }
+    assert_eq!(offered, input.len());
+    assert!(writer.get_ref().refused > 1, "the sink refused deliveries");
+    let mut attempts = 0;
+    let frame = loop {
+        attempts += 1;
+        match writer.finish() {
+            Ok(sink) => break sink.written,
+            Err(failure) => {
+                assert_eq!(failure.error().kind(), ErrorKind::WouldBlock);
+                writer = failure.into_inner();
+            }
+        }
+    };
+    assert!(attempts > 1);
+    assert_eq!(frame, expected);
+}
+
 #[test]
 fn writers_reject_writes_after_the_frame_ended() {
     let mut encoder = Compressor::default();

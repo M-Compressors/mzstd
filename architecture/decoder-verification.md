@@ -11,6 +11,7 @@ graph TD
         Bits[bits: marker, padding, overflow, wide reads]
         Fse[fse: distributions, repeat flags, Appendix A tables, weight decoder]
         Huf[huffman: RFC example tree, 1 and 4 streams, invalid weights, 12-bit trees]
+        HufRef["huffman::reference: exact sections, fast-path stream ends, last pairs, BIT_DStream_t model, pair rows"]
         Lit[literals: all size formats, RLE, treeless reuse]
         Seq[sequences: baselines, overlapping copies, repeat-offset rules, invalid sequences, dictionary reach]
         DictU[dictionary: entropy section, repeat-offset limits, truncation]
@@ -20,6 +21,7 @@ graph TD
         Oracle[decoder_oracle: reference frames, every entry point, chunkings, windows, limits]
         Golden[decoder_golden: golden-decompression and golden-decompression-errors]
         Corrupt[decoder_corruption: every truncation, bit flips, random damage]
+        Ends[decoder_huffman_ends: fuzz finds, damaged variants, synthetic sections]
         Api[decoder_api: modes, Finish contract, budgets, typed errors, retention]
         Io[decoder_io: Read / Write adapters, deferred and sink errors]
         Uninit[decoder_uninit: process_uninit and decompress_to_uninit against the initialized methods, sentinels]
@@ -29,6 +31,7 @@ graph TD
     Ref[zstd 1.5.7 via zstd-ffi] --> Oracle
     Ref --> Golden
     Ref --> Corrupt
+    Ref --> Ends
     Spec[format spec Appendix A, vendored copy] --> Fse
 ```
 
@@ -59,9 +62,25 @@ graph TD
   fail with `UnexpectedEndOfInput`, one-shot and streaming. For every
   single-bit flip of the first 64 bytes and random byte damage, it requires
   no panic, one-shot and streaming verdicts and outputs to agree, identical
-  output whenever both decoders accept, and never accepting what the
-  reference rejects. The only tolerated difference is the documented
-  stricter Huffman stream-end check.
+  output whenever both decoders accept, and the reference's verdict for
+  every damaged frame, Huffman streams that are not consumed exactly
+  included.
+- **`decoder_huffman_ends`** decodes the frames in
+  `testdata/huffman-stream-ends` (fuzz finds that `ZSTD_decompress`
+  accepts although their streams are not consumed exactly: two as found,
+  four cut down to their literals and zeroed byte by byte) on every
+  backend, one-shot, into a slice and streaming, and requires the
+  reference's bytes. 2400 damaged variants of them, and 3000 synthetic
+  frames with random complete trees of up to 12 bits and mostly valid
+  one- or four-stream sections (a few symbols more or fewer per stream,
+  cut, damaged or random streams), optionally followed by a treeless block
+  that inherits the decoder type, must get the reference's verdict and
+  output. Unit tests in `huffman::reference` pin each lenient case by
+  hand: streams with bits left, streams reading into the jump table, a
+  stream reading more than a word past its start after the fast loop,
+  and a last pair read past the stream; `literals` checks that treeless
+  blocks keep the decoder type, and `dictionary` that a dictionary's tree
+  is read for pairs.
 - **`decoder_dictionary`** compresses with `ZSTD_compress2` and a
   dictionary trained by `ZDICT_trainFromBuffer` on JSON-like records, or
   48 KB of raw text, at every level from -5 to 22 (five levels in debug

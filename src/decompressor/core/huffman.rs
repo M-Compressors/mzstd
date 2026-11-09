@@ -17,9 +17,18 @@
 //! it, a table of symbol pairs decodes up to two symbols per lookup. Each
 //! stream then finishes on its own with the single-symbol table and the
 //! reference's cautious loop, and must be consumed exactly.
+//!
+//! The reference accepts more: its fast four-stream path does not check
+//! where a stream ends, and its pair decoder caps a stream's last read.
+//! When the exact decoder rejects a section, [`reference`] decodes it
+//! again as the reference does, with the decoder type ([`TableKind`]) the
+//! reference would use, and its verdict stands.
+
+mod reference;
 
 use alloc::boxed::Box;
 
+pub(crate) use self::reference::TableKind;
 use super::bits::{BitContainer, Sentinel};
 use super::fse::{MAX_WEIGHTS, decode_weights};
 use crate::decompressor::InvalidDataKind;
@@ -127,6 +136,9 @@ pub(crate) struct HuffmanTable {
     pairs: Option<Box<[PairRow; PAIR_SIZE]>>,
     /// Whether `pairs` describes the current tree.
     pairs_valid: bool,
+    /// The decoder the reference reads this tree for, which decides how it
+    /// treats stream ends the exact decoder rejects.
+    kind: TableKind,
 }
 
 impl Default for HuffmanTable {
@@ -136,6 +148,7 @@ impl Default for HuffmanTable {
             rows: Box::new([0; TABLE_SIZE]),
             pairs: None,
             pairs_valid: false,
+            kind: TableKind::Single,
         }
     }
 }
@@ -935,7 +948,8 @@ impl HuffmanTable {
         size: usize,
         four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
-        decode_with(self, src, buffer, size, four_streams, serial(simd))
+        decode_with(&mut *self, src, buffer, size, four_streams, serial(simd))
+            .or_else(|_| self.decode_as_reference(src, buffer, size, four_streams))
     }
 
     /// Decodes literals as [`Self::decode_streams`] with a table that may
@@ -951,6 +965,37 @@ impl HuffmanTable {
         four_streams: bool,
     ) -> Result<(), InvalidDataKind> {
         decode_with(self, src, buffer, size, four_streams, serial(simd))
+            .or_else(|_| self.decode_as_reference(src, buffer, size, four_streams))
+    }
+
+    /// Decodes a section the exact decoder rejected as the reference
+    /// would, whose verdict then stands. Out of line, so that the hot
+    /// loops' code is unchanged.
+    #[cold]
+    #[inline(never)]
+    fn decode_as_reference(
+        &self,
+        src: &[u8],
+        buffer: &mut [u8],
+        size: usize,
+        four_streams: bool,
+    ) -> Result<(), InvalidDataKind> {
+        let out = buffer
+            .get_mut(..size)
+            .ok_or(InvalidDataKind::HuffmanStream)?;
+        reference::decode(self, src, out, four_streams)
+    }
+
+    /// Records the decoder the reference reads this tree for; treeless
+    /// blocks keep it.
+    pub(crate) const fn set_kind(&mut self, kind: TableKind) {
+        self.kind = kind;
+    }
+
+    /// The decoder the reference reads this tree for.
+    #[cfg(test)]
+    pub(crate) const fn kind(&self) -> TableKind {
+        self.kind
     }
 
     /// Builds the pair rows ahead of time, for a table that is then shared.
@@ -1140,7 +1185,7 @@ fn decode_four<T: TableAccess>(
 mod tests {
     use super::*;
 
-    fn read(src: &[u8]) -> Result<(HuffmanTable, usize), InvalidDataKind> {
+    pub(super) fn read(src: &[u8]) -> Result<(HuffmanTable, usize), InvalidDataKind> {
         let mut table = HuffmanTable::default();
         let used = table.read(src)?;
         Ok((table, used))
@@ -1148,7 +1193,7 @@ mod tests {
 
     /// The RFC 8878 example tree: A B C D E F with weights 4 3 2 0 1 1,
     /// as symbols 0..=5, described directly.
-    fn example_table() -> HuffmanTable {
+    pub(super) fn example_table() -> HuffmanTable {
         // Five listed weights (F is implied): header 127 + 5, then 4|3, 2|0, 1|_.
         let src = [132, 0x43, 0x20, 0x10];
         let (table, used) = read(&src).expect("valid tree");
@@ -1329,7 +1374,7 @@ mod tests {
     }
 
     /// One stream holding `symbols`, decoded first to last.
-    fn encode(table: &HuffmanTable, symbols: &[u8]) -> alloc::vec::Vec<u8> {
+    pub(super) fn encode(table: &HuffmanTable, symbols: &[u8]) -> alloc::vec::Vec<u8> {
         let codes = codes(table);
         let mut writer = StreamWriter::default();
         for &symbol in symbols.iter().rev() {
@@ -1340,7 +1385,7 @@ mod tests {
     }
 
     /// A jump table and four streams for `symbols`.
-    fn encode_four(table: &HuffmanTable, symbols: &[u8]) -> alloc::vec::Vec<u8> {
+    pub(super) fn encode_four(table: &HuffmanTable, symbols: &[u8]) -> alloc::vec::Vec<u8> {
         // Three segments of a quarter rounded up; the fourth takes the rest.
         let segment = symbols.len().div_ceil(4);
         let streams: alloc::vec::Vec<_> = (0..4)
@@ -1365,7 +1410,7 @@ mod tests {
     }
 
     /// Symbols the table can code, in a skewed pseudo-random mix.
-    fn message(table: &HuffmanTable, len: usize, seed: u64) -> alloc::vec::Vec<u8> {
+    pub(super) fn message(table: &HuffmanTable, len: usize, seed: u64) -> alloc::vec::Vec<u8> {
         let codes = codes(table);
         let alphabet: alloc::vec::Vec<u8> = (0..=255u8)
             .filter(|&s| codes[usize::from(s)].1 > 0)
@@ -1384,14 +1429,14 @@ mod tests {
     }
 
     /// The weights 12, 11, ..., 1 and an implied 1: a complete 12-bit tree.
-    fn twelve_bit_table() -> HuffmanTable {
+    pub(super) fn twelve_bit_table() -> HuffmanTable {
         read(&[139, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21])
             .expect("valid")
             .0
     }
 
     /// Eight-bit codes for all 256 symbols, as direct weights of 1.
-    fn flat_table() -> HuffmanTable {
+    pub(super) fn flat_table() -> HuffmanTable {
         let mut src = alloc::vec![128 + 127];
         src.extend_from_slice(&[0x11; 64]);
         read(&src).expect("valid").0

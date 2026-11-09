@@ -220,6 +220,48 @@ fn writers_lose_nothing_to_short_writes_and_refusals() {
 }
 
 #[test]
+fn writes_that_hit_a_blocking_sink_report_the_bytes_already_accepted() {
+    // Every other delivery is refused, so writes that take input and then
+    // deliver finished parts meet refusals; a write that reported one as
+    // an error would have its bytes offered again.
+    let input = corpus::mixed(6 * SEGMENT + 77, 7);
+    let mut compressor = compressor(3);
+    let batch = compressor.compress(&input).unwrap();
+    let (mut sink, queue) = compressor.writer(
+        Flaky::new(ErrorKind::WouldBlock, usize::MAX),
+        exact(&input),
+        window(2),
+    );
+    let frame = with_executors(queue, 2, || {
+        let mut offered = 0;
+        for chunk in input.chunks(SEGMENT / 3) {
+            let mut chunk = chunk;
+            while !chunk.is_empty() {
+                match sink.write(chunk) {
+                    Ok(taken) => {
+                        offered += taken;
+                        chunk = &chunk[taken..];
+                    }
+                    Err(error) => assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}"),
+                }
+            }
+        }
+        assert_eq!(offered, input.len());
+        let mut sink = sink;
+        loop {
+            match sink.finish() {
+                Ok(inner) => break inner.written,
+                Err(failure) => {
+                    assert_eq!(failure.error().kind(), ErrorKind::WouldBlock);
+                    sink = failure.into_inner();
+                }
+            }
+        }
+    });
+    assert_eq!(frame, batch);
+}
+
+#[test]
 fn a_failed_finish_hands_back_a_writer_that_completes_the_frame() {
     let input = corpus::text(2 * SEGMENT + 1, 5);
     let mut compressor = compressor(1);
