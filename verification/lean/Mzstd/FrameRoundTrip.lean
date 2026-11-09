@@ -21,7 +21,8 @@ otherwise, the content size is present exactly when the encoder declares it,
 and the dictionary ID and checksum flag are the encoder's. -/
 theorem frame_header_round_trip (dst : Slice U8)
     (header : compressor.core.cctx.FrameHeaderFields) (hdst : 18 ≤ dst.length)
-    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31) :
+    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31)
+    (hformat : header.format = .Standard) :
     compressor.core.cctx.write_frame_header dst header ⦃
       (r : core.result.Result Usize compressor.core.error.CoreError × Slice U8) =>
       ∃ pos : Usize, r.1 = .Ok pos ∧
@@ -31,7 +32,7 @@ theorem frame_header_round_trip (dst : Slice U8)
             (p : core.result.Result decompressor.core.frame.FrameHeader
               decompressor.error.InvalidDataKind) =>
             FrameHeaderResult (some (declared header)) p ⦄ ⦄ := by
-  apply WP.spec_mono (write_frame_header_rfc dst header hdst hw hw')
+  apply WP.spec_mono (write_frame_header_rfc dst header hdst hw hw' hformat)
   rintro r ⟨pos, hres, -, -, -, -, hmagic, hparse, -⟩
   refine ⟨pos, hres, hmagic, fun bytes hbytes => ?_⟩
   apply WP.spec_mono (FrameHeader.parse.spec bytes)

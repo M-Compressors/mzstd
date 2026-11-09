@@ -20,12 +20,21 @@ set_option maxRecDepth 2048
 
 namespace mzstd
 
+/-- [mzstd::format::FrameFormat]
+    Source: 'src/format.rs'
+    Visibility: public -/
+@[discriminant isize]
+inductive format.FrameFormat where
+| Standard : format.FrameFormat
+| Magicless : format.FrameFormat
+
 /-- [mzstd::compressor::core::cctx::FrameHeaderFields]
     Source: 'src/compressor/core/cctx.rs' -/
 structure compressor.core.cctx.FrameHeaderFields where
   window_log : Std.U32
   dict_id : Std.U32
   no_dict_id : Bool
+  format : format.FrameFormat
   checksum : Bool
   content_size : Bool
   pledged : Std.U64

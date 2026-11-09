@@ -287,23 +287,25 @@ fn level_parameters_describe_the_dictionary_they_prepare() {
 }
 
 #[test]
-fn the_parallel_and_framed_compressors_refuse_the_magicless_format() {
+#[cfg(not(feature = "no_std"))]
+fn the_parallel_compressor_refuses_the_magicless_format() {
+    use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig};
+
     let magicless = EncoderConfig::default().with_format(FrameFormat::Magicless);
-    #[cfg(not(feature = "no_std"))]
-    {
-        let refused = ConfigError::Unsupported { id: 10, value: 1 };
-        use mzstd::compressor::parallel::{ParallelCompressor, ParallelConfig};
-        let result = ParallelCompressor::new(magicless, ParallelConfig::default());
-        assert_eq!(result.err(), Some(refused));
-    }
-    #[cfg(feature = "framed")]
-    {
-        use mzstd::framing::FramedEncodeConfig;
-        let config = FramedEncodeConfig::default().with_encoder_config(magicless);
-        let error = mzstd::FramedCompressor::new(config).unwrap_err();
-        assert!(error.to_string().contains("zstd parameter 10"), "{error}");
-        let mut encoder =
-            mzstd::FramedCompressor::new(FramedEncodeConfig::default()).expect("valid");
-        assert!(encoder.reconfigure(config).is_err());
-    }
+    let refused = ConfigError::Unsupported { id: 10, value: 1 };
+    let result = ParallelCompressor::new(magicless, ParallelConfig::default());
+    assert_eq!(result.err(), Some(refused));
+}
+
+#[test]
+#[cfg(feature = "framed")]
+fn the_framed_compressor_refuses_the_magicless_format() {
+    use mzstd::framing::FramedEncodeConfig;
+
+    let magicless = EncoderConfig::default().with_format(FrameFormat::Magicless);
+    let config = FramedEncodeConfig::default().with_encoder_config(magicless);
+    let error = mzstd::FramedCompressor::new(config).unwrap_err();
+    assert!(error.to_string().contains("zstd parameter 10"), "{error}");
+    let mut encoder = mzstd::FramedCompressor::new(FramedEncodeConfig::default()).expect("valid");
+    assert!(encoder.reconfigure(config).is_err());
 }

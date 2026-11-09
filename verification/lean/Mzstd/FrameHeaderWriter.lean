@@ -289,12 +289,14 @@ theorem FromU8Bool.from.spec (b : Bool) :
 set_option maxHeartbeats 4000000 in
 /-- **Spec theorem for `mzstd::compressor::core::cctx::write_frame_header`**
 With room for the largest header and a window of `2 ^ 10` to `2 ^ 31` bytes,
-the encoder writes the magic number, little-endian, and then `headerBytes`,
+for the standard frame format the encoder writes the magic number,
+little-endian, and then `headerBytes`,
 leaves the rest of `dst` as it was and returns the end of the header. -/
 @[step]
 theorem compressor.core.cctx.write_frame_header.spec (dst : Slice U8)
     (header : compressor.core.cctx.FrameHeaderFields) (hdst : 18 ≤ dst.length)
-    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31) :
+    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31)
+    (hformat : header.format = .Standard) :
     compressor.core.cctx.write_frame_header dst header ⦃
       (r : core.result.Result Usize compressor.core.error.CoreError × Slice U8) =>
       ∃ pos : Usize, r.1 = .Ok pos ∧ pos.val = 4 + (headerBytes header).length ∧
@@ -386,7 +388,13 @@ theorem compressor.core.cctx.write_frame_header.spec (dst : Slice U8)
   have hlen18 : 18 ≤ dst.val.length := by simpa [Slice.length] using hdst
   split
   · rename_i hlt; simp [Slice.len] at hlt; omega
-  step as ⟨ s, back, s_val, s_len, s_back ⟩
+  have hformat_eq : format.FrameFormat.Insts.CoreCmpPartialEqFrameFormat.eq
+      header.format .Standard = ok true := by
+    simp [format.FrameFormat.Insts.CoreCmpPartialEqFrameFormat.eq, hformat]
+  rw [hformat_eq]
+  simp only [Std.bind_ok, Std.bind_assoc, ite_true]
+  step as ⟨ pair, s_val, s_len, s_back ⟩
+  rcases pair with ⟨s, back⟩
   step as ⟨ a, a_post ⟩
   step as ⟨ s1, s1_post ⟩
   step as ⟨ s2, s2_post ⟩
@@ -647,7 +655,8 @@ and unused bit 4 are zero, and the `Window_Descriptor`, when present, has a zero
 mantissa. -/
 theorem write_frame_header_rfc (dst : Slice U8)
     (header : compressor.core.cctx.FrameHeaderFields) (hdst : 18 ≤ dst.length)
-    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31) :
+    (hw : 10 ≤ header.window_log.val) (hw' : header.window_log.val ≤ 31)
+    (hformat : header.format = .Standard) :
     compressor.core.cctx.write_frame_header dst header ⦃
       (r : core.result.Result Usize compressor.core.error.CoreError × Slice U8) =>
       ∃ pos : Usize, r.1 = .Ok pos ∧ 4 < pos.val ∧ pos.val ≤ 18 ∧
@@ -658,7 +667,7 @@ theorem write_frame_header_rfc (dst : Slice U8)
         reservedBit r.2.val[4]!.val = 0 ∧ r.2.val[4]!.val / 16 % 2 = 0 ∧
         (singleOf header.content_size header.window_log.val header.pledged.val = false →
           r.2.val[5]!.val % 8 = 0) ⦄ := by
-  apply WP.spec_mono (compressor.core.cctx.write_frame_header.spec dst header hdst hw hw')
+  apply WP.spec_mono (compressor.core.cctx.write_frame_header.spec dst header hdst hw hw' hformat)
   rintro ⟨res, out⟩ ⟨pos, hres, hpos, hwr, hlen⟩
   dsimp only at hres hpos hwr hlen ⊢
   obtain ⟨hH1, hH14⟩ := headerBytes_length_le header

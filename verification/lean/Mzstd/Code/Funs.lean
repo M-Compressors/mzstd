@@ -80,6 +80,15 @@ def shared.format.FRAME_HEADER_SIZE_MAX : Std.Usize := 18#usize
 @[global_simps, irreducible]
 def shared.format.MAGIC_NUMBER : Std.U32 := 4247762216#u32
 
+/-- [mzstd::format::{impl core::cmp::PartialEq<mzstd::format::FrameFormat> for mzstd::format::FrameFormat}::eq]:
+    Source: 'src/format.rs'
+    Visibility: public -/
+def format.FrameFormat.Insts.CoreCmpPartialEqFrameFormat.eq
+  (self : format.FrameFormat) (other : format.FrameFormat) : Result Bool := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
 /-- [mzstd::compressor::core::cctx::write_frame_header]:
     Source: 'src/compressor/core/cctx.rs' -/
 def compressor.core.cctx.write_frame_header
@@ -136,104 +145,113 @@ def compressor.core.cctx.write_frame_header
     ok (core.result.Result.Err compressor.core.error.CoreError.DstSizeTooSmall,
       dst)
   else
-    let (s, index_mut_back) ←
-      core.slice.index.Slice.index_mut
-        (core.slice.index.SliceIndexRangeToUsizeSlice Std.U8) dst
-        { «end» := 4#usize }
-    let a ← lift (core.num.U32.to_le_bytes shared.format.MAGIC_NUMBER)
-    let s1 ← lift (Array.to_slice a)
-    let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
-    let dst1 := index_mut_back s2
-    let (_, index_mut_back1) ← Slice.index_mut_usize dst1 4#usize
-    let pos ← 4#usize + 1#usize
-    let (dst2, pos1) ←
+    let b ←
+      format.FrameFormat.Insts.CoreCmpPartialEqFrameFormat.eq header.format
+        format.FrameFormat.Standard
+    let (dst1, pos) ←
+      if b
+      then
+        do
+        let (s, index_mut_back) ←
+          core.slice.index.Slice.index_mut
+            (core.slice.index.SliceIndexRangeToUsizeSlice Std.U8) dst
+            { «end» := 4#usize }
+        let a ← lift (core.num.U32.to_le_bytes shared.format.MAGIC_NUMBER)
+        let s1 ← lift (Array.to_slice a)
+        let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+        let dst2 := index_mut_back s2
+        ok (dst2, 4#usize)
+      else ok (dst, 0#usize)
+    let (_, index_mut_back) ← Slice.index_mut_usize dst1 pos
+    let pos1 ← pos + 1#usize
+    let (dst2, pos2) ←
       if single_segment
-      then let s3 := index_mut_back1 descriptor
-           ok (s3, pos)
+      then let s := index_mut_back descriptor
+           ok (s, pos1)
       else
         do
-        let dst3 := index_mut_back1 descriptor
-        let s3 ← Slice.update dst3 pos window_log_byte
-        let pos2 ← pos + 1#usize
-        ok (s3, pos2)
-    let (dst3, pos2) ←
+        let dst3 := index_mut_back descriptor
+        let s ← Slice.update dst3 pos1 window_log_byte
+        let pos3 ← pos1 + 1#usize
+        ok (s, pos3)
+    let (dst3, pos3) ←
       match dict_id_size_code with
-      | 0#uscalar => ok (dst2, pos1)
+      | 0#uscalar => ok (dst2, pos2)
       | 1#uscalar =>
         do
         let i9 ← lift (UScalar.cast .U8 header.dict_id)
-        let s3 ← Slice.update dst2 pos1 i9
-        let pos3 ← pos1 + 1#usize
-        ok (s3, pos3)
+        let s ← Slice.update dst2 pos2 i9
+        let pos4 ← pos2 + 1#usize
+        ok (s, pos4)
       | 2#uscalar =>
         do
-        let i9 ← pos1 + 2#usize
-        let (s3, index_mut_back2) ←
+        let i9 ← pos2 + 2#usize
+        let (s, index_mut_back1) ←
           core.slice.index.Slice.index_mut
             (core.slice.index.SliceIndexRangeUsizeSlice Std.U8) dst2
-            { start := pos1, «end» := i9 }
+            { start := pos2, «end» := i9 }
         let i10 ← lift (UScalar.cast .U16 header.dict_id)
-        let a1 ← lift (core.num.U16.to_le_bytes i10)
-        let s4 ← lift (Array.to_slice a1)
-        let s5 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s3 s4
-        let dst4 := index_mut_back2 s5
+        let a ← lift (core.num.U16.to_le_bytes i10)
+        let s1 ← lift (Array.to_slice a)
+        let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+        let dst4 := index_mut_back1 s2
         ok (dst4, i9)
       | _ =>
         do
-        let i9 ← pos1 + 4#usize
-        let (s3, index_mut_back2) ←
+        let i9 ← pos2 + 4#usize
+        let (s, index_mut_back1) ←
           core.slice.index.Slice.index_mut
             (core.slice.index.SliceIndexRangeUsizeSlice Std.U8) dst2
-            { start := pos1, «end» := i9 }
-        let a1 ← lift (core.num.U32.to_le_bytes header.dict_id)
-        let s4 ← lift (Array.to_slice a1)
-        let s5 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s3 s4
-        let dst4 := index_mut_back2 s5
+            { start := pos2, «end» := i9 }
+        let a ← lift (core.num.U32.to_le_bytes header.dict_id)
+        let s1 ← lift (Array.to_slice a)
+        let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+        let dst4 := index_mut_back1 s2
         ok (dst4, i9)
     match fcs_code with
     | 0#uscalar =>
       if single_segment
       then
         let i9 ← lift (UScalar.cast .U8 header.pledged)
-        let dst4 ← Slice.update dst3 pos2 i9
-        let pos3 ← pos2 + 1#usize
-        ok (core.result.Result.Ok pos3, dst4)
-      else ok (core.result.Result.Ok pos2, dst3)
+        let dst4 ← Slice.update dst3 pos3 i9
+        let pos4 ← pos3 + 1#usize
+        ok (core.result.Result.Ok pos4, dst4)
+      else ok (core.result.Result.Ok pos3, dst3)
     | 1#uscalar =>
-      let i9 ← pos2 + 2#usize
-      let (s3, index_mut_back2) ←
+      let i9 ← pos3 + 2#usize
+      let (s, index_mut_back1) ←
         core.slice.index.Slice.index_mut
           (core.slice.index.SliceIndexRangeUsizeSlice Std.U8) dst3
-          { start := pos2, «end» := i9 }
+          { start := pos3, «end» := i9 }
       let i10 ← header.pledged - 256#u64
       let i11 ← lift (UScalar.cast .U16 i10)
-      let a1 ← lift (core.num.U16.to_le_bytes i11)
-      let s4 ← lift (Array.to_slice a1)
-      let s5 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s3 s4
-      let dst4 := index_mut_back2 s5
+      let a ← lift (core.num.U16.to_le_bytes i11)
+      let s1 ← lift (Array.to_slice a)
+      let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+      let dst4 := index_mut_back1 s2
       ok (core.result.Result.Ok i9, dst4)
     | 2#uscalar =>
-      let i9 ← pos2 + 4#usize
-      let (s3, index_mut_back2) ←
+      let i9 ← pos3 + 4#usize
+      let (s, index_mut_back1) ←
         core.slice.index.Slice.index_mut
           (core.slice.index.SliceIndexRangeUsizeSlice Std.U8) dst3
-          { start := pos2, «end» := i9 }
+          { start := pos3, «end» := i9 }
       let i10 ← lift (UScalar.cast .U32 header.pledged)
-      let a1 ← lift (core.num.U32.to_le_bytes i10)
-      let s4 ← lift (Array.to_slice a1)
-      let s5 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s3 s4
-      let dst4 := index_mut_back2 s5
+      let a ← lift (core.num.U32.to_le_bytes i10)
+      let s1 ← lift (Array.to_slice a)
+      let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+      let dst4 := index_mut_back1 s2
       ok (core.result.Result.Ok i9, dst4)
     | _ =>
-      let i9 ← pos2 + 8#usize
-      let (s3, index_mut_back2) ←
+      let i9 ← pos3 + 8#usize
+      let (s, index_mut_back1) ←
         core.slice.index.Slice.index_mut
           (core.slice.index.SliceIndexRangeUsizeSlice Std.U8) dst3
-          { start := pos2, «end» := i9 }
-      let a1 ← lift (core.num.U64.to_le_bytes header.pledged)
-      let s4 ← lift (Array.to_slice a1)
-      let s5 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s3 s4
-      let dst4 := index_mut_back2 s5
+          { start := pos3, «end» := i9 }
+      let a ← lift (core.num.U64.to_le_bytes header.pledged)
+      let s1 ← lift (Array.to_slice a)
+      let s2 ← core.slice.Slice.copy_from_slice core.marker.CopyU8 s s1
+      let dst4 := index_mut_back1 s2
       ok (core.result.Result.Ok i9, dst4)
 
 /-- [mzstd::compressor::core::cctx::write_block_header]:
