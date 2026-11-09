@@ -14,8 +14,9 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
   `ZSTD_compressStream2` driven with the same chunks, output capacities and
   flushes. This holds for levels -131072 to 22, the explicit compression
   parameters, long distance matching, checksums, content sizes, pledged sizes,
-  size hints and dictionaries (raw or Zstandard-format, as
-  `ZSTD_CCtx_loadDictionary` loads them).
+  size hints, target compressed block sizes (`ZSTD_c_targetCBlockSize`) and
+  dictionaries (raw or Zstandard-format, as `ZSTD_CCtx_loadDictionary` loads
+  them).
 - **Independent decoder** written from the format specification. It decodes
   every frame zstd writes, with or without a dictionary, with bounded window,
   input and output limits.
@@ -34,27 +35,29 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
 ### Our benchmarks
 
 Compression writes byte-identical frames to zstd 1.5.7 and reaches a median
-1.256× its speed across the comparison corpus; decompression reaches 1.502×.
+1.248× its speed across the comparison corpus; decompression reaches 1.517×.
 These medians include empty and tiny inputs. Alice text remains slower at
-some compression levels and at every decompression level, and on whole
-Silesia files both codecs still trail C by 2–6% at most levels.
+some compression levels and at most decompression levels, and on the whole
+`silesia.tar` in lzbench both codecs still trail C by a few percent at most
+levels.
 
 <details>
 <summary>Compression benchmark results and methodology</summary>
 
 ![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
 
-**Recorded 2026-10-30 · working tree on `0a4fd87` and main · AMD Ryzen 9 7950X (KVM) · cold one-shot APIs.**
+**Recorded 2026-11-09 · mzstd 0.2.12 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
 Each value is the median of per-dataset ratios across eight equally weighted datasets,
 including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
 frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
-median over all 192 dataset/level pairs is **1.256×**, with lower mean latency
-in 179 pairs (main: 1.254×, 178 pairs). The slower pairs are Alice at levels
--1, 1, 2, 4-9, 11 and 12 (0.94–0.99×) and random 1 MiB at levels 3 and 4.
+median over all 192 dataset/level pairs is **1.248×**, with lower mean latency
+in 174 pairs (2026-10-30: 1.256×, 179 pairs). The 18 slower pairs are Alice at
+ten levels, cyclic Alice at four and random data at four (0.84–0.998×). The host
+was loaded during the run: medians are stable, single cells good to about ±10%.
 
 The benchmark includes compressor construction, allocation, compression, and disposal.
-Results apply to the [recorded revision and machine][bench-levels]; [Silesia][silesia]
-covers whole large files with reused contexts.
+Results apply to the [recorded revision and machine][bench-levels]; [lzbench](#lzbench)
+covers a whole large archive.
 
 [Per-dataset results and methodology][benchmarks] · [Raw measurements][bench-csv] · [Reproduce the benchmarks][benchmarking]
 
@@ -65,12 +68,12 @@ covers whole large files with reused contexts.
 
 ![Decompression speed relative to zstd 1.5.7 by source level][decoder-bench-chart]
 
-**Recorded 2026-10-30 · working tree on `0a4fd87` and main · AMD Ryzen 9 7950X (KVM) · cold one-shot APIs.**
+**Recorded 2026-11-09 · mzstd 0.2.12 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
 zstd C and mzstd decode identical C-written frames at source levels **-5 to 22**.
 All **384 cases** restore the original bytes. The median over all 192 pairs is
-**1.502×** (main 1.400×), faster in 143 pairs: much faster on empty and tiny
-frames and on random data, 1.44× on structured binary and 1.51× on run-length
-data, and 0.94× (Alice) and 0.97× (cyclic Alice) on compressible text.
+**1.517×** (2026-10-30: 1.502×), faster in 151 pairs: much faster on empty and tiny
+frames and on random data, 1.45× on structured binary and 1.53× on run-length
+data, and 0.95× (Alice) and 0.94× (cyclic Alice) on compressible text.
 Construction, allocation, decode and disposal are timed; C reads the output
 capacity from the frame header.
 
@@ -83,41 +86,47 @@ capacity from the frame header.
 #### lzbench
 
 <details>
-<summary>lzbench 2.4.1 results for mzstd 0.2.11 and zstd 1.5.7</summary>
+<summary>lzbench 2.4.1 results for mzstd 0.2.12 and zstd 1.5.7</summary>
 
 [lzbench](https://github.com/inikep/lzbench) is a long-running open-source
 in-memory benchmark: every codec is built from source into one binary with the
 same compiler and flags and runs on the same data and machine. We ran lzbench
 master at [`a6fa8aa`][lzbench-commit] (lzbench 2.4.1, gcc 15.2, C and Rust
-codecs built with `-march=native`) on the 211 MB `silesia.tar` of the
+codecs built with `-march=native`), with this release's sources in place of
+the mzstd 0.2.11 it vendors, on the 211 MB `silesia.tar` of the
 [Silesia corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia),
-pinned to one thread of an AMD Ryzen 9 7950X VDS, with `-t8,8`.
-[Command and raw output][lzbench-run].
+pinned to one thread of an AMD Ryzen 9 7950X VDS, with `-t8,8`, in three
+rounds on 2026-11-09. [Command, raw output of every round and the 0.2.11 run][lzbench-run].
 
-mzstd 0.2.11 against zstd 1.5.7; bold marks the faster result. Ratio is the
+mzstd 0.2.12 against zstd 1.5.7; bold marks the faster result. Ratio is the
 compressed size as a percentage of the input and matches for both: every frame
 is byte-identical.
 
 | Level | Compress mzstd | Compress zstd | Decompress mzstd | Decompress zstd | Ratio, % |
 | ----: | -------------: | ------------: | ---------------: | --------------: | -------: |
-| -22      |  **2.19 MB/s** |     2.00 MB/s |        1418 MB/s |   **1590 MB/s** | 24.67 |
-| -18      |  **4.58 MB/s** |     4.17 MB/s |        1713 MB/s |   **1859 MB/s** | 25.15 |
-| -15      |  **8.21 MB/s** |     7.95 MB/s |        1954 MB/s |   **2102 MB/s** | 26.83 |
-| -11      |      37.9 MB/s | **40.0 MB/s** |        1879 MB/s |   **2037 MB/s** | 27.35 |
-| -8       |      95.4 MB/s |  **103 MB/s** |        1886 MB/s |   **2011 MB/s** | 28.17 |
-| -5       |       198 MB/s |  **207 MB/s** |        1722 MB/s |   **1847 MB/s** | 29.60 |
-| -3       |       354 MB/s |  **363 MB/s** |        1728 MB/s |   **1869 MB/s** | 31.20 |
-| -2       |       505 MB/s |  **528 MB/s** |        1784 MB/s |   **1940 MB/s** | 32.70 |
-| -1       |       601 MB/s |  **643 MB/s** |        1867 MB/s |   **2122 MB/s** | 34.53 |
-| --fast=1 |       661 MB/s |  **711 MB/s** |        2522 MB/s |   **2689 MB/s** | 41.01 |
-| --fast=3 |       747 MB/s |  **809 MB/s** |        2683 MB/s |   **2841 MB/s** | 44.63 |
-| --fast=5 |       826 MB/s |  **882 MB/s** |        2863 MB/s |   **3034 MB/s** | 48.61 |
+| -22 | **2.27 MB/s** | 2.13 MB/s | 1498 MB/s | **1608 MB/s** | 24.67 |
+| -18 | **5.03 MB/s** | 4.28 MB/s | 1745 MB/s | **1858 MB/s** | 25.15 |
+| -15 | **9.04 MB/s** | 8.41 MB/s | 2014 MB/s | **2116 MB/s** | 26.83 |
+| -11 | 42.7 MB/s | **45.7 MB/s** | 1982 MB/s | **2082 MB/s** | 27.35 |
+| -8 | 103 MB/s | **107 MB/s** | 1945 MB/s | **2040 MB/s** | 28.17 |
+| -5 | 203 MB/s | **208 MB/s** | 1769 MB/s | **1858 MB/s** | 29.60 |
+| -3 | **374 MB/s** | 370 MB/s | 1784 MB/s | **1892 MB/s** | 31.20 |
+| -2 | 505 MB/s | **534 MB/s** | 1834 MB/s | **1966 MB/s** | 32.70 |
+| -1 | 626 MB/s | **658 MB/s** | 1992 MB/s | **2134 MB/s** | 34.53 |
+| --fast=1 | 682 MB/s | **720 MB/s** | 2504 MB/s | **2695 MB/s** | 41.01 |
+| --fast=3 | 763 MB/s | **812 MB/s** | 2673 MB/s | **2867 MB/s** | 44.63 |
+| --fast=5 | 838 MB/s | **893 MB/s** | 2828 MB/s | **3048 MB/s** | 48.61 |
 
-**Summary:** byte-identical output at every level; **3–10% faster**
-compression at levels 15–22, 2.5–7.7% slower at levels -5 to 11, and
-decompression 5.6–12% behind C. A repeat of levels 1 and 3 reproduced every
-speed within 2%. lzbench compresses the whole archive as one frame, so it
-measures large-input throughput; the medians above also weight empty and tiny
+**Summary:** byte-identical output at every level; the fastest of three
+rounds compresses 6.6-17.5% faster than zstd at levels 15, 18 and 22, at its
+speed at level 3 and 2.4-6.6% slower at the other levels, and decompresses
+4.7-7.2% slower at every level. Compression at level 2 and above moves by
+3-21% between rounds on this loaded host. Against 0.2.11 in the same
+rounds, relative to zstd, decompression gained 0.8-5 points at levels 1 to 22
+(level 1: 0.883 to 0.933), level 3 compression went from 0.973 to 1.011,
+and the `--fast` levels and levels 1 and 2 compress 0.8-2.4 points faster.
+lzbench compresses the whole archive as one frame, so it measures
+large-input throughput; the medians above also weight empty and tiny
 inputs, where mzstd is much faster.
 
 </details>
@@ -270,8 +279,6 @@ and verified.
 
 ## Not supported
 
-- Magicless frames
-- `targetCBlockSize`
 - External sequence producers
 - Legacy (v0.x) frames
 - Byte identity with zstd's multithreaded mode
@@ -317,6 +324,5 @@ conditions.
 [decoder-bench-csv]: ./docs/benchmarks/decoder-comparison.csv
 [decoder-bench-chart]: ./docs/benchmarks/decoders/charts/overview.svg
 [decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
-[silesia]: ./docs/benchmarks/silesia.md
 [lzbench-commit]: https://github.com/inikep/lzbench/tree/a6fa8aa758932a02841c0cc68c07e5abf8870951
-[lzbench-run]: ./docs/benchmarks/lzbench-2026-11-08.md
+[lzbench-run]: ./docs/benchmarks/lzbench-2026-11-09.md

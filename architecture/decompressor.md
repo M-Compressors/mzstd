@@ -45,6 +45,8 @@ graph TD
         Sequences --> Fse
         Sequences --> Copy[copy: wildcopies, short-offset shuffles]
         Huffman --> Bits[bits: BitContainer, Sentinel, Reverse / Forward readers]
+        Stream --> Ahead[ahead: WriteAhead, next block's output prefetch]
+        Huffman --> Ahead
         Fse --> Bits
         Sequences --> Bits
     end
@@ -634,6 +636,26 @@ deliberate exceptions:
   and Zstandard-format bytes are rejected where `ZSTD_loadDEntropy` rejects
   them. `DictionaryContent::Zstd` on bytes without the magic number is
   `NotZstdFormat`, where the reference reports `dictionary_corrupted`.
+
+## Magicless frames and header queries
+
+`DecoderConfig::with_format(FrameFormat::Magicless)` (`ZSTD_d_format`) makes
+`State::Magic` of the streaming machine, and the one-shot `walk`, skip the
+magic number and the skippable-frame check: every frame starts at its header
+descriptor, and concatenated frames follow header to header.
+`decompressor::FrameHeaderInfo::parse(src, format)` ports
+`ZSTD_getFrameHeader_advanced` over `FrameHeader::parse`; see
+[OpenZL integration](openzl-integration.md#decoder-side).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Magic
+    Magic --> FrameHeader: Magicless, or magic number read
+    Magic --> SkippableSize: Standard, skippable magic
+    SkippableSize --> Skipping
+    Skipping --> Magic
+    FrameHeader --> BlockHeader
+```
 
 ## Known gaps
 

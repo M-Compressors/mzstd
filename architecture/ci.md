@@ -209,9 +209,10 @@ flowchart TD
     K3 --> K4["decompressor::core::sequences: execution at fixed and growing output edges"]
     Buf --> B1["compressor::core::output: UninitOutput"]
     Buf --> B2["decompressor::core::stream: decode_to_uninit output"]
-    B1 --> B3["tests/compressor_api.rs: compress_to_uninit end to end"]
-    K1 & K2 & K3 & K4 & B1 & B2 & B3 --> Miri["scripts/miri.sh: Miri, x86-64: scalar, SSE2, SSE4.2, AVX2, AVX-512 on capable runners"]
-    K1 & K2 & K3 & K4 & B1 & B2 --> ASan["ci-sanitizer.yml: native backends under ASan"]
+    B1 --> B3["tests/compressor_api.rs, tests/compressor_target_block.rs: compress_to_uninit end to end"]
+    Simd --> K5["compressor::core::superblock: sub-block sequence encoding on every backend"]
+    K1 & K2 & K3 & K4 & K5 & B1 & B2 & B3 --> Miri["scripts/miri.sh: Miri, x86-64: scalar, SSE2, SSE4.2, AVX2, AVX-512 on capable runners"]
+    K1 & K2 & K3 & K4 & K5 & B1 & B2 --> ASan["ci-sanitizer.yml: native backends under ASan"]
     All[every integration test with framed] --> ASan
 ```
 

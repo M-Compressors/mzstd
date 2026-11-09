@@ -24,6 +24,11 @@ graph TD
     Cctx --> Output["output: fixed slice, incrementally initialized Vec or zeroed-ahead uninit memory"]
     Cctx --> Presplit[presplit: pre-splitter]
     Block --> Split[split_block: post splitter]
+    Block --> Stats["block_stats: ZSTD_buildBlockEntropyStats"]
+    Split --> Stats
+    Cctx --> Super["superblock: targetCBlockSize sub-blocks"]
+    Super --> Block
+    Super --> Stats
     Block --> MS[match_state: tables, opt state]
     MS --> LB["lazy_box: LazyBox, state allocated on first write"]
     Entropy --> LB
@@ -259,7 +264,9 @@ sequenceDiagram
         BS->>MF: compressor(ms, seq_store, rep, block)
     end
     MF-->>BS: sequences + last literals
-    alt post splitter enabled
+    alt target compressed block size set
+        FC->>FC: superblock::compress_block instead of B (see target-block-size)
+    else post splitter enabled
         B->>S: split sequences into partitions, entropy-cost each
         S->>EC: compress each partition, repeat offsets fixed up
     else
@@ -299,16 +306,23 @@ sequenceDiagram
 - Dense full blocks in the `fast` prefix parser can switch from `SeqStore`
   vector appends to a `SeqCursor` over the store's kept full-block
   destinations (`FullBlock`: a boxed `[SeqDef; 32768]` and
-  `[u8; 128 KiB + 16]`), allocated and zeroed on the store's first
+  `[u8; 128 KiB + 32]`), allocated and zeroed on the store's first
   promotion and reused by every later one.
-  The first 1024 sequences use the original vector writer. At the end of
-  a complete match/repeat-code chain, at least 64 KiB of remaining input
-  selects the cursor; otherwise the vector loop resumes. This keeps the
+  Until a store holds a `FullBlock`, a full block starts with the original
+  vector writer. After 1024 sequences, at the end of a complete
+  match/repeat-code chain, at least 64 KiB of remaining input selects the
+  cursor; otherwise the vector loop resumes. This keeps the
   initialization cost away from sparse random and long-run inputs. The
   continuation preserves the hash table, current position and raw repeat
   offsets; it changes neither search order nor match decisions.
   Promotion copies the entries the vectors already hold into the
-  destinations; the cursor owns local counts, and on return the block's
+  destinations. Once the store holds a `FullBlock`, every later full block
+  starts on the cursor (`SeqStore::has_full_block`): starting costs nothing
+  then, and the block writes no vector entries and copies none at a
+  promotion (silesia.tar through `mzstd_compress`, level 1: 601 to
+  618 MB/s against zstd's 640-643; dickens, 2 MiB, levels -1 and 1:
+  2.5-4% fewer cycles per call, 2026-11-08).
+  The cursor owns local counts, and on return the block's
   entries stay there: `sequences()`, `literals()`, `sequences_mut()` and
   `nb_seq()` read them until `reset`, and `store_last_literals` appends
   after them. Before, the vectors were resized to a full block and
@@ -320,7 +334,11 @@ sequenceDiagram
   vectors themselves keep their length cost the dfast and lazy levels
   1.5-3.9%. At most 32768 matches of at least four bytes fit in 128 KiB;
   masks on the sequence and literal indices are therefore identity while
-  proving the fixed-size writes in bounds. Dictionary entry points and
+  proving the fixed-size writes in bounds. A run of at most 32 literals is
+  copied as one 32-byte chunk (`CURSOR_WILD`, the destination's slack),
+  where the reference copies 16 bytes and wildcopies the rest; a longer
+  run, or one within 32 bytes of the input's end, is copied exactly (a
+  `memcpy` call, which runs of 17-32 bytes used to take). Dictionary entry points and
   partial blocks keep the vector path. The promoted loop has its own
   `#[simd]` entry so the callback retains the selected target features,
   and scans with a local reborrow of the cursor (`SeqCursor::reborrow`),
@@ -334,13 +352,14 @@ sequenceDiagram
 flowchart TD
     Start[fast prefix block] --> Full{128 KiB and min match at least 4?}
     Full -->|no| Vec[vector writer]
-    Full -->|yes| Probe[vector writer through 1024 sequences]
+    Full -->|yes| Has{store has a FullBlock?}
+    Has -->|yes| Direct[whole block on SeqCursor over it]
+    Direct --> Counts
+    Has -->|no| Probe[vector writer through 1024 sequences]
     Probe --> Boundary[finish match, hash insertions and repeat chain]
     Boundary --> Left{at least 64 KiB left?}
     Left -->|no| Vec
-    Left -->|yes| Kept{store has a FullBlock?}
-    Kept -->|no| Alloc[allocate and zero it once]
-    Kept -->|yes| Copy
+    Left -->|yes| Alloc[allocate and zero it, once per store]
     Alloc --> Copy[copy the vectors' entries into it]
     Copy --> Cursor[resume with SeqCursor over it]
     Cursor --> Counts[block's counts kept beside it until reset]
@@ -415,7 +434,12 @@ adapters. Lookahead depths, cache updates and parsing heuristics are unchanged.
 - `presplit` (`ZSTD_splitBlock`, by fingerprint distance) chooses block sizes
   before match finding for the strategies that enable it; `split_block`
   (`ZSTD_compressBlock_splitBlock`) splits the sequences of a finished block
-  for the ultra levels. `presplit::split_block` dispatches once per eligible
+  for the ultra levels. `superblock`
+  (`ZSTD_compressBlock_targetCBlockSize`) replaces both block paths when a
+  target compressed block size is set (see
+  [target compressed block size](target-block-size.md)); the entropy
+  statistics it shares with `split_block` live in `block_stats`.
+  `presplit::split_block` dispatches once per eligible
   full block to the encoder's selected backend. The splitter body stays out
   of line so the dispatcher does not retain a second fingerprint stack
   frame; the frame is released before match finding. `split_by_chunks`
@@ -588,6 +612,20 @@ reference's templates are:
   replaced that select, whose stand-in address and low-bit choice were
   rebuilt at every position; in dfast it measured faster on single small
   blocks but slower on multi-block inputs (see the known gaps);
+- dfast's prefix and base-relative loops take a `BRANCHY` parameter, chosen
+  per block by `takes_branches(windowLog, hashLog)`: when the window spans
+  at least sixteen times the long table (`windowLog >= hashLog + 4`, level
+  3 above 1 MiB), a slot goes stale only if nothing overwrites it for a
+  whole window, so candidates are tested with branches
+  (`mem::matches64_branchy`, `matches32_branchy`), which then predict well;
+  otherwise (level 4, small windows) the selects above remain. This is the
+  choice ClickHouse's zstd fork makes (`useCmov = windowLog < hashLog + 4`).
+  Both forms accept the same candidates, and the strict lower limit of the
+  second long candidate at `ip + 1` is kept, so output is unchanged in
+  one-shot and streaming compression. silesia.tar at level 3 (one pinned
+  vCPU of a Ryzen 9 7950X VDS, native build, 2026-11-09): 8582M to 8085M
+  instructions per compression (zstd 1.5.7: 6489M); level 4 unchanged at
+  8413-8415M;
 - like the reference, fast and dfast prefetch the input at `ip1 + 64` and
   `ip1 + 128` whenever the step grows (`mem::prefetch_l1`, through the
   `branches` crate). The reference's per-position `ip + 256` on aarch64
@@ -982,9 +1020,28 @@ buffers are always large enough) into `EncodeError::Internal`.
 
 ## Known gaps
 
+- Measured 2026-11-08 (one pinned vCPU of a Ryzen 9 7950X VDS, native
+  builds, lzbench master on silesia.tar, five interleaved repeats): levels
+  3, 5 and 8 compress at a median 0.950, 0.963 and 0.962 of zstd 1.5.7's
+  speed, single runs from 0.915 to 1.05. At level 8 the instructions,
+  branch and cache misses per call are within 1-4% of the reference's
+  (32.56G against 32.38G instructions per silesia.tar call); the row
+  finder's cycles vary by up to 25% between runs on that host. The `dfast`
+  loop executes about 60 instructions per searched position against the
+  reference's 45 (mozilla, 1 MiB, level 3: 23.95M against 16.16M for the
+  whole loop, 9.56M against 7.53M cycles): about fifteen are stack
+  traffic, loads of the input's length for each word's bounds test, and the
+  repcode read's own bounds test. Running full `dfast` blocks on the
+  `fast` levels' `SeqCursor` removed only 0.7-3.9% of the instructions and
+  no cycles, and was not kept. Rechecked the same day: one fixed stand-in
+  with the range test joined to the equality (`loaded == word && inside`,
+  as `ZSTD_selectAddr` compares) cut 1.3% of the instructions but cost 32%
+  more cycles, since LLVM again tested the range with its own,
+  mispredicted branch.
 - `fast` on inputs above 256 KiB (Silesia, levels -1 and 1) runs at a
   median 0.939-0.945x the reference, 0.93-0.96x on text
-  ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30, Ryzen 9 7950X).
+  (Silesia run of 2026-10-30, Ryzen 9 7950X, since replaced by
+  [lzbench](../docs/benchmarks/lzbench-2026-11-09.md)).
   Its search loop
   costs about the reference's instructions per position; a match costs
   about 127 instructions against the reference's 91 (Silesia dickens,

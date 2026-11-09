@@ -13,8 +13,10 @@ graph TD
     Root --> Encoder[compressor::encoder]
     Root --> Session[compressor::session]
     Root --> Error[compressor::error]
+    Root --> Parameter[compressor::parameter: CParameter]
     Root --> IO["compressor::io (std)"]
     Root --> Parallel["compressor::parallel (std)"]
+    Parameter --> Config
     Config --> Internal[compressor::internal: lowering]
     Internal --> Core["compressor::core (private)"]
     Encoder --> Core
@@ -26,7 +28,8 @@ graph TD
 
 | Module | Owns |
 | --- | --- |
-| `config` | `Level`, `Strategy`, `CompressionParams`, `LdmParams`, `LongDistanceMatching`, `EncoderConfig`, `Parameter`, `ConfigError`, `SizeOverflow`, and validation against the reference's bounds. |
+| `config` | `Level`, `Strategy`, `Switch`, `DictionaryAttach`, `CompressionParams` (including `for_level`, `ZSTD_getCParams`), `LdmParams`, `LongDistanceMatching`, `EncoderConfig`, `Parameter`, `ConfigError`, `SizeOverflow`, and validation against the reference's bounds. |
+| `parameter` | `CParameter`: a `(ZSTD_cParameter, value)` pair validated as `ZSTD_CCtx_setParameter` does, applied with `EncoderConfig::with_parameter`; see [OpenZL integration](openzl-integration.md#parameters-by-id). |
 | `internal` | `requested_params`: the single translation from `EncoderConfig` to the core's `RequestedParams` (the reference's `ZSTD_CCtx_params`). |
 | `dictionary` | `DictionaryBuilder`, `PreparedDictionary` (re-exported from `mzstd::dictionary`); see [dictionaries](dictionaries.md). |
 | `encoder` | `Compressor`, `CompressorBuilder` (`with_retention`, `with_backend`), one-shot calls (with and without a dictionary), `start`/`into_session` and their `_with_dictionary` forms, retention. The backend (default: the detected SIMD level) is stored in the `Engine` for the match finders. |
@@ -47,11 +50,28 @@ classDiagram
     class EncoderConfig {
         level: Level
         params: CompressionParams
-        ldm: LongDistanceMatching
+        ldm_switch: Switch
+        ldm: LdmParams
         checksum: bool
         content_size: bool
         size_hint: Option~u32~
+        format: FrameFormat
+        dictionary_id: bool
+        literal_compression: Switch
+        dictionary_attach: DictionaryAttach
+        force_max_window: bool
+        row_match_finder: Switch
+        post_block_splitter: Switch
+        block_splitter_level: u8
+        max_block_size: Option~u32~
+        target_compressed_block_size: Option~NonZeroU32~
     }
+    class CParameter {
+        <<enum>>
+        +try_from((i32, i32)) CParameter
+        +check_memory_cap(u32) CParameter
+    }
+    CParameter --> EncoderConfig : with_parameter
     class Compressor {
         config: EncoderConfig
         requested: RequestedParams
@@ -90,7 +110,8 @@ validation because it has no explicit parameter. Explicit parameters are
 `CompressionParams` and `LdmParams` stores `0` as `None`, as
 `ZSTD_CCtx_setParameter(.., 0)` resets a parameter to its default, so the
 last value given wins and a caller can apply a list of zstd-style parameters
-directly, one setter call each. Lowering maps `None` to `0`, which the core
+directly, one setter call each; `CParameter` does the same for numeric
+`ZSTD_cParameter` IDs, with the reference's validation. Lowering maps `None` to `0`, which the core
 already treated as "derive from the level", so frames are unchanged.
 
 ## One-shot compression
@@ -250,13 +271,14 @@ changes output: a reused engine's frames equal a fresh one's (checked by
 
 ## Known gaps
 
-- No `targetCBlockSize`, no magicless frames, no external
-  sequence producers, and no explicit `ZSTD_c_useRowMatchFinder`,
-  `ZSTD_c_blockSplitterLevel` or `ZSTD_c_maxBlockSize` control in the public
-  API; the core models them only at their automatic values.
+- No external sequence producers and no multithreaded `ZSTD_c_nbWorkers`.
+  `targetCBlockSize` is implemented, see
+  [target compressed block size](target-block-size.md).
+- Magicless frames (`EncoderConfig::with_format`) are written by
+  `Compressor` only; the parallel and framed compressors refuse them.
 - The stable-buffer streaming modes (`ZSTD_c_stableInBuffer`,
-  `ZSTD_c_stableOutBuffer`) are not exposed; sessions always behave as the
-  reference's buffered mode.
+  `ZSTD_c_stableOutBuffer`) are accepted by `CParameter` and ignored; sessions
+  always behave as the reference's buffered mode.
 - Streaming at the fast levels trails zstd on the `stream/mixed-4MiB`
   bench (level 1: 7.4 ms against 6.1 ms on the i7-13700KF before the
   branch-free segment select, about 2% less since) because of the extDict

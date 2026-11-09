@@ -58,8 +58,10 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Codec features](codec-features.md) | Feature gates, `no_std`, std-only modules, hotpath anchors and the checked configurations. |
 | [Compressor](compressor.md) | Public encoder API, configuration lowering, one-shot calls, sessions, I/O adapters, errors and retention. |
 | [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding, streaming and output destinations (slice, Vec, uninitialized memory). |
+| [Target compressed block size](target-block-size.md) | `ZSTD_c_targetCBlockSize`: the superblock path that cuts a block into sub-blocks near a compressed size: parameter semantics, estimation, the split loop, per-sub-block literals and sequences decisions, entropy-table state across sub-blocks, fallbacks and verification. |
 | [Optimal parser](optimal-parser.md) | btopt/btultra/btultra2 and LDM: per-block SIMD dispatch, the shared binary-tree walk, match-length kernels, price tables. |
 | [Dictionaries](dictionaries.md) | Raw and Zstandard-format dictionaries on the encoder side: `PreparedDictionary` (CDict), parameter modes, attach / copy / load at frame start, the dictionary segment, dictMatchState finders, entropy loading; the decoder side is in [decompressor](decompressor.md#dictionaries). |
+| [OpenZL integration](openzl-integration.md) | The zstd calls OpenZL's codec makes and their mzstd counterparts: `FrameFormat` (magicless frames), `CParameter` (reference parameters by ID), standalone dictionaries (`ZSTD_createCDict_advanced` + `ZSTD_CCtx_refCDict`, which replaces the context level), per-element flush streaming, `FrameHeaderInfo` and `DecoderConfig::with_format`. |
 | [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches over slices or random-access sources (`prepare_source`), windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues and their executor progress requirements, the parallel `std::io` adapters, errors and panic safety. |
 | [Framed containers](framing.md) | The `framed` wire format (Zstandard and skippable frames, chunk headers, directory, footer, contrib-compatible seek table) and the framed compressor: owner, sessions, structured input, std adapters, state and memory. |
 | [Framed decoder](framed-decoder.md) | `FramedDecompressor`: detection, chunk and seek table validation, events, dictionaries and budgets; the `FramedSeekReader` index and dependency plan. |
@@ -78,23 +80,25 @@ signatures. Each codec compiles on its own, with or without `std`.
 
 - **Scope.** Both codecs take raw and Zstandard-format dictionaries
   ([dictionaries](dictionaries.md), [decompressor](decompressor.md#dictionaries));
-  the parallel compressor and the C ABI do not. There are no magicless frames, no `targetCBlockSize`, no external
+  the parallel compressor and the C ABI do not. Magicless frames are written by `Compressor` and read by the
+  decoder (not by the parallel or framed compressors, nor the C ABI;
+  [OpenZL integration](openzl-integration.md)). There are no external
   sequence producers, and no legacy (v0.x) frames.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
   and dispatched once per block. In the cold comparison against zstd 1.5.7
   ([benchmarks](../docs/benchmarks/README.md), Ryzen 9 7950X under KVM,
-  AVX-512, 2026-10-30) compression runs at a median 1.256x the reference's
-  speed, faster in 179 of 192 dataset/level pairs, and decompression at
-  1.502x, faster in 143. These medians include empty and tiny inputs. The
-  encoder still trails on Alice at levels -1, 1, 2, 4-9, 11 and 12
-  (0.94-0.99x), and on whole Silesia files with reused contexts at the
-  `fast` levels (0.94x) and the row levels 5-9 (0.95-0.96x); `fast`
-  executes about 127 instructions per match against the reference's 91
+  AVX-512, 2026-11-09, host loaded by other tenants) compression runs at a
+  median 1.248x the reference's speed, faster in 174 of 192 dataset/level
+  pairs, and decompression at 1.517x, faster in 151. These medians include
+  empty and tiny inputs. The encoder still trails on Alice at ten levels
+  (0.84-0.998x in that noisy run; 0.94-0.99x on 2026-10-30), and on the
+  whole `silesia.tar` in lzbench at most levels; `fast` executes about 127
+  instructions per match against the reference's 91
   ([encoder core](encoder-core.md#known-gaps)). The decoder trails on
-  compressible text at every level (Alice 0.93-0.96x, cyclic Alice
-  0.94-0.98x) and on whole Silesia files (0.96-0.98x, x-ray level 1
-  0.85x): its four-stream Huffman loop executes about 242 instructions per
-  round against the reference's 221
+  compressible text (Alice 0.948x and cyclic Alice 0.937x in the median)
+  and in lzbench at every level (0.92-0.96x of zstd): its four-stream
+  Huffman loop executes about 242 instructions per round against the
+  reference's 221
   ([decoder fast paths](decoder-performance.md#known-gaps)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's: segments are primed with their

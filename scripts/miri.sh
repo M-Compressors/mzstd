@@ -45,6 +45,10 @@ run --lib \
     compressor::core::opt_count::tests::segment_counts_stop_at_the_limit \
     compressor::core::opt_count::tests::ordered_counts_report_the_first_differing_bytes \
     compressor::core::opt_count::tests::two_segment_counts_continue_at_the_prefix_start \
+    compressor::core::superblock::tests::sequences_sections_are_identical_on_every_backend \
+    compressor::core::superblock::tests::sequences_sections_carry_their_tables_once_and_repeat_them_after \
+    compressor::core::superblock::tests::a_sub_block_has_a_header_and_reports_what_it_wrote \
+    compressor::core::superblock::tests::tables_that_were_never_written_fall_back_to_the_previous_ones \
     compressor::core::lazy::row::tests::masks_equal_the_scalar_reference_on_every_backend \
     compressor::core::lazy::row::tests::a_single_matching_slot_is_found_from_every_head \
     decompressor::core::copy::tests::wildcopied_matches_equal_byte_copies_for_every_offset_and_mode \
@@ -68,3 +72,8 @@ run --lib \
 run --test=compressor_api \
     compress_to_uninit_writes_the_one_shot_frame \
     compress_to_uninit_reports_a_destination_that_is_too_small
+
+# The superblock path (a target compressed block size) into uninitialized
+# memory and a slice.
+run --test=compressor_target_block \
+    uninitialized_and_initialized_outputs_hold_the_same_superblock_frame

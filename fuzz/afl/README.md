@@ -38,7 +38,9 @@ The same target bodies also run under libFuzzer for ClusterFuzzLite; see
 ## Input layout
 
 `decode_config` reads byte 0 as the level (`value % 40`: `0..=32` map to
-`-10..=22`, then `-100`, `-1000`, `-131072`, and `13..=19` again) and byte 1
+`-10..=22`, then `-100`, `-1000`, `-131072`, and `13..=19` again; `value / 40`
+of `1..=6` also sets `ZSTD_c_targetCBlockSize` to 1340, 1500, 2048, 4096,
+16384 or 131072) and byte 1
 as flags: `1` checksum, `2` no content size, `4`/`8` LDM disabled or enabled
 (one byte of LDM minimum match follows), `0x10` window log (one byte),
 `0x20` strategy and minimum match (one byte), `0x40` search, hash and chain
@@ -54,7 +56,7 @@ logs (one byte), `0x80` source size hint (two bytes). The rest, capped at
 | `encoder_session` | 4: output size, declared size, chunk seed | A session fed random chunks, flushes and output windows, alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way |
 | `compressor_lifecycle` | a second header mid-payload | Reuse, `reconfigure` and `trim` never change a frame |
 | `parallel` | 1: task count (bits 0-2), stream window (3-4), flush (5), chunk size (6-7 with 0-2) | Parallel frames decode and are identical for 1–8 tasks run in reverse order, from a slice or from a `SeekSource` read by detached tasks; a session alternating `process` and `process_uninit` and the writer and reader adapters, with and without a declared size, decode and reproduce the batch frame whenever no flush moved a boundary |
-| `parameter_parsing` | none | Header decoding never panics; window logs are accepted exactly in `10..=31` |
+| `parameter_parsing` | none | Header decoding never panics; window logs are accepted exactly in `10..=31`; `CParameter` accepts `(id, value)` pairs exactly as `ZSTD_CCtx_setParameter` does and accepted lists compress to the reference's bytes |
 | `decompress` | raw input, no header | Arbitrary bytes never panic; whatever mzstd accepts, the reference's streaming decoder accepts with the same output; `decompress_to_slice` agrees with `decompress` |
 | `decode_streaming` | 2: input and output piece sizes, then a frame | A session fed those pieces agrees with one-shot decoding, never over-reports progress, and stops only when `NeedsInput` has consumed its input |
 | `decode_roundtrip` | parameter header | Frames the reference writes with the fuzzed configuration decode to the payload, one-shot and in pieces |

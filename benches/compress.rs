@@ -19,6 +19,7 @@ use hotpath::criterion::{
 use mzstd::{Compressor, EncoderConfig, EncoderStatus, InputSize, Level, Operation};
 use std::hint::black_box;
 use std::mem::MaybeUninit;
+use std::num::NonZeroU32;
 use std::path::Path;
 use zstd_ffi::corpus;
 use zstd_ffi::oracle::{self, Directive, Params};
@@ -261,9 +262,66 @@ fn uninit_output(c: &mut Criterion) {
     group.finish();
 }
 
+/// Frames cut to a target compressed block size (`ZSTD_c_targetCBlockSize`),
+/// against `ZSTD_compress2` with the same parameter. The frames are checked
+/// identical first and their sizes printed: a smaller target costs ratio.
+fn target_block(c: &mut Criterion) {
+    let corpora = corpora();
+    for (name, input) in corpora
+        .iter()
+        .filter(|(name, _)| matches!(*name, "text-1MiB" | "binary-1MiB" | "http"))
+    {
+        let bound = Compressor::max_compressed_size(input.len()).expect("a bound");
+        let mut ours = vec![0u8; bound];
+        for level in [1, 3, 9] {
+            for target in [1340u32, 16_384] {
+                let params =
+                    Params::level(level).with(zstd_ffi::ZSTD_c_targetCBlockSize, target as i32);
+                let config = EncoderConfig::default()
+                    .with_level(Level::try_from(level).expect("a valid level"))
+                    .with_target_compressed_block_size(NonZeroU32::new(target));
+                let mut mzstd = Compressor::new(config).expect("a valid configuration");
+                let size = mzstd
+                    .compress_to_slice(input, &mut ours)
+                    .expect("compresses");
+                let theirs = oracle::compress2(input, &params).expect("reference");
+                assert_eq!(
+                    ours[..size],
+                    theirs[..],
+                    "{name} level {level} target {target}"
+                );
+                assert_eq!(
+                    oracle::decompress(&theirs, input.len()).expect("decodes"),
+                    *input
+                );
+                println!(
+                    "{name} level {level} target {target}: {} -> {size} bytes ({:.4})",
+                    input.len(),
+                    size as f64 / input.len() as f64
+                );
+
+                let mut group = c.benchmark_group(format!("target-block/{name}/{target}"));
+                group.throughput(Throughput::Bytes(input.len() as u64));
+                group.bench_function(BenchmarkId::new("mzstd", level), |b| {
+                    b.iter(|| {
+                        mzstd
+                            .compress_to_slice(black_box(input), &mut ours)
+                            .expect("compresses")
+                    });
+                });
+                let mut cctx = oracle::Encoder::new(&params);
+                group.bench_function(BenchmarkId::new("zstd", level), |b| {
+                    b.iter(|| cctx.compress_into(black_box(input), &mut ours));
+                });
+                group.finish();
+            }
+        }
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Config::default().sample_size(10);
-    targets = compress, streaming, uninit_output
+    targets = compress, streaming, uninit_output, target_block
 }
 criterion_main!(benches);

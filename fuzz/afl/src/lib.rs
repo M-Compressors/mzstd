@@ -6,6 +6,8 @@
 //! AFL: each binary under `src/bin/` is a three line adapter, so a minimised
 //! finding replays through `cargo afl test` (see `tests/regressions.rs`).
 
+use core::num::NonZeroU32;
+
 use mzstd::{CompressionParams, EncoderConfig, LdmParams, Level, LongDistanceMatching, Strategy};
 use zstd_ffi::oracle::Params;
 use zstd_ffi::*;
@@ -29,6 +31,9 @@ pub struct Decoded<'a> {
     pub rest: &'a [u8],
 }
 
+/// Target compressed block sizes selected by `byte 0 / 40` (`1..=6`).
+const TARGETS: [u32; 6] = [1340, 1500, 2048, 4096, 16_384, 131_072];
+
 fn take<'a>(data: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     if data.len() < n {
         return None;
@@ -40,7 +45,9 @@ fn take<'a>(data: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 
 /// Decodes a configuration header.
 ///
-/// Byte 0 selects the level (`-10..=22` plus a few accelerated ones); byte
+/// Byte 0 selects the level (`-10..=22` plus a few accelerated ones) in
+/// `value % 40` and, in `value / 40`, a target compressed block size (none,
+/// then one of six sizes from the reference's minimum to its maximum); byte
 /// 1 holds flags: checksum, content size, LDM mode (two bits), window,
 /// strategy, search and size-hint overrides, each followed by its byte.
 pub fn decode_config(mut data: &[u8]) -> Option<Decoded<'_>> {
@@ -60,6 +67,10 @@ pub fn decode_config(mut data: &[u8]) -> Option<Decoded<'_>> {
     let mut params = Params::level(level)
         .with(ZSTD_c_checksumFlag, i32::from(flags & 1 != 0))
         .with(ZSTD_c_contentSizeFlag, i32::from(flags & 2 == 0));
+    if let Some(&target) = TARGETS.get((header[0] / 40).wrapping_sub(1) as usize) {
+        config = config.with_target_compressed_block_size(NonZeroU32::new(target));
+        params = params.with(ZSTD_c_targetCBlockSize, target as i32);
+    }
     let mut cparams = CompressionParams::default();
     if flags & 0x10 != 0 {
         let window = 10 + u32::from(take(&mut data, 1)?[0] % 14);

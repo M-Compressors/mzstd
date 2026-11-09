@@ -78,3 +78,11 @@ public functions as missed even though tests call them.
   show that the reference's own heuristics are good.
 - Inputs above a few megabytes are covered only by the parallel tests and
   the overflow-correction mode, not by the level matrix.
+
+## OpenZL integration
+
+`tests/openzl_binding.rs` compares the calls OpenZL's zstd node makes
+(magicless frames, parameters by ID, the per-element flush stream, referenced
+`ZSTD_CDict`s, `ZSTD_getCParams`, `ZSTD_compressBound`) with the oracle shim
+`mzstd_shim_openzl_encode` byte for byte; see
+[OpenZL integration](openzl-integration.md#verification).

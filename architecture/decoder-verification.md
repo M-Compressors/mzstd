@@ -122,3 +122,11 @@ CARGO_TARGET_DIR=target-dec cargo test --release --no-default-features \
 Function coverage of `src/decompressor` with
 `cargo llvm-cov --no-default-features --features std,decompression --lib --test 'decoder_*'`
 is 100%.
+
+## Magicless frames and header queries
+
+`tests/openzl_binding.rs` decodes magicless frames in every frame shape, chunking
+and frame mode against `ZSTD_decompress_usingDDict`
+(`mzstd_shim_openzl_decode`), and compares `FrameHeaderInfo::parse` with
+`ZSTD_getFrameHeader_advanced` on every prefix of generated frames and on
+random bytes, for both formats.

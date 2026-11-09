@@ -491,6 +491,18 @@ pub(crate) fn matches64(src: &[u8], at: u32, word: u64) -> bool {
     *candidate(src, at, &word) == word
 }
 
+/// [`matches64`] with branches, as [`matches32_branchy`] is for four bytes:
+/// where the window is several times the hash table's span, a candidate is
+/// rarely stale, and the range test predicts well.
+#[inline(always)]
+pub(crate) fn matches64_branchy(src: &[u8], at: u32, word: u64) -> bool {
+    let at = at as usize;
+    match src.get(at..at + 8) {
+        Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap_or_default()) == word,
+        None => false,
+    }
+}
+
 /// Hints that `src[at]` will be read soon (`PREFETCH_L1`). The pointer only
 /// reaches the prefetch instruction, so an offset past the end is harmless.
 #[inline(always)]
@@ -650,12 +662,24 @@ mod tests {
                         matches64(history, at, u64::from_le_bytes(word64)),
                         index as usize >= start && index as usize + 8 <= end
                     );
+                    assert_eq!(
+                        matches32_branchy(history, at, u32::from_le_bytes(word32)),
+                        matches32(history, at, u32::from_le_bytes(word32))
+                    );
+                    assert_eq!(
+                        matches64_branchy(history, at, u64::from_le_bytes(word64)),
+                        matches64(history, at, u64::from_le_bytes(word64))
+                    );
                     assert!(!matches32(history, at, u32::MAX));
                     assert!(!matches64(history, at, u64::MAX));
+                    assert!(!matches32_branchy(history, at, u32::MAX));
+                    assert!(!matches64_branchy(history, at, u64::MAX));
                 }
                 for at in u32::MAX - 8..=u32::MAX {
                     assert!(!matches32(history, at, 0));
                     assert!(!matches64(history, at, 0));
+                    assert!(!matches32_branchy(history, at, 0));
+                    assert!(!matches64_branchy(history, at, 0));
                 }
             }
         }

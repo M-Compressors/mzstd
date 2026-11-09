@@ -626,7 +626,14 @@ mod tests {
     ) -> Result<Vec<u8>, InvalidDataKind> {
         let mut out = alloc::vec![0xee; n];
         table
-            .decode_streams(fearless_simd::Fallback::new(), src, &mut out, n, four)
+            .decode_streams(
+                fearless_simd::Fallback::new(),
+                src,
+                &mut out,
+                n,
+                four,
+                crate::decompressor::core::ahead::WriteAhead::NONE,
+            )
             .map(|()| out)
     }
 

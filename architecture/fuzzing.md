@@ -31,7 +31,7 @@ equivalent reference `Params`, so every target compares like with like.
 
 ```mermaid
 flowchart LR
-    B0["byte 0: level (value % 40)"] --> B1["byte 1: flags"]
+    B0["byte 0: level (value % 40), target compressed block size (value / 40)"] --> B1["byte 1: flags"]
     B1 -->|0x10| W[window log byte]
     B1 -->|0x20| S[strategy + min match byte]
     B1 -->|0x40| H[search / hash / chain byte]
@@ -53,7 +53,7 @@ the payload, so every target shares one seed corpus.
 | `encoder_session` | A session driven by random chunks, flushes and output capacity, with calls alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
 | `compressor_lifecycle` | Reuse, `reconfigure` and `trim(ReleaseAll)` never change a frame. |
 | `parallel` | Parallel frames decode with the reference and are identical for 1–8 tasks run in reverse order, whether the batch borrows the input or reads it from a `SeekSource` through `prepare_source` with each task on a detached thread. A session (windows 1–4, an optional flush, calls alternating `process` and `process_uninit`, which must leave every byte past `produced` untouched) and the `ParallelEncoderWriter`/`ParallelEncoderReader` adapters (one executor thread each) decode; with a declared size, or an input within one segment, and no flush they equal the batch frame; the writer always equals the session driven with the same writes and flush. |
-| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default. |
+| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default; `CParameter::try_from((id, value))` agrees with `ZSTD_CCtx_setParameter` on acceptance, and accepted lists compress to the reference's bytes. |
 | `decompress` | Raw bytes: no panic; anything mzstd accepts, `ZSTD_decompressStream` accepts with the same output; `decompress_to_slice` agrees with `decompress`; `decompress_to_uninit` returns the same result and bytes as `decompress_to_slice` and leaves every byte past it untouched. |
 | `decode_streaming` | Two piece sizes, then a frame: a session, with calls alternating `process` and `process_uninit` (which must leave every byte past `produced` untouched), agrees with one-shot decoding and never over-reports progress. `decode_roundtrip` and `decode_dictionary` drive their sessions the same way. |
 | `decode_roundtrip` | Parameter header: frames the reference writes with that configuration decode to the payload, one-shot and in pieces. |

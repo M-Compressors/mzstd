@@ -10,7 +10,7 @@ use super::{FseRepeat, FseTables};
 use crate::Backend;
 use crate::compressor::core::error::CoreError;
 use crate::compressor::core::params::Strategy;
-use crate::compressor::core::seq_store::{CODE_COUNT_SLOTS, SeqStore};
+use crate::compressor::core::seq_store::{CODE_COUNT_SLOTS, SeqCodes, SeqDef, SeqStore};
 use crate::shared::format::{
     DEFAULT_MAX_OFF, EncodingType, LL_DEFAULT_NORM, LL_DEFAULT_NORM_LOG, LL_FSE_LOG, MAX_LL,
     MAX_ML, MAX_OFF, MAX_SEQ, ML_DEFAULT_NORM, ML_DEFAULT_NORM_LOG, ML_FSE_LOG, OF_DEFAULT_NORM,
@@ -475,7 +475,30 @@ pub(crate) fn encode(
     store: &SeqStore,
     backend: Backend,
 ) -> Result<usize, CoreError> {
-    fearless_simd::dispatch!(backend.0, simd => encode_on(simd, dst, tables, store))
+    let n = store.nb_seq();
+    encode_slice(
+        dst,
+        tables,
+        &store.sequences()[..n],
+        &store.codes[..n],
+        backend,
+    )
+}
+
+/// [`encode`] for a run of a store's sequences and their codes, as a
+/// sub-block holds them.
+///
+/// # Errors
+///
+/// As [`encode`]; an empty run has no bitstream.
+pub(crate) fn encode_slice(
+    dst: &mut [u8],
+    tables: &FseTables,
+    sequences: &[SeqDef],
+    codes: &[SeqCodes],
+    backend: Backend,
+) -> Result<usize, CoreError> {
+    fearless_simd::dispatch!(backend.0, simd => encode_on(simd, dst, tables, sequences, codes))
 }
 
 /// Bits of extra values one sequence may add without a flush: the 64-bit
@@ -488,16 +511,16 @@ fn encode_on<S: Simd>(
     simd: S,
     dst: &mut [u8],
     tables: &FseTables,
-    store: &SeqStore,
+    sequences: &[SeqDef],
+    codes: &[SeqCodes],
 ) -> Result<usize, CoreError> {
     let Some(mut writer) = BitWriter::new(dst) else {
         return Err(CoreError::DstSizeTooSmall);
     };
-    let n = store.nb_seq();
-    let Some((last, codes)) = store.codes[..n].split_last() else {
+    let Some((last, codes)) = codes.split_last() else {
         return Err(CoreError::Generic);
     };
-    let Some((last_seq, seqs)) = store.sequences()[..n].split_last() else {
+    let Some((last_seq, seqs)) = sequences.split_last() else {
         return Err(CoreError::Generic);
     };
 

@@ -338,6 +338,16 @@ fn compress_scan_adaptive<
             &mut stopped,
         );
     }
+    // Once an earlier block allocated and zeroed the full-block
+    // destinations, the cursor costs nothing to start: the whole block
+    // runs on it, with no vector pushes and no copy at a promotion.
+    if store.has_full_block() {
+        return store.with_full_block_cursor(|cursor| {
+            compress_cursor_scan::<S, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN>(
+                simd, table, cursor, scan, ip, reps,
+            )
+        });
+    }
     let (remaining, reps) = compress_scan::<S, SeqStore, MLS, IN_PREFIX, HLOG, BRANCHY, ORIGIN, true>(
         simd,
         table,

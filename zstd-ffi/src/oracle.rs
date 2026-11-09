@@ -120,6 +120,33 @@ impl Drop for CCtx {
     }
 }
 
+/// `ZSTD_CCtx_setParameter` on a fresh context: whether the reference accepts
+/// `value` for `param`.
+///
+/// # Errors
+///
+/// Returns the reference's error name.
+pub fn set_parameter(param: ZSTD_cParameter, value: i32) -> Result<(), String> {
+    CCtx::new().set(param, value)
+}
+
+/// `ZSTD_CCtx_setParameter` followed by `ZSTD_CCtx_getParameter` on a fresh
+/// context: the value the reference stores for `value`, which differs from
+/// it where the reference normalizes (a `targetCBlockSize` below its minimum
+/// is raised to it).
+///
+/// # Errors
+///
+/// Returns the reference's error name, from either call.
+pub fn stored_parameter(param: ZSTD_cParameter, value: i32) -> Result<i32, String> {
+    let mut cctx = CCtx::new();
+    cctx.set(param, value)?;
+    let mut stored: c_int = 0;
+    // SAFETY: `cctx.0` is a live context and `stored` is a valid `int`.
+    check(unsafe { ZSTD_CCtx_getParameter(cctx.0, param, &mut stored) })?;
+    Ok(stored)
+}
+
 /// A configured compression context kept across calls, for benchmarks that
 /// must not time context creation.
 pub struct Encoder(CCtx);
@@ -1084,4 +1111,245 @@ pub fn seekable_compress(input: &[u8], level: i32, max_frame: u32) -> Result<Vec
     let written = out.pos;
     output.truncate(written);
     Ok(output)
+}
+
+/// A `ZSTD_CDict` made the way OpenZL makes one
+/// (`ZSTD_createCDict_advanced` with `ZSTD_getCParams(level, 0, size)`).
+pub struct OpenZlCDict(*mut ZSTD_CDict);
+
+impl OpenZlCDict {
+    /// Prepares `raw` for `clevel`, or `None` when the reference refuses.
+    pub fn new(raw: &[u8], clevel: i32) -> Option<Self> {
+        // SAFETY: the dictionary is copied (`ZSTD_dlm_byCopy`).
+        let cdict =
+            unsafe { mzstd_shim_openzl_create_cdict(raw.as_ptr().cast(), raw.len(), clevel) };
+        (!cdict.is_null()).then_some(Self(cdict))
+    }
+}
+
+impl Drop for OpenZlCDict {
+    fn drop(&mut self) {
+        // SAFETY: created by `ZSTD_createCDict_advanced`, freed once.
+        unsafe { ZSTD_freeCDict(self.0) };
+    }
+}
+
+/// A `ZSTD_DDict` made the way OpenZL makes one
+/// (`ZSTD_createDDict_advanced`, by copy, content type auto).
+pub struct OpenZlDDict(*mut ZSTD_DDict);
+
+impl OpenZlDDict {
+    /// Prepares `raw`, or `None` when the reference refuses.
+    pub fn new(raw: &[u8]) -> Option<Self> {
+        // SAFETY: the dictionary is copied (`ZSTD_dlm_byCopy`).
+        let ddict = unsafe { mzstd_shim_openzl_create_ddict(raw.as_ptr().cast(), raw.len()) };
+        (!ddict.is_null()).then_some(Self(ddict))
+    }
+}
+
+impl Drop for OpenZlDDict {
+    fn drop(&mut self) {
+        // SAFETY: created by `ZSTD_createDDict_advanced`, freed once.
+        unsafe { ZSTD_freeDDict(self.0) };
+    }
+}
+
+/// Everything OpenZL's zstd encoder node reads for one stream.
+#[derive(Clone, Copy)]
+pub struct OpenZlJob<'a> {
+    /// `ZL_CParam_formatVersion >= 9`: the frame has no magic number.
+    pub magicless: bool,
+    /// `ZL_CParam_compressionLevel`.
+    pub compression_level: i32,
+    /// `ZL_CParam_decompressionLevel`; `1` stores literals raw.
+    pub decompression_level: i32,
+    /// The node's local integer parameters, in order.
+    pub params: &'a [(i32, i32)],
+    /// The materialized dictionary, if any.
+    pub cdict: Option<&'a OpenZlCDict>,
+    /// Width of one element.
+    pub elt_width: usize,
+}
+
+/// Why OpenZL's encoder node did not produce a frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpenZlError {
+    /// `EI_zstd_parameter_valid` refused a local parameter.
+    PolicyRejected,
+    /// zstd returned this error.
+    Zstd(String),
+}
+
+/// A compression context reused across streams, as OpenZL reuses one.
+pub struct OpenZlEncoder(CCtx);
+
+impl Default for OpenZlEncoder {
+    fn default() -> Self {
+        Self(CCtx::new())
+    }
+}
+
+impl OpenZlEncoder {
+    /// Runs `EI_zstdWithCCtx` on `src`, a whole number of elements.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenZlError`] when the node refuses a parameter or zstd fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `src` is not a whole number of elements.
+    pub fn encode(&mut self, src: &[u8], job: &OpenZlJob<'_>) -> Result<Vec<u8>, OpenZlError> {
+        assert_eq!(src.len() % job.elt_width.max(1), 0, "whole elements");
+        let nb_elts = src.len().checked_div(job.elt_width).unwrap_or(0);
+        let flat: Vec<c_int> = job
+            .params
+            .iter()
+            .flat_map(|&(id, value)| [id, value])
+            .collect();
+        let mut dst = vec![0u8; compress_bound(src.len()) + nb_elts * 3 + 16];
+        let mut rejected: c_int = 0;
+        // SAFETY: every buffer is valid for the size passed, the context and
+        // dictionary are live, and `flat` holds `2 * params.len()` integers.
+        let written = unsafe {
+            mzstd_shim_openzl_encode(
+                (self.0).0,
+                c_int::from(job.magicless),
+                job.compression_level,
+                job.decompression_level,
+                flat.as_ptr(),
+                job.params.len(),
+                job.cdict
+                    .map_or(core::ptr::null(), |cdict| cdict.0.cast_const()),
+                src.as_ptr().cast(),
+                job.elt_width,
+                nb_elts,
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                &mut rejected,
+            )
+        };
+        if rejected != 0 {
+            return Err(OpenZlError::PolicyRejected);
+        }
+        let written = check(written).map_err(OpenZlError::Zstd)?;
+        dst.truncate(written);
+        Ok(dst)
+    }
+}
+
+/// What OpenZL's decoder node reports about a stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpenZlDecode {
+    /// The header does not give a usable content size.
+    BadHeader,
+    /// zstd refused the frame.
+    Zstd(String),
+}
+
+/// Runs `DI_zstd` on `frame`, returning the decoded bytes.
+///
+/// # Errors
+///
+/// [`OpenZlDecode`] when the header gives no content size or zstd fails.
+pub fn openzl_decode(
+    magicless: bool,
+    ddict: Option<&OpenZlDDict>,
+    frame: &[u8],
+    max_output: usize,
+) -> Result<Vec<u8>, OpenZlDecode> {
+    // SAFETY: allocation only; a null result is checked.
+    let dctx = unsafe { ZSTD_createDCtx() };
+    assert!(!dctx.is_null(), "ZSTD_createDCtx failed");
+    struct Guard(*mut ZSTD_DCtx);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: created by `ZSTD_createDCtx`, freed once.
+            unsafe { ZSTD_freeDCtx(self.0) };
+        }
+    }
+    let guard = Guard(dctx);
+    let mut dst = vec![0u8; max_output];
+    let mut content_size = 0;
+    let mut bad_header: c_int = 0;
+    // SAFETY: every buffer is valid for the size passed and the contexts are
+    // live.
+    let written = unsafe {
+        mzstd_shim_openzl_decode(
+            guard.0,
+            c_int::from(magicless),
+            ddict.map_or(core::ptr::null(), |ddict| ddict.0.cast_const()),
+            frame.as_ptr().cast(),
+            frame.len(),
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            &mut content_size,
+            &mut bad_header,
+        )
+    };
+    if bad_header != 0 {
+        return Err(OpenZlDecode::BadHeader);
+    }
+    let written = check(written).map_err(OpenZlDecode::Zstd)?;
+    dst.truncate(written);
+    Ok(dst)
+}
+
+/// What `ZSTD_getFrameHeader_advanced` reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameHeaderReport {
+    /// `frameContentSize` (`ZSTD_CONTENTSIZE_UNKNOWN` when absent).
+    pub content_size: u64,
+    /// `windowSize`.
+    pub window_size: u64,
+    /// `dictID`.
+    pub dict_id: u32,
+    /// `headerSize`.
+    pub header_size: u32,
+    /// `checksumFlag`.
+    pub checksum: bool,
+    /// `1` for a skippable frame, `0` for a Zstandard one.
+    pub frame_type: i32,
+}
+
+/// `ZSTD_getFrameHeader_advanced`: the header, `Ok(Err(n))` when `n` bytes
+/// are needed, or the reference's error name.
+///
+/// # Errors
+///
+/// The reference's error name for an invalid header.
+pub fn frame_header(
+    src: &[u8],
+    magicless: bool,
+) -> Result<Result<FrameHeaderReport, usize>, String> {
+    let (mut content_size, mut window_size) = (0, 0);
+    let (mut dict_id, mut header_size, mut checksum) = (0, 0, 0);
+    let mut frame_type = 0;
+    // SAFETY: the source is valid for its length and every out-pointer is a
+    // live local.
+    let ret = unsafe {
+        mzstd_shim_frame_header(
+            src.as_ptr().cast(),
+            src.len(),
+            c_int::from(magicless),
+            &mut content_size,
+            &mut window_size,
+            &mut dict_id,
+            &mut header_size,
+            &mut checksum,
+            &mut frame_type,
+        )
+    };
+    let ret = check(ret)?;
+    if ret != 0 {
+        return Ok(Err(ret));
+    }
+    Ok(Ok(FrameHeaderReport {
+        content_size,
+        window_size,
+        dict_id,
+        header_size,
+        checksum: checksum != 0,
+        frame_type,
+    }))
 }

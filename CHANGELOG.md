@@ -1,7 +1,44 @@
 # Changelog
 
-## Unreleased
+## [v0.2.12](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.12) - 2026-11-09
 
+- **`ZSTD_c_targetCBlockSize` is implemented.** A target compressed block
+  size cuts each block into sub-blocks of about that many compressed bytes,
+  so a receiver can start decoding before a whole 128 KiB block has
+  arrived; the frame is byte-identical to `ZSTD_compress2` and
+  `ZSTD_compressStream2` with the same parameter. It is a port of
+  `ZSTD_compressBlock_targetCBlockSize` and `ZSTD_compressSuperBlock`
+  (`zstd_compress_superblock.c`): the whole block's tables and their
+  descriptions are built once, sub-blocks are sized from the estimated
+  literal and sequence costs, the first one that compresses carries the
+  tables and the others repeat them, a sub-block that does not shrink joins
+  its successor, and a tail that never compresses is stored with its repeat
+  offsets rebuilt. New `EncoderConfig::with_target_compressed_block_size`
+  and `target_compressed_block_size` (`Option<NonZeroU32>`; a value below
+  1340 is raised to it and one above 131072 is refused when building the
+  compressor, as `ZSTD_CCtx_setParameter` does), `CParameter::TargetCBlockSize`
+  for parameter 130 (before, any non-zero value was refused with
+  `ConfigError::Unsupported`; `(130, value)` is now accepted and refused
+  exactly as the reference does, and its pair reports the raised value),
+  and `Parameter::TargetCompressedBlockSize` for the out-of-range error. The
+  target replaces the post-sequence block splitter, as in the reference. The
+  entropy statistics of a block (`ZSTD_buildBlockEntropyStats`) moved from
+  `split_block` to a shared `block_stats` module that also keeps the table
+  descriptions, and `sequences::encode_slice` encodes a run of a block's
+  sequences. New `tests/compressor_target_block.rs` compares frames with the
+  reference across levels -5 to 22, targets from 1 to 131072, sizes up to
+  5 MiB, text, noise, constant, structured and mixed inputs, one-shot, slice,
+  uninitialized and `Vec` outputs with every capacity boundary, streaming
+  with flushes, dictionaries in every attach mode, long distance matching,
+  checksums, the block splitters, `maxBlockSize`, every backend and a
+  randomized structured corpus; `tests/openzl_binding.rs` now requires
+  parameter 130 to match the reference for every value and in the OpenZL
+  node's parameter lists; unit tests reach the paths a corpus rarely hits
+  (raw and RLE literals, expansion past the header size, the 1.3.4 and 1.4.0
+  decoder guards, tables never written). The AFL parameter header gains a
+  target (byte 0 `/ 40`), and `scripts/miri.sh` runs the superblock tests.
+  A target set on the parallel compressor's configuration is applied
+  inside every segment.
 - **The decoder accepts every Huffman literal section zstd 1.5.7 accepts.**
   `Decompressor` rejected with `InvalidData { kind: HuffmanStream }` frames
   that `ZSTD_decompress` decodes: the reference's fast four-stream Huffman
@@ -39,6 +76,85 @@
   as before. `ParallelEncoderWriter` and the framed `ResourceWriter`
   already behaved this way; tests with a sink that refuses every other
   write now cover all three.
+- **OpenZL integration surface.** Everything OpenZL v0.3.0's zstd codec needs
+  to reproduce `ZSTD_CCtx` / `ZSTD_DCtx` behaviour byte for byte, additive
+  only (no existing item changes meaning):
+  - `FrameFormat` (`Standard`, `Magicless`; `ZSTD_c_format` /
+    `ZSTD_d_format`) with `EncoderConfig::with_format` and
+    `DecoderConfig::with_format`. A magicless frame is the standard frame
+    without its four magic bytes; the decoder reads frames from their header
+    and no skippable frames. `ParallelCompressor` and the framed compressor
+    refuse it with `ConfigError::Unsupported`.
+  - `CParameter`: a `(ZSTD_cParameter, value)` pair validated exactly as
+    `ZSTD_CCtx_setParameter` does (`TryFrom<(i32, i32)>`, clamped levels,
+    `0` = default, bounds, unknown IDs, single-threaded `parameter_unsupported`),
+    applied with `EncoderConfig::with_parameter`; `check_memory_cap` is
+    OpenZL's "maximum minus three" log cap. New `EncoderConfig` options
+    behind it: `with_literal_compression` (`ZSTD_c_literalCompressionMode`),
+    `with_dictionary_id`, `with_dictionary_attach` (`DictionaryAttach`),
+    `with_force_max_window`, `with_row_match_finder`,
+    `with_post_block_splitter`, `with_block_splitter_level`,
+    `with_max_block_size`, plus `Switch`. Long distance matching now keeps its
+    sizes when its switch changes, as the reference does. New
+    `ConfigError::{UnknownParameter, Unsupported}` and `Parameter` variants.
+  - `CompressionParams::for_level` (`ZSTD_getCParams`) and
+    `DictionaryBuilder::with_level_parameters`, which prepares a
+    "standalone" dictionary like `ZSTD_createCDict_advanced(...,
+    ZSTD_getCParams(level, 0, size))`. Such a dictionary is accepted by any
+    compressor and, as for `ZSTD_CCtx_refCDict`, the compressor's level is
+    replaced by the default level when the frame's parameters are resolved.
+    `ZSTD_c_forceMaxWindow` now also turns attaching a dictionary off.
+  - `decompressor::FrameHeaderInfo` / `FrameKind`
+    (`ZSTD_getFrameHeader_advanced`: content size, window, dictionary ID,
+    checksum and header size, for either frame format).
+  - Streaming with a pledged size and `Operation::Flush` per element, and
+    `Compressor::max_compressed_size`, already matched the reference; they
+    are now covered by a transcription of OpenZL's encoder node.
+  - zstd-ffi: oracle shims for OpenZL's encoder/decoder nodes
+    (`mzstd_shim_openzl_*`), `ZSTD_getFrameHeader_advanced` and
+    `oracle::set_parameter`. Tests: `tests/openzl_binding.rs`,
+    `tests/openzl_config.rs`, and forced-window cases in
+    `compressor::core::dict_tests`; the `parameter_parsing` AFL target now
+    checks `CParameter` against `ZSTD_CCtx_setParameter`. Specification:
+    `architecture/openzl-integration.md`.
+
+- **Faster level 3 on large inputs.** The `dfast` match finder tests its
+  candidates with branches instead of selects when the window spans at
+  least sixteen times its long hash table (`windowLog >= hashLog + 4`, the
+  choice ClickHouse's zstd fork makes): level 3 above 1 MiB, where table
+  slots rarely go stale and the branches predict well. Level 4 and small
+  windows keep the selects. Output is unchanged, one-shot and streaming:
+  both forms accept the same candidates. silesia.tar at level 3 runs 5.8%
+  fewer instructions (8582M to 8085M; zstd 1.5.7: 6489M). In lzbench, the
+  fastest of three rounds, level 3 compresses at 1.011 of zstd's speed
+  against 0.973 for 0.2.11 (single rounds 1.000-1.082 on the loaded host).
+- **Faster decoding of large outputs and literal-heavy blocks in AVX-512
+  builds, faster `fast` levels.** Output is unchanged: frames stay
+  byte-identical to zstd 1.5.7 and every decoder accepts and rejects the
+  same streams.
+  - The four-stream Huffman loops prefetch, once per round, the output the
+    next block will write (`decompressor::core::ahead::WriteAhead`, two
+    `prefetchw` hints through `branches`, which the `decompression`
+    feature now pulls in). An uninitialized destination was zeroed a
+    block's room at a time with nothing to overlap the cache misses; the
+    zeroing now finds most lines cached.
+  - With AVX-512 features, the fixed-buffer pair loop interleaves streams
+    1-3 and decodes stream 4 in a block of its own instead of one stream
+    at a time; the compiler still cannot pack the streams into gathers.
+    1 MiB of literal-heavy x-ray decodes in 3.25M cycles instead of 3.66M
+    (zstd's asm loop: 2.55M).
+  - The `fast` match finder starts every full block on the kept full-block
+    cursor once a store has one, instead of pushing its first 1024
+    sequences into vectors and copying them over; the cursor copies runs of
+    up to 32 literals as one chunk instead of calling `memcpy` for runs of
+    17-32.
+  In lzbench on silesia.tar, the fastest of three rounds against 0.2.11
+  in the same rounds and relative to zstd 1.5.7 beside it, decompression
+  went from 0.883-0.944 to 0.928-0.953 of zstd's speed (level 1: 0.883 to
+  0.933, level 2: 0.906 to 0.933), and compression at the `--fast` levels
+  and level 1 from 0.927-0.932 to 0.938-0.951; the other levels moved
+  within the host's noise (one pinned vCPU of a Ryzen 9 7950X VDS, native
+  builds, 2026-11-09).
 - **Read-only token for the CI workflows.** `ci.yml`, `ci-lean.yml`,
   `ci-coverage.yml`, `ci-benchmarks.yml`, `ci-fuzz.yml`, `ci-miri.yml` and
   `ci-sanitizer.yml` now declare `permissions: contents: read` instead of
@@ -47,11 +163,19 @@
   them writes to the repository; the published crate is unchanged.
 - **lzbench results in the README.** The external-benchmarks list is replaced
   by an lzbench table: lzbench master `a6fa8aa` (2.4.1) on `silesia.tar`,
-  mzstd 0.2.11 against zstd 1.5.7 at levels -5 to 22, with byte-identical
-  sizes, faster compression at 15-22 and slower compression below 15 and
-  decompression at every level. The command, environment, raw output and a
-  repeatability check are in `docs/benchmarks/lzbench-2026-11-08.md`.
-  Documentation only; the crate is unchanged.
+  mzstd 0.2.12 against zstd 1.5.7 at levels -5 to 22, with byte-identical
+  sizes, the fastest of three rounds. The command, environment, raw output
+  of every 0.2.12 and 0.2.11 round and their spread are in
+  `docs/benchmarks/lzbench-2026-11-09.md`.
+- **Library benchmarks rerun for 0.2.12.** The cold comparison against zstd
+  1.5.7 is recorded again (`long-20261109`): compression at a median 1.248x
+  C's speed, decompression at 1.517x, over 192 dataset/level pairs each.
+  Other tenants loaded the host all day, so the suites ran with 50 samples
+  of 6 s after a 3 s warmup; medians agree with the 2026-10-30 run within
+  a few percent, while single cases carry a median 95% interval of 5-6%.
+  Reports, level pages, charts, environment records and archives are
+  regenerated; the 2026-10-30 archives, the main-branch series and the
+  Silesia report are removed, and lzbench now covers whole large files.
 - **hotpath 0.31 and Criterion benchmarks on hotpath Cloud**, ported from
   mbrotli. The optional `hotpath` dependency is updated to 0.31.0, whose
   Callgrind mode leaves the profiler's own overhead out of the instruction

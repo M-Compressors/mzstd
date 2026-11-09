@@ -42,6 +42,18 @@ pub struct ZSTD_DCtx {
     _private: [u8; 0],
 }
 
+/// Opaque prepared compression dictionary.
+#[repr(C)]
+pub struct ZSTD_CDict {
+    _private: [u8; 0],
+}
+
+/// Opaque prepared decompression dictionary.
+#[repr(C)]
+pub struct ZSTD_DDict {
+    _private: [u8; 0],
+}
+
 /// `ZSTD_strategy`.
 pub type ZSTD_strategy = c_int;
 /// `ZSTD_cParameter`.
@@ -63,6 +75,12 @@ pub const ZSTD_btopt: ZSTD_strategy = 7;
 pub const ZSTD_btultra: ZSTD_strategy = 8;
 pub const ZSTD_btultra2: ZSTD_strategy = 9;
 
+/// `ZSTD_c_format` (`ZSTD_c_experimentalParam2`).
+pub const ZSTD_c_format: ZSTD_cParameter = 10;
+/// `ZSTD_c_literalCompressionMode` (`ZSTD_c_experimentalParam5`).
+pub const ZSTD_c_literalCompressionMode: ZSTD_cParameter = 1002;
+/// `ZSTD_c_maxBlockSize` (`ZSTD_c_experimentalParam18`).
+pub const ZSTD_c_maxBlockSize: ZSTD_cParameter = 1015;
 pub const ZSTD_c_compressionLevel: ZSTD_cParameter = 100;
 pub const ZSTD_c_windowLog: ZSTD_cParameter = 101;
 pub const ZSTD_c_hashLog: ZSTD_cParameter = 102;
@@ -230,6 +248,11 @@ unsafe extern "C" {
         param: ZSTD_cParameter,
         value: c_int,
     ) -> usize;
+    pub fn ZSTD_CCtx_getParameter(
+        cctx: *const ZSTD_CCtx,
+        param: ZSTD_cParameter,
+        value: *mut c_int,
+    ) -> usize;
     pub fn ZSTD_CCtx_setPledgedSrcSize(cctx: *mut ZSTD_CCtx, pledgedSrcSize: c_ulonglong) -> usize;
     pub fn ZSTD_CCtx_reset(cctx: *mut ZSTD_CCtx, reset: ZSTD_ResetDirective) -> usize;
     pub fn ZSTD_compress2(
@@ -313,6 +336,58 @@ unsafe extern "C" {
         dictSize: usize,
     ) -> ZSTD_compressionParameters;
     pub fn ZSTD_checkCParams(params: ZSTD_compressionParameters) -> usize;
+
+    pub fn ZSTD_freeCDict(cdict: *mut ZSTD_CDict) -> usize;
+    pub fn ZSTD_freeDDict(ddict: *mut ZSTD_DDict) -> usize;
+
+    /// `ZSTD_createCDict_advanced` as OpenZL calls it.
+    pub fn mzstd_shim_openzl_create_cdict(
+        raw: *const c_void,
+        raw_size: usize,
+        clevel: c_int,
+    ) -> *mut ZSTD_CDict;
+    /// `ZSTD_createDDict_advanced` as OpenZL calls it.
+    pub fn mzstd_shim_openzl_create_ddict(raw: *const c_void, raw_size: usize) -> *mut ZSTD_DDict;
+    /// OpenZL's zstd encoder node (`EI_zstdWithCCtx`).
+    pub fn mzstd_shim_openzl_encode(
+        cctx: *mut ZSTD_CCtx,
+        magicless: c_int,
+        compression_level: c_int,
+        decompression_level: c_int,
+        params: *const c_int,
+        nb_params: usize,
+        cdict: *const ZSTD_CDict,
+        src: *const c_void,
+        elt_width: usize,
+        nb_elts: usize,
+        dst: *mut c_void,
+        dst_capacity: usize,
+        policy_rejected: *mut c_int,
+    ) -> usize;
+    /// OpenZL's zstd decoder node (`DI_zstd`).
+    pub fn mzstd_shim_openzl_decode(
+        dctx: *mut ZSTD_DCtx,
+        magicless: c_int,
+        ddict: *const ZSTD_DDict,
+        src: *const c_void,
+        src_size: usize,
+        dst: *mut c_void,
+        dst_capacity: usize,
+        content_size: *mut c_ulonglong,
+        bad_header: *mut c_int,
+    ) -> usize;
+    /// `ZSTD_getFrameHeader_advanced`.
+    pub fn mzstd_shim_frame_header(
+        src: *const c_void,
+        src_size: usize,
+        magicless: c_int,
+        content_size: *mut c_ulonglong,
+        window_size: *mut c_ulonglong,
+        dict_id: *mut c_uint,
+        header_size: *mut c_uint,
+        checksum: *mut c_uint,
+        frame_type: *mut c_int,
+    ) -> usize;
 
     /// Reports the parameters the last compression on `cctx` was applied with.
     pub fn mzstd_shim_applied_params(cctx: *const ZSTD_CCtx, out: *mut MzstdResolvedParams);

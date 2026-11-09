@@ -178,7 +178,6 @@ const fn ml_code_bits(length: u16) -> u32 {
 
 /// The literal and match lengths of one sequence
 /// (`ZSTD_getSequenceLength`).
-#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SequenceLength {
     pub(crate) lit_length: u32,
@@ -252,13 +251,17 @@ pub(crate) const CODE_COUNT_SLOTS: usize = 64;
 /// have at least four bytes.
 pub(crate) const FULL_BLOCK_SEQUENCES: usize = 1 << 15;
 pub(crate) const FULL_BLOCK_LITERALS: usize = 1 << 17;
+/// Bytes a [`SeqCursor`]'s literal destination keeps past a full block's
+/// literals: a sequence of at most this many literals is copied as one
+/// chunk of this size, which may run past its end.
+const CURSOR_WILD: usize = 32;
 
 /// A full block's initialized sequence and literal destinations. Positions
 /// belong to the writer rather than the vectors, so a match does not update
 /// vector metadata or test capacity.
 pub(crate) struct SeqCursor<'a> {
     sequences: &'a mut [SeqDef; FULL_BLOCK_SEQUENCES],
-    literals: &'a mut [u8; FULL_BLOCK_LITERALS + 16],
+    literals: &'a mut [u8; FULL_BLOCK_LITERALS + CURSOR_WILD],
     long_length: &'a mut LongLength,
     sequence_count: usize,
     literal_count: usize,
@@ -325,9 +328,15 @@ impl SeqCursor<'_> {
         let start = self.literal_count & (FULL_BLOCK_LITERALS - 1);
         let end = start + lit_length;
         debug_assert!(end <= FULL_BLOCK_LITERALS);
-        match src.get(anchor..).and_then(<[u8]>::first_chunk::<16>) {
-            Some(chunk) if lit_length <= 16 => {
-                self.literals[start..start + 16].copy_from_slice(chunk);
+        // One fixed-size chunk covers most literal runs, as the
+        // reference's `ZSTD_copy16` plus a short `ZSTD_wildcopy` do; a
+        // longer run, or one too near the end of `src`, is copied exactly.
+        match src
+            .get(anchor..)
+            .and_then(<[u8]>::first_chunk::<CURSOR_WILD>)
+        {
+            Some(chunk) if lit_length <= CURSOR_WILD => {
+                self.literals[start..start + CURSOR_WILD].copy_from_slice(chunk);
             }
             _ => self.literals[start..end].copy_from_slice(&src[anchor..anchor + lit_length]),
         }
@@ -425,13 +434,13 @@ impl SeqWrite for SeqCursor<'_> {
 #[derive(Clone, Debug)]
 struct FullBlock {
     sequences: alloc::boxed::Box<[SeqDef; FULL_BLOCK_SEQUENCES]>,
-    literals: alloc::boxed::Box<[u8; FULL_BLOCK_LITERALS + 16]>,
+    literals: alloc::boxed::Box<[u8; FULL_BLOCK_LITERALS + CURSOR_WILD]>,
 }
 
 impl FullBlock {
     fn new() -> Self {
         let sequences = alloc::vec![SeqDef::default(); FULL_BLOCK_SEQUENCES].into_boxed_slice();
-        let literals = alloc::vec![0; FULL_BLOCK_LITERALS + 16].into_boxed_slice();
+        let literals = alloc::vec![0; FULL_BLOCK_LITERALS + CURSOR_WILD].into_boxed_slice();
         match (sequences.try_into(), literals.try_into()) {
             (Ok(sequences), Ok(literals)) => Self {
                 sequences,
@@ -519,6 +528,13 @@ impl SeqStore {
         }
     }
 
+    /// Whether an earlier promotion left the full-block destinations
+    /// allocated, so a block can start on a cursor at no cost.
+    #[inline(always)]
+    pub(crate) const fn has_full_block(&self) -> bool {
+        self.full.is_some()
+    }
+
     /// Runs a full-block finder over the kept full-block destinations,
     /// allocated and zeroed on the first promotion, after the entries the
     /// vectors already hold; the block's entries then stay there.
@@ -559,7 +575,7 @@ impl SeqStore {
     /// Bytes held between blocks.
     pub(crate) fn retained_bytes(&self) -> usize {
         let full = if self.full.is_some() {
-            size_of::<[SeqDef; FULL_BLOCK_SEQUENCES]>() + FULL_BLOCK_LITERALS + 16
+            size_of::<[SeqDef; FULL_BLOCK_SEQUENCES]>() + FULL_BLOCK_LITERALS + CURSOR_WILD
         } else {
             0
         };
@@ -680,7 +696,6 @@ impl SeqStore {
     }
 
     /// The full lengths of sequence `index` (`ZSTD_getSequenceLength`).
-    #[cfg(test)]
     pub(crate) fn sequence_length(&self, index: usize) -> SequenceLength {
         let seq = self.sequences()[index];
         let mut lengths = SequenceLength {
@@ -844,7 +859,7 @@ mod tests {
         let kept = store.full.as_ref().map(|full| full.sequences.as_ptr());
         assert_eq!(
             store.retained_bytes() - before,
-            FULL_BLOCK_SEQUENCES * size_of::<SeqDef>() + FULL_BLOCK_LITERALS + 16
+            FULL_BLOCK_SEQUENCES * size_of::<SeqDef>() + FULL_BLOCK_LITERALS + CURSOR_WILD
         );
         let cases = [
             (3usize, 2usize, 5usize),

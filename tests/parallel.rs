@@ -71,6 +71,31 @@ fn inputs_within_one_segment_match_the_serial_compressor() {
 }
 
 #[test]
+fn a_target_compressed_block_size_applies_inside_every_segment() {
+    let config = EncoderConfig::default()
+        .with_level(Level::try_from(5).unwrap())
+        .with_target_compressed_block_size(std::num::NonZeroU32::new(2048));
+    let parallel =
+        ParallelConfig::default().with_segment_size(SegmentSize::try_from(256 << 10).unwrap());
+    let mut parallel = ParallelCompressor::new(config, parallel).unwrap();
+    let mut serial = Compressor::new(config).unwrap();
+    // One segment: the serial compressor's frame.
+    let short = corpus::mixed(200_000, 6);
+    assert_eq!(
+        parallel.compress(&short).unwrap(),
+        serial.compress(&short).unwrap()
+    );
+    // Several: frames that decode to the input whatever the task count.
+    let input = corpus::mixed(1_500_000, 7);
+    let reference = threaded(&mut parallel, &input, 1);
+    assert_eq!(threaded(&mut parallel, &input, 5), reference);
+    assert_eq!(
+        zstd_ffi::oracle::decompress(&reference, input.len()).unwrap(),
+        input
+    );
+}
+
+#[test]
 fn the_compressor_reports_its_parallel_configuration() {
     let segment = SegmentSize::try_from(1 << 20).unwrap();
     let parallel = ParallelConfig::default().with_segment_size(segment);

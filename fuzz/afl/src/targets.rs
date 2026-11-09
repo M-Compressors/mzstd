@@ -373,6 +373,7 @@ pub fn parameter_parsing(data: &[u8]) {
         let mut encoder = Compressor::new(decoded.config).expect("valid configuration");
         let _ = encoder.compress(&decoded.rest[..decoded.rest.len().min(64)]);
     }
+    reference_parameters(data);
     for chunk in data.chunks(4) {
         let mut word = [0u8; 4];
         word[..chunk.len()].copy_from_slice(chunk);
@@ -387,6 +388,71 @@ pub fn parameter_parsing(data: &[u8]) {
             Compressor::new(config).is_ok(),
             window == 0 || (10..=31).contains(&window)
         );
+    }
+}
+
+/// Reference parameter IDs the fuzzer's pairs are steered towards.
+const PARAMETER_IDS: [i32; 40] = [
+    10, 100, 101, 102, 103, 104, 105, 106, 107, 130, 160, 161, 162, 163, 164, 200, 201, 202, 400,
+    401, 402, 500, 1000, 1001, 1002, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013,
+    1014, 1015, 1016, 1017, 1003,
+];
+
+/// `CParameter` accepts and refuses `(id, value)` pairs exactly as
+/// `ZSTD_CCtx_setParameter` does, and an accepted list compresses to the
+/// reference's bytes.
+///
+/// The first byte is the number of pairs (at most five), then eight bytes
+/// per pair (a little-endian ID, steered towards the IDs the reference
+/// defines, and a value); the remaining bytes are compressed.
+pub fn reference_parameters(data: &[u8]) {
+    use mzstd::{CParameter, ConfigError, EncoderConfig};
+    use zstd_ffi::oracle::Params;
+    let Some((&count, rest)) = data.split_first() else {
+        return;
+    };
+    let count = usize::from(count % 6);
+    let mut pairs = Vec::new();
+    let mut input = rest;
+    for _ in 0..count {
+        let Some((pair, tail)) = input.split_first_chunk::<8>() else {
+            break;
+        };
+        input = tail;
+        let id = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]);
+        let value = i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]);
+        let id = if id & 0xFF < 64 {
+            PARAMETER_IDS[(id as u32 as usize >> 8) % PARAMETER_IDS.len()]
+        } else {
+            id
+        };
+        pairs.push((id, value));
+    }
+    let mut config = EncoderConfig::default();
+    let mut comparable = true;
+    let mut reference = Params::default();
+    for &(id, value) in &pairs {
+        let ours = CParameter::try_from((id, value));
+        let theirs = oracle::set_parameter(id, value);
+        match (&ours, &theirs) {
+            (Ok(parameter), Ok(())) => {
+                config = config.with_parameter(*parameter);
+                reference = reference.with(id, value);
+                // Tables sized by an explicit log would dwarf the input.
+                comparable &= !(matches!(id, 101..=103 | 161) && value > 20);
+            }
+            (Err(ConfigError::Unsupported { .. }), Ok(())) => comparable = false,
+            (Err(_), Err(_)) => {}
+            _ => panic!("({id}, {value}): {ours:?} vs {theirs:?}"),
+        }
+    }
+    let input = &input[..input.len().min(256)];
+    if comparable && let Ok(expected) = oracle::compress2(input, &reference) {
+        let ours = Compressor::new(config)
+            .expect("accepted parameters are valid")
+            .compress(input)
+            .expect("compression");
+        assert_eq!(ours, expected, "{pairs:?}");
     }
 }
 

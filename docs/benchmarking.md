@@ -16,7 +16,7 @@ Both codecs use the same documentation layout under `docs/benchmarks/`:
 | Measurements | `encoder-comparison.csv` | `decoder-comparison.csv` |
 | Environment | `encoder-comparison-environment.json` | `decoder-comparison-environment.json` |
 | Size manifest | `encoder-comparison-<date>/sizes.csv` | `decoder-comparison-<date>/sizes.csv` |
-| Main branch's run | `encoder-comparison-<date>/main.csv` | `decoder-comparison-<date>/main.csv` |
+| Main branch's run, when recorded | `encoder-comparison-<date>/main.csv` | `decoder-comparison-<date>/main.csv` |
 | Index and level pages | `encoders/README.md`, `encoders/l-5.md`–`l22.md` | `decoders/README.md`, `decoders/l-5.md`–`l22.md` |
 | Charts | `encoders/charts/` | `decoders/charts/` |
 
@@ -86,15 +86,13 @@ Rebuild the checked-in encoder pages and charts with Matplotlib 3.10.8:
 ```sh
 python3 benchmarks/comparison/level_docs.py \
   --csv docs/benchmarks/encoder-comparison.csv \
-  --main-csv docs/benchmarks/encoder-comparison-2026-10-30/main.csv \
   --environment docs/benchmarks/encoder-comparison-environment.json \
   --report docs/benchmarks/encoder-comparison.md \
   --output docs/benchmarks/encoders
 python3 benchmarks/comparison/plot.py \
   --csv docs/benchmarks/encoder-comparison.csv \
-  --main-csv docs/benchmarks/encoder-comparison-2026-10-30/main.csv \
   --output docs/benchmarks/encoders/charts \
-  --subtitle 'Ryzen 9 7950X (KVM); 20 samples; one vCPU per process; 2026-10-30'
+  --subtitle 'Ryzen 9 7950X (KVM); 50 samples; one vCPU; 2026-11-09'
 ```
 
 `level_docs.py` writes the index, 24 level pages and their detailed charts.
@@ -102,11 +100,12 @@ python3 benchmarks/comparison/plot.py \
 charts directory. All eight corpora contribute to the medians. `--main-csv`
 adds the main branch's series (see [main branch series](#main-branch-series)).
 The published encoder and decoder CSVs are the Criterion baseline
-`full-20261030` (2026-10-30), with their size manifests, the main branch's
-CSVs and the raw Criterion samples of both trees in
-`benchmarks/encoder-comparison-2026-10-30/` and
-`benchmarks/decoder-comparison-2026-10-30/`. They use 20 samples, 0.5 s
-warmup and 1 s requested measurement; see the
+`long-20261109` (2026-11-09), with their size manifests and raw Criterion
+samples in `benchmarks/encoder-comparison-2026-11-09/` and
+`benchmarks/decoder-comparison-2026-11-09/`. Other tenants loaded the host
+that day, so they use 50 samples, 3 s warmup and 6 s requested
+measurement instead of the 20 samples, 0.5 s and 1 s that suffice on a
+quiet host; no main branch series was recorded. See the
 [encoder](benchmarks/encoder-comparison.md) and
 [decoder](benchmarks/decoder-comparison.md) reports. Each
 environment record identifies the measured sources; regenerating charts reuses
@@ -152,7 +151,6 @@ Matplotlib 3.10.8:
 ```sh
 python3 benchmarks/comparison/decoder_docs.py \
   --csv docs/benchmarks/decoder-comparison.csv \
-  --main-csv docs/benchmarks/decoder-comparison-2026-10-30/main.csv \
   --environment docs/benchmarks/decoder-comparison-environment.json \
   --report docs/benchmarks/decoder-comparison.md \
   --output docs/benchmarks/decoders
@@ -213,8 +211,8 @@ and checks its bytes against C first:
 python3 benchmarks/comparison/silesia.py run --current /tmp/warm-current --main /tmp/warm-main \
   --corpus /path/to/silesia --output /tmp/silesia-encode.json --cpu 0 \
   --plan encode-1,encode1,encode3,encode5,encode7,encode9,encode12
-python3 benchmarks/comparison/silesia.py report --results docs/benchmarks/silesia-2026-10-30/silesia.json.gz \
-  --output docs/benchmarks/silesia-2026-10-30/silesia.svg
+python3 benchmarks/comparison/silesia.py report --results /tmp/silesia-encode.json \
+  --output /tmp/silesia.svg
 ```
 
 Interrupted runs resume from the output file. `report` reads plain or

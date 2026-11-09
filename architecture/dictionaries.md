@@ -198,9 +198,10 @@ The frame header names the dictionary's ID in 1, 2 or 4 bytes.
 
 ## Known gaps
 
-- Dedicated dictionary search (`ZSTD_c_enableDedicatedDictSearch`),
-  referencing a prefix (`ZSTD_CCtx_refPrefix`) and `ZSTD_dictForceLoad` /
-  `ZSTD_dictForceCopy` are not public; only the default attach heuristic is.
+- Dedicated dictionary search (`ZSTD_c_enableDedicatedDictSearch`) and
+  referencing a prefix (`ZSTD_CCtx_refPrefix`) are not public. The attach
+  preferences (`ZSTD_dictForceAttach`, `ForceCopy`, `ForceLoad`) are
+  `EncoderConfig::with_dictionary_attach`.
   (`Engine::load_prefix` is the prefix mechanism, used by the parallel
   compressor for most strategies' overlaps.)
 - Dictionaries are not available to the parallel compressor or the C ABI.
@@ -211,7 +212,11 @@ The frame header names the dictionary's ID in 1, 2 or 4 bytes.
   fast dictMatchState kernel executes about 1.6x the reference's
   instructions on it).
 - A prepared dictionary serves one configuration; another configuration
-  needs its own (`EncodeError::DictionaryMismatch` otherwise).
+  needs its own (`EncodeError::DictionaryMismatch` otherwise), unless it was
+  built with `DictionaryBuilder::with_level_parameters`: that is the
+  `ZSTD_createCDict_advanced` + `ZSTD_CCtx_refCDict` route, which any
+  compressor accepts and which replaces the compressor's level with the
+  default one ([OpenZL integration](openzl-integration.md#dictionaries-refcdict-versus-loaddictionary)).
 - The optimal parser's seeding reads `FSE_getMaxNbBits` for every literal
   and match length symbol. Past a dictionary table's largest symbol the
   reference reads uninitialized workspace, so its own frames then depend on

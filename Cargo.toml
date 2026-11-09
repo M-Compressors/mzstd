@@ -1,6 +1,6 @@
 [package]
 name = "mzstd"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -132,6 +132,7 @@ compression = [
 ]
 decompression = [
     "dep:borrowed-buf",
+    "dep:branches",
     "dep:fearless_simd",
     "dep:fearless_simd_macros",
     "dep:thiserror",

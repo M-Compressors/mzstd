@@ -125,8 +125,11 @@ flowchart TD
     Sel -->|X2, tree up to 11 bits| Fixed{buffer of FIXED_OUT bytes?}
     Fixed -->|yes| Avx{AVX-512 features?}
     Avx -->|no| PairsFixed[build_pairs if stale; pair_rounds_fixed: one masked position per stream, streams 1-3 interleaved, stream 4 with the refills]
-    Avx -->|yes| PairsSerial[build_pairs if stale; pair_rounds_serial: one stream at a time, each refill behind a branch]
+    Avx -->|yes| PairsSerial[build_pairs if stale; pair_rounds_serial: streams 1-3 interleaved, stream 2's refill behind a branch, then stream 4 in its own block]
     Fixed -->|no| Pairs[build_pairs if stale; pair_rounds: per-round windows, streams 1-3 interleaved, then stream 4]
+    Single -. one WriteAhead step per round .-> Ahead[prefetchw: next block's output]
+    PairsFixed -. one WriteAhead step per round .-> Ahead
+    PairsSerial -. one WriteAhead step per round .-> Ahead
     PairsFixed --> Back
     PairsSerial --> Back
     Single --> Back[Sentinels back to containers]
@@ -202,16 +205,26 @@ flowchart TD
   four lookup indices, `vpgatherqd` loads four rows, `vpsllvq` consumes
   them, every row is extracted again for its scalar store, and the four
   refills become a `vpgatherqq`. That runs the four streams as one
-  dependency chain through the gathers. The serial loop runs the same
-  rounds with the same bounds over the same masked positions, but each
-  stream makes its five lookups and then refills with `Sentinel::reload`,
-  whose bounds test is a branch the compiler cannot remove (the clamp in
-  `reload_within` lets it prove every refill in bounds, which merges the
-  four streams into one basic block). Each stream's chain then ends its own
-  block, SLP cannot pack them, and the processor still overlaps the four
-  chains. With `-C target-cpu=native` on a Ryzen 9 7950X the decoder then
-  has no gather left, and silesia.tar at level `-1` decodes 18% faster
-  (see [Measurements](#measurements)).
+  dependency chain through the gathers. The AVX-512 loop runs the same
+  rounds with the same bounds over the same masked positions, but no basic
+  block holds all four streams: streams 1-3 interleave their five lookups
+  and refill, stream 2 with `Sentinel::reload`, whose bounds test is a
+  branch the compiler cannot remove, streams 1 and 3 clamped with
+  `reload_within`; stream 4 then decodes its round in its own block, which
+  the rotated loop ends with its exit test. SLP finds no four isomorphic
+  chains in one block, and with the branch no three refills either; the
+  processor overlaps three lookup chains at a time.
+  Earlier the loop ran one stream at a time, each refill behind a branch:
+  that left the scheduler full of one stream's waiting lookups, and on
+  x-ray (1 MiB, level 1, almost all four-stream literals) a decode took
+  3.66M cycles against zstd 1.5.7's asm loop at 2.55M; the current order
+  takes 3.25M (2026-11-08, Ryzen 9 7950X VDS, native build). Measured and
+  rejected there: four streams interleaved with every refill behind a
+  branch, or with branch-free refills in a rotated loop (both vectorized
+  again, 1.6-2x slower), two pairs of streams (3.55M), and a pair row
+  whose symbols sit in the low 16 bits with the bit count rotated into
+  place (`rorx`; LLVM emits `mov` and `shr` for it, no fewer
+  instructions).
 - A code of `b` bits fills a run of `1 << (11 - b)` pair rows whose `j`th
   row continues with the code at row `j << b`, the same series for every
   code of that length (the reference's `HUF_fillDTableX2Level2` per rank).
@@ -466,6 +479,59 @@ flowchart TD
   but its new tail. A four-stream section of at least 4 KiB grows it to
   `FIXED_OUT` bytes once, for the fixed-size pair loop.
 
+### Write prefetch of the next block
+
+```mermaid
+sequenceDiagram
+    participant S as Stream::walk
+    participant O as Output (Uninit / Slice / Vec)
+    participant B as BlockDecoder::decode_compressed
+    participant H as Huffman fast loop
+    S->>O: reserve(block_max)
+    O->>O: zero this block's room (UninitOutput only)
+    O->>O: ahead = next_room(room end, block_max, limit)
+    S->>B: decode(out)
+    B->>O: out.ahead()
+    B->>H: decode_streams(..., ahead)
+    loop every round
+        H->>H: lookups and refills
+        H->>H: ahead.step(): prefetchw two lines, advance 128 bytes
+    end
+    B->>B: sequences (unchanged)
+    S->>O: commit; next reserve zeroes lines already cached
+```
+
+A caller's buffer is usually not cached when the decoder reaches it. The
+reference decodes a large block's literals into the end of the block's own
+output (`ZSTD_in_dst`), so its literal loop takes those misses while it
+computes. Here literals go to the decoder's own buffer, and an
+uninitialized output is zeroed a block's room at a time before the block
+(`UninitOutput::reserve`), a `memset` whose misses nothing overlaps.
+
+`Output::reserve` therefore also records the `block_max` bytes after the
+current block's room (`next_room`, cut at the frame's end for caller
+slices, at the capacity for a vector) as a `WriteAhead`
+(`decompressor::core::ahead`), which `BlockOutput::ahead` hands to the
+block's literal decoding. `single_rounds`, `pair_rounds_fixed` and
+`pair_rounds_serial` call `WriteAhead::step` once per round: two
+`prefetchw` hints (`branches::prefetch_write_data`, safe inline assembly;
+nothing on targets without one, and nothing under Miri) and an advance of
+128 bytes, until the range is covered. The loops are bound by their lookup
+chains and leave memory bandwidth idle, so the misses overlap decoding;
+the next block's zeroing (or its first writes into a caller's slice or a
+vector's spare capacity) then finds the lines cached. A prefetch never
+faults and changes no result, so the range needs no bounds proof; history
+outputs, dictionaries and the cold paths pass `WriteAhead::NONE`.
+
+Measured on silesia.tar through `mzstd_decompress` in lzbench master
+`a6fa8aa` (one pinned vCPU of a Ryzen 9 7950X VDS, native build, three
+interleaved rounds, ratio to zstd 1.5.7 in the same run; the host's noise
+is about ±3%): without prefetch 0.876-0.900 at level 1 and 0.887-0.926 at
+level 8; one line per round 0.913-0.938 and 0.923-0.927; two lines
+0.903-0.941, 0.945-0.975 and 0.913-1.016 at level 19. Four lines measured
+no better than two. The hint costs the literal loops about 1% on x-ray,
+whose literals leave little else to overlap.
+
 ## Measurements
 
 `cargo bench --bench decompress -- --warm-up-time 1 --measurement-time 3`,
@@ -548,14 +614,73 @@ which already matches the reference's 21 GB/s.
   7950X. The out-of-line `read_header_on` is not yet measured there.
 
 - Literal-heavy inputs decode slowest against the reference: Silesia x-ray
-  at level 1 0.85x ([Silesia](../docs/benchmarks/silesia.md), 2026-10-30,
-  Ryzen 9 7950X, reused contexts), where both decoders spend
+  at level 1 0.85x (Silesia run of 2026-10-30,
+  Ryzen 9 7950X, reused contexts; since replaced by
+  [lzbench](../docs/benchmarks/lzbench-2026-11-09.md)), where both decoders spend
   77-79% of their time in the four-stream pair loop. `pair_rounds_fixed`
   takes 72.6 cycles per round against the reference's 61.5 (242
   instructions against 221): the compiler keeps two streams' containers on
   the stack between rounds, on their dependency chains (22.6M
   store-to-load interlocks against 6.9M for 30 decodes). A branch-checked
-  refill and other stream orders measured slower.
+  refill and other stream orders measured slower. In AVX-512 builds the
+  three-plus-one `pair_rounds_serial` still executes about 13 instructions
+  per pair lookup against the asm loop's 9.75 that lzbench's zstd
+  links (`huf_decompress_amd64.S`): 12.4M instructions and 3.25M cycles
+  per decode of 1 MiB of x-ray against 9.2M and 2.55M (2026-11-08). The
+  remaining instructions are the stack traffic of twenty live values in
+  fifteen registers and a `mov` per lookup that the asm avoids with three
+  narrow loads from each row.
+- Measured and rejected (2026-11-08, same input): the four streams'
+  containers in one `fearless_simd` `u64x4`, with the lookup index, the
+  consumed bits (`shlv_u64x4`) and the rounds in vector form, and the row
+  loads, stores and refills per lane. It executed the fewest instructions
+  (8.0M against 12.6M) but took 7.36M cycles against 3.32M at 1.1
+  instructions per cycle: LLVM turned the per-lane row loads into
+  `vpgatherqd`, whose latency sits on every stream's lookup chain. A
+  gather cannot be written explicitly either: `_mm256_i64gather_epi32`
+  takes a raw pointer and stays `unsafe` inside `fearless_simd::kernel!`,
+  whose other intrinsics (`_mm256_sllv_epi64` and the like) are the
+  operations the portable types already give.
+- Measured and rejected (2026-11-09, C-written frames at level 1): the
+  four-stream sections of four consecutive blocks decoded together, every
+  lookup step taking one pair from each of the sixteen streams, which a
+  decoder could do without changing the format. Even in an SSE4.2 build,
+  where nothing can become a gather, sixteen chains decoded at 0.69x the
+  speed of one section at a time on x-ray and 0.73-0.76x on mozilla and
+  dickens (0.60-0.82x with AVX2 or AVX-512 features, whose builds also
+  vectorize the step into gathers). Sixteen containers, positions and
+  output positions do not fit in fifteen registers: every chain step then
+  loads and stores its state, and the store-to-load latency joins the
+  chain. More chains do not help a loop that already overlaps three or
+  four.
+- Measured and rejected (2026-11-08, same input): the AVX-512 pair loop
+  over one shared buffer, the output at its start and the streams copied
+  after it (`FIXED_OUT + BLOCK_SIZE_MAX + 8` bytes), with refills masked
+  into the copy instead of clamped to a limit. One base and no limit freed
+  registers and cut the loop to 11.85M instructions from 12.56M, but not
+  its cycles (3.23M against 3.23M, eight rounds): the three-plus-one order
+  is bound by the fourth stream's lookup chain, which runs alone. All four
+  streams interleaved, as the reference's asm does, vectorized again into
+  gathers (6.4M cycles) even with one or two streams indexing by
+  `rotate_left(11) & 0x7ff`, which LLVM folds back into the same shift.
+- Large outputs: with the write prefetch, silesia.tar decodes at
+  0.90-0.97 of zstd 1.5.7's speed at levels 1 and 8 in lzbench, about
+  even at level 19. The rest of the gap is the uninitialized output's
+  zeroing, which safe code cannot skip, and the part of each block's room
+  the literal loops do not reach in time: blocks with few or raw literals
+  prefetch little.
+- Measured and rejected (2026-11-08, lzbench on silesia.tar, ratio to zstd
+  1.5.7 in the same run, medians of three): writing the uninitialized
+  output in place behind a checked initialized front, as a safe
+  `WriteFront` type would (each chunk write tests that it starts at or
+  before the front and moves the front; reads test that they end below
+  it), instead of zeroing each block's room. Simulated in the copy kernels,
+  the checks added 22-27% instructions per decode (dickens 2 MiB level 1:
+  25.1M to 30.7M) and decoded at 0.866-0.876 of zstd's speed at levels 1,
+  8 and 15, against 0.932-0.949 with zeroing and the write prefetch. Even
+  with no zeroing and no checks at all (an `unsafe` cast, for the
+  measurement only) the decoder reached 0.960-0.984: the zeroing left
+  costs about 3%.
 
 - Measured and rejected (2026-10-29, Ryzen 9 7950X, Alice level 1): the
   repeat offsets as scalars, a packed `u64` pair, permuted slots, a ring
