@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [v0.2.13](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.13) - 2026-11-11
+
 - Publish the user guides, runnable recipes, architecture specifications, and
   benchmark data as an mdBook on GitHub Pages, matching the mbrotli book’s
   layout and topics. Add documentation CI with example execution, Mermaid

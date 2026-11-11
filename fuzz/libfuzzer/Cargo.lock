@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "mzstd"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "borrowed-buf",
  "branches",

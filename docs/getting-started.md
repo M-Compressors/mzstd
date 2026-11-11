@@ -8,14 +8,14 @@ Requires **Rust 1.89+**.
 ```sh
 cargo new zstd-demo
 cd zstd-demo
-cargo add mzstd@0.2.12
+cargo add mzstd@0.2.13
 ```
 
 Or add this to `Cargo.toml`:
 
 ```toml
 [dependencies]
-mzstd = "0.2.12"
+mzstd = "0.2.13"
 ```
 
 ## Compress and decompress
@@ -114,11 +114,11 @@ backpressure, reader read-ahead, and direct sessions.
 
 | Configuration | Dependency |
 | --- | --- |
-| Default std encoder + decoder | `mzstd = "0.2.12"` |
-| Encoder only | `mzstd = { version = "0.2.12", default-features = false, features = ["std", "compression"] }` |
-| Decoder only | `mzstd = { version = "0.2.12", default-features = false, features = ["std", "decompression"] }` |
-| Framing containers | `mzstd = { version = "0.2.12", features = ["framed"] }` |
-| Alloc-backed codecs without std | `mzstd = { version = "0.2.12", default-features = false, features = ["no_std", "compression", "decompression"] }` |
+| Default std encoder + decoder | `mzstd = "0.2.13"` |
+| Encoder only | `mzstd = { version = "0.2.13", default-features = false, features = ["std", "compression"] }` |
+| Decoder only | `mzstd = { version = "0.2.13", default-features = false, features = ["std", "decompression"] }` |
+| Framing containers | `mzstd = { version = "0.2.13", features = ["framed"] }` |
+| Alloc-backed codecs without std | `mzstd = { version = "0.2.13", default-features = false, features = ["no_std", "compression", "decompression"] }` |
 
 `no_std` takes precedence when enabled and removes std-only adapters and parallel
 APIs. See [codec features and no_std support](../architecture/codec-features.md).
