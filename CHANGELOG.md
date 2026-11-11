@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Publish the user guides, runnable recipes, architecture specifications, and
+  benchmark data as an mdBook on GitHub Pages, matching the mbrotli book’s
+  layout and topics. Add documentation CI with example execution, Mermaid
+  diagrams, search, and local-link/anchor validation.
+
 ## [v0.2.12](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.12) - 2026-11-09
 
 - **Fuzzing: the `output_capacity` oracle no longer corrupts the heap.**

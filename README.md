@@ -2,6 +2,8 @@
 
 Zstandard (RFC 8878) compression and decompression in safe Rust.
 
+[Documentation](https://m-compressors.github.io/mzstd/) · [Getting started](docs/getting-started.md) · [API reference](https://docs.rs/mzstd)
+
 [![Crates.io](https://img.shields.io/crates/v/mzstd.svg)][crate]
 [![docs.rs](https://docs.rs/mzstd/badge.svg)][api]
 [![Tests](https://github.com/M-Compressors/mzstd/actions/workflows/ci.yml/badge.svg?branch=main)][ci]

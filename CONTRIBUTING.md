@@ -185,6 +185,9 @@ machine, and before/after numbers for both speed and compressed size.
 
 ## Documentation and changelog
 
+The [documentation website guide](docs/website.md) describes local mdBook
+builds, recipe checks, and GitHub Pages publishing.
+
 - Update the specifications and Mermaid diagrams in `architecture/`, and its
   `README.md` index, whenever a change adds, removes, or reshapes a module,
   public API, state machine, data flow, or dispatch boundary. Documentation

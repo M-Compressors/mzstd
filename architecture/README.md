@@ -73,6 +73,7 @@ signatures. Each codec compiles on its own, with or without `std`.
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: one-shot and session functions, handle lifecycle, validation, panic guard and status mapping. |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
+| [Documentation publishing](documentation.md) | mdBook source staging, navigation, link and recipe validation, Mermaid assets, and GitHub Pages deployment. |
 | [CI](ci.md) | Workflows and the checks they run; ClusterFuzzLite pull request and daily fuzzing; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`; hotpath Cloud merged-mode (native plus Callgrind) benchmarks of `profile_compressor` and of selected Criterion ids through `hotpath::criterion`. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
 
