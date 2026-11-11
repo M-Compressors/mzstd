@@ -1,14 +1,49 @@
 # mzstd
 
-Zstandard (RFC 8878) compression and decompression in safe Rust.
+**Zstandard (RFC 8878) compression and decompression in safe Rust.**
 
-[Documentation](https://m-compressors.github.io/mzstd/) · [Getting started](docs/getting-started.md) · [API reference](https://docs.rs/mzstd)
+A port of the zstd 1.5.7 encoder that writes the same bytes, plus an independent
+Rust decoder. Reuse working memory between payloads, integrate directly with
+`std::io::Read` and `std::io::Write`, drive either codec incrementally, and opt into
+caller-scheduled parallel compression when a workload benefits from it.
 
 [![Crates.io](https://img.shields.io/crates/v/mzstd.svg)][crate]
 [![docs.rs](https://docs.rs/mzstd/badge.svg)][api]
 [![Tests](https://github.com/M-Compressors/mzstd/actions/workflows/ci.yml/badge.svg?branch=main)][ci]
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![hotpath-cloud](https://img.shields.io/endpoint?url=https://hotpath.rs/badge-cloud.json)](https://hotpath.rs/app/repos/M-Compressors/mzstd)
+
+**[Documentation][site]** · [Getting started][start] · [Choose your API][guide] · [Examples][examples] · [Benchmarks](#performance) · [API reference][api] · [Changelog](CHANGELOG.md)
+
+## Quick start
+
+Requires **Rust 1.89 or later**.
+
+```toml
+[dependencies]
+mzstd = "0.2"
+```
+
+```rust
+use mzstd::{Compressor, Decompressor, EncoderConfig, Level};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = EncoderConfig::default().with_level(Level::try_from(19)?);
+    let mut encoder = Compressor::new(config)?;
+    let compressed = encoder.compress(b"hello, hello, hello")?;
+
+    let restored = Decompressor::default().decompress(&compressed)?;
+    assert_eq!(restored, b"hello, hello, hello");
+    Ok(())
+}
+```
+
+Before decoding input you do not control, set limits: the default window limit is
+128 MiB, and input and output byte budgets are unlimited. See
+[decompression and limits][decoder-guide]. [Getting started][start] continues with
+memory reuse, streaming and feature selection.
+
+## Why mzstd?
 
 - **Byte-identical encoder.** For the same input and parameters,
   single-threaded compression writes exactly the bytes of zstd 1.5.7:
@@ -31,6 +66,25 @@ Zstandard (RFC 8878) compression and decompression in safe Rust.
 - **Sans-I/O sessions.** `Encoder` and `Decoder` sessions work only with the buffers you
   pass in and never perform I/O themselves, so you can drive them from blocking code,
   async runtimes, or your own event loop.
+
+## Choose your API
+
+Compression and decompression expose the same I/O shapes. Pick the one that matches
+how your application already moves bytes.
+
+| I/O shape | Compression | Decompression | Guide |
+| --- | --- | --- | --- |
+| Return a new `Vec<u8>` | `Compressor::compress` | `Decompressor::decompress` | [Getting started][start] |
+| Append to a Vec or write into a slice | `compress_into`, `compress_to_slice` | `decompress_into`, `decompress_to_slice` | [Buffers and memory reuse][memory] |
+| Pull through `std::io::Read` | `Compressor::reader` | `Decompressor::reader` | [Read / Write I/O][io] |
+| Push through `std::io::Write` | `Compressor::writer` | `Decompressor::writer` | [Read / Write I/O][io] |
+| Drive buffers yourself, no I/O | `start` → `EncoderSession` | `start` → `DecoderSession` | Sans I/O [compression][sans-io-enc], [decompression][sans-io-dec] |
+| Any of the above with a dictionary | `compress_with_dictionary*`, `*_with_dictionary` | `decompress_with_dictionary*`, `*_with_dictionary` | [Dictionaries][dictionaries] |
+| Split one input across your threads | `ParallelCompressor` | Ordinary `Decompressor` | [Parallel compression][parallel] |
+| Several resources in one seekable container | `FramedCompressor` | `FramedDecompressor` | [Framing containers][frames], `framed` feature |
+
+The [full API table][guide] also lists owned sessions, uninitialized-output calls and
+the parallel streaming entry points.
 
 ## Performance
 
@@ -136,118 +190,24 @@ inputs, where mzstd is much faster.
 #### TurboBench
 Results available [here](https://github.com/powturbo/TurboBench).
 
-## Usage
+## Compatibility
 
-### Install
+Single-threaded compression is byte-identical to zstd **1.5.7**: one-shot calls match
+`ZSTD_compress2`, and sessions match `ZSTD_compressStream2` driven with the same
+chunks, output capacities, flushes and pledged size. Parallel compression writes
+valid, deterministic Zstandard frames, but not the bytes of zstd's multithreaded
+mode. [Compatibility and validation][validation] states each claim with its oracle.
 
-```toml
-[dependencies]
-mzstd = "0.2"
-```
+Framed containers (`features = ["framed"]`) are built only from Zstandard frames:
+`zstd -d` prints the visible resources concatenated, everything else is in skippable
+frames, and the last frame is a seek table in zstd's `contrib/seekable_format`
+layout. The format is specified in [architecture/framing.md](architecture/framing.md).
 
-### Examples
+Not supported:
 
-```rust
-use mzstd::{Compressor, Decompressor, EncoderConfig, Level};
-
-let mut encoder = Compressor::new(EncoderConfig::default().with_level(Level::try_from(19)?))?;
-let compressed = encoder.compress(b"hello, hello, hello")?;
-
-let restored = Decompressor::default().decompress(&compressed)?;
-assert_eq!(restored, b"hello, hello, hello");
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-Explicit parameters override the level just as `ZSTD_CCtx_setParameter` does:
-
-```rust
-use mzstd::{CompressionParams, Compressor, EncoderConfig, LdmParams, Level, LongDistanceMatching, Strategy};
-
-let config = EncoderConfig::default()
-    .with_level(Level::try_from(9)?)
-    .with_checksum(true)
-    .with_params(CompressionParams::default().with_window_log(24).with_strategy(Strategy::Lazy2))
-    .with_long_distance_matching(LongDistanceMatching::Enabled(LdmParams::default()));
-let mut encoder = Compressor::new(config)?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-Dictionaries make small inputs compress well. Prepare one for the
-configuration you compress with; the same dictionary decodes its frames:
-
-```rust
-use mzstd::dictionary::DictionaryBuilder;
-use mzstd::{Compressor, Decompressor, EncoderConfig};
-
-let config = EncoderConfig::default();
-// Raw content here; a trained Zstandard-format dictionary works the same way.
-let dictionary = DictionaryBuilder::new(br#"{"user":"alice","city":"Oslo","tags":["a","b"]}"#)
-    .with_config(config)
-    .build()?;
-let record = br#"{"user":"alice","city":"Oslo","tags":["b"]}"#;
-let frame = Compressor::new(config)?.compress_with_dictionary(&dictionary, record)?;
-let restored = Decompressor::default().decompress_with_dictionary(&dictionary, &frame)?;
-assert_eq!(restored, record);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-## Choose your API
-
-Compression and decompression expose the same core I/O shapes. Pick the shape that
-matches how your application already moves bytes. `ParallelCompressor` (in
-`mzstd::compressor::parallel`) is a separate execution strategy for compression: it
-splits one frame into independent segments and hands them to your executor as tasks,
-either for a whole input at once or for input that arrives in chunks. It requires `std`.
-
-| I/O shape | Compression | Decompression |
-| --- | --- | --- |
-| Return a new `Vec<u8>` | `Compressor::compress` | `Decompressor::decompress` |
-| Append to an existing Vec | `compress_into` | `decompress_into` |
-| Write into a caller-owned slice | `compress_to_slice`, `compress_to_uninit` | `decompress_to_slice` |
-| Pull output through `std::io::Read` | `Compressor::reader` | `Decompressor::reader` |
-| Push input through `std::io::Write` | `Compressor::writer` | `Decompressor::writer` |
-| Drive input/output incrementally | `start` → `EncoderSession` | `start` → `DecoderSession` |
-| Same, with the session owning the codec | `into_session` → `EncoderSessionOwned` | `into_session` → `DecoderSessionOwned` |
-| Any of the above with a dictionary | `compress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` | `decompress_with_dictionary*`, `start_with_dictionary`, `into_session_with_dictionary`, `writer_with_dictionary`, `reader_with_dictionary` |
-| Split one known input across your threads | `ParallelCompressor::prepare_slice` / `prepare_source` → `ScopedParallelBatch` | — |
-| Stream chunked input across your threads | `ParallelCompressor::start` → `ParallelEncoderSession` + `ParallelTaskQueue` | — |
-| Same, with the session owning the compressor | `ParallelCompressor::into_session` → `ParallelEncoderSessionOwned` | — |
-| Push or pull through `std::io` across your threads | `ParallelCompressor::writer`, `ParallelCompressor::reader` | — |
-
-## Features
-
-| Feature | Default | Enables |
-| --- | --- | --- |
-| `compression` | yes | `mzstd::compressor` |
-| `decompression` | yes | `mzstd::decompressor` |
-| `std` | yes | `std::error::Error`, `mzstd::io`, parallel compression |
-| `no_std` | no | alloc-only build; overrides `std` |
-| `framed` | no | `mzstd::framing`: seekable containers of resources and metadata, built only from Zstandard frames (see below) |
-| `hotpath`, `hotpath-cpu`, `hotpath-alloc`, `hotpath-callgrind`, `hotpath-cloud` | no | profiling anchors; Callgrind instruction counts and hotpath Cloud upload |
-
-## Framed containers
-
-With `features = ["framed"]`, `mzstd::framing` stores ordered resources,
-metadata, padding, a central directory and a footer in one container,
-with the same API as mbrotli's framing. The container is only Zstandard
-frames: every visible resource is a sequence of regular frames, so
-`zstd -d` prints the visible resources concatenated; everything else is
-in skippable frames; and the last frame is a seek table in zstd's
-`contrib/seekable_format` layout, which seekable readers use to jump to
-any offset.
-
-```rust
-use mzstd::framing::{FramedCompressor, FramedDecompressor, FramedItem, FramedResource};
-
-let items = [FramedItem::Resource(FramedResource::from(&b"payload"[..]))];
-let container = FramedCompressor::new(Default::default())?.compress(items.as_slice().into())?;
-let output = FramedDecompressor::new(Default::default())?.decompress(&container)?;
-assert_eq!(output.resources[0].data, b"payload");
-```
-
-`FramedDecompressor::framed_seek_reader` reads one resource of a container
-through any `Read + Seek` source. The format is specified in
-[architecture/framing.md](architecture/framing.md).
+- External sequence producers
+- Legacy (v0.x) frames
+- Byte identity with zstd's multithreaded mode
 
 ## Verification
 
@@ -279,11 +239,37 @@ through any `Read + Seek` source. The format is specified in
 See [`architecture/`](architecture/README.md) for how the code is organized
 and verified.
 
-## Not supported
+## Cargo features
 
-- External sequence producers
-- Legacy (v0.x) frames
-- Byte identity with zstd's multithreaded mode
+The default feature set is `std`, `compression`, and `decompression`. Disable default
+features to select one codec or to build for `no_std` with `alloc`:
+
+```toml
+[dependencies]
+mzstd = { version = "0.2", default-features = false, features = ["no_std", "decompression"] }
+```
+
+`framed` enables seekable containers of resources and metadata. See
+[Cargo features][features] for every feature and what `no_std` excludes.
+
+## Documentation
+
+| If you want to | Read |
+| --- | --- |
+| Build a first round trip | [Getting started][start] |
+| Find the right entry point | [Choose your API][guide] |
+| Tune the level, parameters, or features | [Configuration and features][configuration] |
+| Control allocations | [Buffers and memory reuse][memory] |
+| Decode untrusted input | [Decompression and limits][decoder-guide] |
+| Stream with readers, writers, or sessions | [Streaming and completion][streaming] |
+| Use several cores | [Parallel compression][parallel] |
+| Use dictionaries or magicless frames | [Dictionaries and extended formats][dictionaries] |
+| Package several resources | [Framing containers][frames] |
+| Look up a type or method | [API reference on docs.rs][api] |
+| Understand the implementation | [Architecture][architecture] |
+
+The same pages live in [`docs/`](docs/README.md) and
+[`architecture/`](architecture/README.md) in this repository.
 
 ## Contributing
 
@@ -328,3 +314,20 @@ conditions.
 [decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
 [lzbench-commit]: https://github.com/inikep/lzbench/tree/a6fa8aa758932a02841c0cc68c07e5abf8870951
 [lzbench-run]: ./docs/benchmarks/lzbench-2026-11-09.md
+[site]: https://m-compressors.github.io/mzstd/
+[start]: https://m-compressors.github.io/mzstd/docs/getting-started.html
+[guide]: https://m-compressors.github.io/mzstd/docs/
+[examples]: https://m-compressors.github.io/mzstd/docs/examples/
+[configuration]: https://m-compressors.github.io/mzstd/docs/configuration.html
+[features]: https://m-compressors.github.io/mzstd/docs/configuration.html#cargo-features
+[memory]: https://m-compressors.github.io/mzstd/docs/memory.html
+[decoder-guide]: https://m-compressors.github.io/mzstd/docs/decompression.html
+[streaming]: https://m-compressors.github.io/mzstd/docs/streaming.html
+[io]: https://m-compressors.github.io/mzstd/docs/io.html
+[sans-io-enc]: https://m-compressors.github.io/mzstd/docs/sans-io-compression.html
+[sans-io-dec]: https://m-compressors.github.io/mzstd/docs/sans-io-decompression.html
+[parallel]: https://m-compressors.github.io/mzstd/docs/parallel.html
+[frames]: https://m-compressors.github.io/mzstd/docs/frames.html
+[dictionaries]: https://m-compressors.github.io/mzstd/docs/dictionaries.html
+[validation]: https://m-compressors.github.io/mzstd/docs/correctness.html
+[architecture]: https://m-compressors.github.io/mzstd/architecture/

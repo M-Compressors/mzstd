@@ -5,6 +5,25 @@ ownership boundaries, public APIs, data flow, state machines, errors and known
 gaps. `zstd-ffi/vendor/zstd` (zstd v1.5.7) is the reference implementation,
 and [`doc/zstd_compression_format.md`](../zstd-ffi/vendor/zstd/doc/zstd_compression_format.md)
 in that tree is the format specification.
+To use the crate, read the [guides](../docs/README.md) instead; for checks and
+repository layout, see [development](../docs/development.md).
+
+## Where to start
+
+| You want to understand | Read, in order |
+| --- | --- |
+| How a `compress` call becomes a frame | [Compressor](compressor.md) → [Encoder core](encoder-core.md) → [Optimal parser](optimal-parser.md) for the bt strategies |
+| How a frame is decoded | [Decompressor](decompressor.md) → [Decoder fast paths](decoder-performance.md) → [Decoder uninitialized output](decoder-uninit-output.md) |
+| How dictionaries are loaded and used | [Dictionaries](dictionaries.md) → [Decompressor](decompressor.md#dictionaries) |
+| How one input is split across threads | [Parallel compression](parallel-compression.md) |
+| How containers work | [Framed containers](framing.md) → [Framed decoder](framed-decoder.md) |
+| How byte identity and correctness are established | [Encoder verification](encoder-verification.md) → [Decoder verification](decoder-verification.md) → [Fuzzing](fuzzing.md) → [Formal verification](formal-verification.md) |
+| Which features compile which code | [Codec features](codec-features.md) |
+
+Specifications share an outline: module and ownership boundaries, public
+surface, control and data flow with Mermaid diagrams, and error propagation.
+What is missing or slower than the reference is listed under
+[known gaps](#known-gaps).
 
 ## Module map
 
@@ -51,31 +70,59 @@ Private `core` modules own algorithms and state machines. Their errors
 (`CoreError`, the decoder's internal errors) never appear in public
 signatures. Each codec compiles on its own, with or without `std`.
 
-## Specifications
+## Common boundaries
 
 | Specification | Scope |
 | --- | --- |
 | [Codec features](codec-features.md) | Feature gates, `no_std`, std-only modules, hotpath anchors and the checked configurations. |
+
+## Compression
+
+From the public `Compressor` down to the engine, match finders and entropy coding.
+
+| Specification | Scope |
+| --- | --- |
 | [Compressor](compressor.md) | Public encoder API, configuration lowering, one-shot calls, sessions, I/O adapters, errors and retention. |
-| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle and table reuse, the segment and address model of the window, the block pipeline, backend dispatch, match finders, LDM, entropy coding, streaming and output destinations (slice, Vec, uninitialized memory). |
-| [Target compressed block size](target-block-size.md) | `ZSTD_c_targetCBlockSize`: the superblock path that cuts a block into sub-blocks near a compressed size: parameter semantics, estimation, the split loop, per-sub-block literals and sequences decisions, entropy-table state across sub-blocks, fallbacks and verification. |
+| [Encoder core](encoder-core.md) | Parameter resolution, engine lifecycle, the window model, the block pipeline, backend dispatch, match finders, LDM, entropy coding and output destinations. |
 | [Optimal parser](optimal-parser.md) | btopt/btultra/btultra2 and LDM: per-block SIMD dispatch, the shared binary-tree walk, match-length kernels, price tables. |
-| [Dictionaries](dictionaries.md) | Raw and Zstandard-format dictionaries on the encoder side: `PreparedDictionary` (CDict), parameter modes, attach / copy / load at frame start, the dictionary segment, dictMatchState finders, entropy loading; the decoder side is in [decompressor](decompressor.md#dictionaries). |
-| [OpenZL integration](openzl-integration.md) | The zstd calls OpenZL's codec makes and their mzstd counterparts: `FrameFormat` (magicless frames), `CParameter` (reference parameters by ID), standalone dictionaries (`ZSTD_createCDict_advanced` + `ZSTD_CCtx_refCDict`, which replaces the context level), per-element flush streaming, `FrameHeaderInfo` and `DecoderConfig::with_format`. |
-| [Parallel compression](parallel-compression.md) | Frame plans, segments primed with their overlap as a ZSTDMT-style prefix, scoped batches over slices or random-access sources (`prepare_source`), windowed streaming sessions (borrowed and owned, `process`/`process_uninit`/`wait`) with task queues and their executor progress requirements, the parallel `std::io` adapters, errors and panic safety. |
-| [Framed containers](framing.md) | The `framed` wire format (Zstandard and skippable frames, chunk headers, directory, footer, contrib-compatible seek table) and the framed compressor: owner, sessions, structured input, std adapters, state and memory. |
-| [Framed decoder](framed-decoder.md) | `FramedDecompressor`: detection, chunk and seek table validation, events, dictionaries and budgets; the `FramedSeekReader` index and dependency plan. |
-| [Formal verification](formal-verification.md) | Charon/Aeneas translation to Lean 4 and its drift check, the RFC 8878 transcription, function specifications, encoder/decoder round trips for headers, `Number_of_Sequences` and length codes, repeat offsets, FSE transitions, trusted base and the RFC coverage checklist. |
+| [Target compressed block size](target-block-size.md) | `ZSTD_c_targetCBlockSize`: the superblock path that cuts a block into sub-blocks near a compressed size. |
+| [Dictionaries](dictionaries.md) | Raw and Zstandard-format dictionaries on the encoder side: `PreparedDictionary`, parameter modes, attach / copy / load and entropy loading. |
+| [Parallel compression](parallel-compression.md) | Frame plans, overlap-primed segments, scoped batches, windowed streaming sessions with task queues, the parallel `std::io` adapters, errors and panic safety. |
 | [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
-| [Decompressor](decompressor.md) | Public decoder API, dictionaries (parsing, frame-start setup, dictionary history), streaming state machine, history, block regeneration, Huffman stream ends (the reference's lenient fast four-stream path, ported for sections the exact decoder rejects) and compatibility with the reference decoder. |
-| [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only streaming `Sink`, the one-shot `BorrowedBuf` zeroed a block's room before each compressed block, the shared outcome mapping, the C ABI and their contract. |
-| [Decoder fast paths](decoder-performance.md) | SIMD dispatch (including AVX-512 baseline builds), bit containers, Huffman stream scheduling, static and custom FSE tables, sequence loops, wildcopies, direct slice output and measurements. |
+
+## Decompression
+
+The independent decoder, its fast paths and its output contracts.
+
+| Specification | Scope |
+| --- | --- |
+| [Decompressor](decompressor.md) | Public decoder API, dictionaries, streaming state machine, history, block regeneration and compatibility with the reference decoder. |
+| [Decoder uninitialized output](decoder-uninit-output.md) | `process_uninit` and `decompress_to_uninit`: the write-only sink, the one-shot `BorrowedBuf`, the C ABI and their contract. |
+| [Decoder fast paths](decoder-performance.md) | SIMD dispatch, bit containers, Huffman stream scheduling, FSE tables, sequence loops, wildcopies and measurements. |
 | [Decoder verification](decoder-verification.md) | Differential, golden, corruption and API suites for the decoder. |
+
+## Containers and integrations
+
+The `framed` container format, the OpenZL-facing surface and the C ABI.
+
+| Specification | Scope |
+| --- | --- |
+| [Framed containers](framing.md) | The `framed` wire format and the framed compressor: owner, sessions, structured input, std adapters, state and memory. |
+| [Framed decoder](framed-decoder.md) | `FramedDecompressor`: detection, validation, events, dictionaries and budgets; the `FramedSeekReader` index and dependency plan. |
+| [OpenZL integration](openzl-integration.md) | The zstd calls OpenZL's codec makes and their mzstd counterparts: magicless frames, `CParameter`, standalone dictionaries and `FrameHeaderInfo`. |
 | [C ABI](c-abi.md) | `mzstd-ffi`: one-shot and session functions, handle lifecycle, validation, panic guard and status mapping. |
+
+## Development tools
+
+How the repository measures, tests, proves and publishes itself.
+
+| Specification | Scope |
+| --- | --- |
 | [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
-| [Documentation publishing](documentation.md) | mdBook source staging, navigation, link and recipe validation, Mermaid assets, and GitHub Pages deployment. |
-| [CI](ci.md) | Workflows and the checks they run; ClusterFuzzLite pull request and daily fuzzing; Miri and AddressSanitizer coverage of the `unsafe` reached through `fearless_simd` and `borrowed-buf`; hotpath Cloud merged-mode (native plus Callgrind) benchmarks of `profile_compressor` and of selected Criterion ids through `hotpath::criterion`. |
+| [Formal verification](formal-verification.md) | Charon/Aeneas translation to Lean 4, the RFC 8878 transcription, function specifications, round trips, trusted base and the RFC coverage checklist. |
+| [CI](ci.md) | Workflows and the checks they run: fuzzing, Miri, AddressSanitizer and hotpath Cloud benchmarks. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |
+| [Documentation publishing](documentation.md) | Source staging, navigation, section pages, recipe execution, link validation and Pages deployment. |
 
 ## Known gaps
 

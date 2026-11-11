@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [retention policies](README.md#reusing-memory) to control which workspace
+See [retention policies](memory.md#reusing-memory) to control which workspace
 allocations remain after an operation. Caller output capacity is separate.
 
 ## Stream through `Write`
@@ -107,21 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For a retryable sink failure, `FinishError::into_parts` returns the error and
 writer. `into_error` discards the writer, as this in-memory example does.
-The [streaming guide](README.md#streaming-and-completion) explains completion,
+The [streaming guide](streaming.md) explains completion,
 backpressure, reader read-ahead, and direct sessions.
 
 ## Choose features
 
-| Configuration | Dependency |
-| --- | --- |
-| Default std encoder + decoder | `mzstd = "0.2.13"` |
-| Encoder only | `mzstd = { version = "0.2.13", default-features = false, features = ["std", "compression"] }` |
-| Decoder only | `mzstd = { version = "0.2.13", default-features = false, features = ["std", "decompression"] }` |
-| Framing containers | `mzstd = { version = "0.2.13", features = ["framed"] }` |
-| Alloc-backed codecs without std | `mzstd = { version = "0.2.13", default-features = false, features = ["no_std", "compression", "decompression"] }` |
-
-`no_std` takes precedence when enabled and removes std-only adapters and parallel
-APIs. See [codec features and no_std support](../architecture/codec-features.md).
+The default features enable `std` and both codecs. To build only one codec,
+drop std, or enable framing containers, see
+[Cargo features](configuration.md#cargo-features).
 
 ## Next steps
 
@@ -129,5 +122,7 @@ APIs. See [codec features and no_std support](../architecture/codec-features.md)
 - [Read / Write I/O](io.md): readers and writers for raw, parallel, and framed streams.
 - [Parallel compression](parallel.md): scoped threads, Rayon, files, and streaming.
 - [Framing containers](frames.md): multiple resources, metadata, and indexed reads.
-- [API guide](README.md): buffers, limits, sessions, and error handling.
+- [Choose your API](README.md): every entry point for both codecs, with its guide.
+- [Configuration and features](configuration.md): level, parameters, and Cargo features.
+- [Decompression and limits](decompression.md): budgets for untrusted input.
 - [Examples](examples/README.md): pick a recipe and run the repository examples.

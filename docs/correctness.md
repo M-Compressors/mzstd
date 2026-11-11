@@ -21,6 +21,18 @@ It is not a production dependency of the main crate. The library forbids
 `unsafe` in production code; SIMD and uninitialized-output dependencies still
 need memory-tool checks. The separate `mzstd-ffi` crate provides a C ABI.
 
+## Output compatibility
+
+Single-threaded one-shot compression is byte-identical to zstd **1.5.7**
+`ZSTD_compress2` with equivalent input, parameters, and dictionary. Sessions
+match `ZSTD_compressStream2` driven with the same chunks, output capacities,
+flushes, and pledged size. Different schedules are not interchangeable byte
+oracles. SIMD selection and workspace reuse preserve observable behavior.
+
+Parallel compression writes valid, deterministic Zstandard frames, but its bytes
+differ from serial compression and zstd's multithreaded mode. Framing is this
+crate's container format built from Zstandard and skippable frames.
+
 ## Validation layers
 
 - Encoder differential tests cover levels, random advanced parameters, long

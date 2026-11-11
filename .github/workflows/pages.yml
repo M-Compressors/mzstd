@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'README.md'
       - 'docs/**'
       - 'architecture/**'
       - 'book.toml'
@@ -16,6 +17,7 @@ on:
       - 'src/**'
   pull_request:
     paths:
+      - 'README.md'
       - 'docs/**'
       - 'architecture/**'
       - 'book.toml'

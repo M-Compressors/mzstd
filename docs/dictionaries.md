@@ -56,7 +56,7 @@ distance matching through `LongDistanceMatching::Enabled(LdmParams::default())`.
 These remain standard Zstandard frames. Explicit parameter validation follows
 the reference; decoder window limits must permit the resulting declaration.
 Larger windows can require more retained history and memory. See
-[encoder core](../architecture/encoder-core.md) and [configuration](README.md#configuration).
+[encoder core](../architecture/encoder-core.md) and [configuration](configuration.md#encoder-settings).
 
 ## Magicless frames
 

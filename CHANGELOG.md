@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Reorganize the documentation website and the README for readers, matching
+  the mbrotli book. The sidebar has five parts in reading order (Start here,
+  Guides, Performance and correctness, How it works, Contributing) and folds
+  nested chapters: the 48 per-level benchmark pages and the architecture
+  specifications open under their parent. `architecture/README.md` groups its
+  specifications into sections with reading paths and one-line scopes, and
+  each section gets a generated landing page. The catch-all user guide is
+  split into `docs/configuration.md`, `docs/memory.md`,
+  `docs/decompression.md` and `docs/streaming.md`; `docs/README.md` becomes
+  the API chooser, and output compatibility moves into `docs/correctness.md`.
+  The landing page leads with a round trip and a level ladder drawn from the
+  2026-11-09 lzbench run. The theme has its own light and dark palette and a
+  dialog that shows a Mermaid diagram at its natural size. The README leads
+  with a quick start and one API table and links into the site; its
+  explicit-parameters example moves to the configuration guide. The book
+  build now also checks every README link into the published site.
+  Documentation only; the crate is unchanged.
+
 ## [v0.2.13](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.13) - 2026-11-11
 
 - Publish the user guides, runnable recipes, architecture specifications, and
