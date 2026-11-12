@@ -316,12 +316,16 @@ sequenceDiagram
   continuation preserves the hash table, current position and raw repeat
   offsets; it changes neither search order nor match decisions.
   Promotion copies the entries the vectors already hold into the
-  destinations. Once the store holds a `FullBlock`, every later full block
-  starts on the cursor (`SeqStore::has_full_block`): starting costs nothing
-  then, and the block writes no vector entries and copies none at a
-  promotion (silesia.tar through `mzstd_compress`, level 1: 601 to
+  destinations. Once the store holds a `FullBlock`, every later block
+  that fits it starts on the cursor (`SeqStore::has_full_block`): starting
+  costs nothing then, and the block writes no vector entries and copies
+  none at a promotion (silesia.tar through `mzstd_compress`, level 1: 601 to
   618 MB/s against zstd's 640-643; dickens, 2 MiB, levels -1 and 1:
-  2.5-4% fewer cycles per call, 2026-11-08).
+  2.5-4% fewer cycles per call, 2026-11-08). That includes blocks shorter
+  than 128 KiB, such as the 64 KiB halves the pre-splitter cuts at these
+  levels: before 2026-11-12 only full blocks qualified, and on silesia.tar
+  about a quarter of the finder's instructions ran in the vector writer
+  (level -5: 3840M to 3731M instructions per call).
   The cursor owns local counts, and on return the block's
   entries stay there: `sequences()`, `literals()`, `sequences_mut()` and
   `nb_seq()` read them until `reset`, and `store_last_literals` appends
@@ -338,8 +342,9 @@ sequenceDiagram
   copied as one 32-byte chunk (`CURSOR_WILD`, the destination's slack),
   where the reference copies 16 bytes and wildcopies the rest; a longer
   run, or one within 32 bytes of the input's end, is copied exactly (a
-  `memcpy` call, which runs of 17-32 bytes used to take). Dictionary entry points and
-  partial blocks keep the vector path. The promoted loop has its own
+  `memcpy` call, which runs of 17-32 bytes used to take). Dictionary entry points,
+  stores sized for three-byte matches and, until a store holds the
+  destinations, partial blocks keep the vector path. The promoted loop has its own
   `#[simd]` entry so the callback retains the selected target features,
   and scans with a local reborrow of the cursor (`SeqCursor::reborrow`),
   whose address never escapes: the compiler then keeps its counts in
@@ -416,15 +421,69 @@ adapters. Lookahead depths, cache updates and parsing heuristics are unchanged.
     would link a whole stable sort for runs of at most nine nodes. Order
     among equal counts is the reference's; tests compare `sort` with a
     verbatim port of `HUF_sort` and the quicksort with the recursive one.
-  - `sequences::encode` walks codes and sequences backwards together. Each
-    sequence's extra bits are assembled into one word (literal length,
-    match length, offset, from the least significant bit; `SeqCodes::extra`)
-    and added with one write when they number fewer than 31, the
-    reference's own bound; otherwise the word is flushed in two parts.
-    Flushes only move whole bytes out of the container, so where they fall
-    does not change the stream; `fused_encoding_matches_the_reference_loop`
+  - `sequences::encode` walks codes and sequences backwards, in batches of
+    64 (`ENCODE_BATCH`) and two loops per batch:
+
+    ```mermaid
+    sequenceDiagram
+        participant E as encode_on
+        participant P as prepare (out of line)
+        participant S as CState x3 (of, ml, ll)
+        participant W as BitWriter
+        E->>W: last sequence's extra bits, flush
+        loop every batch of at most 64 sequences, last first
+            E->>P: codes, sequences
+            P-->>E: Pending records: extra word, three SymbolTransforms, width (stops before a sequence with 31 extra bits or more)
+            E->>W: pending(): container, bit position
+            E->>W: room::<520>(): the next 520 bytes of the destination, or a stack buffer near its end
+            loop every record
+                E->>S: advance(transform) x3: bits and count of each state
+                E->>E: join state bits and extra word, add to the container, store 8 bytes at a masked position
+            end
+            E->>W: advance(bytes, container, bit position), or append(bytes, ...) from the stack buffer
+            opt the batch stopped at a wide sequence
+                E->>S: encode x3 through the writer
+                E->>W: flush, 31 extra bits, flush, the rest, flush
+            end
+        end
+        E->>W: flush the three states, close
+    ```
+
+    `prepare` gathers what depends on a sequence alone: its extra bits as
+    one word (literal length, match length, offset, from the least
+    significant bit; `SeqCodes::extra`, which cuts the lengths with masks
+    read from one byte-indexed table, `seq_store::EXTRA`) and the
+    `SymbolTransform` each of its three codes selects. It is out of line
+    (`#[inline(never)]`, with its own `#[simd]` entry) so that it does not
+    share registers with the states its caller keeps across batches. The
+    state loop then reads one 40-byte record per sequence and indexes only
+    the three state tables: `CState::advance` returns a state's bits and
+    their count without touching the writer, the three are joined on their
+    own and added to the container with the extra word in one shift, and
+    the container is stored at a masked position (a sequence completes at
+    most seven bytes) of the destination's next 520 bytes
+    (`BitWriter::room`, then `advance`). Within 520 bytes of the
+    destination's end the batch is packed into a stack buffer instead,
+    which `BitWriter::append` copies out: copying every batch that way
+    cost about 1% of a level 1 call, the copy's wide loads waiting on the
+    narrow overlapping stores that had just filled the buffer. The three states and the
+    container stay in registers; before, each state's value went through
+    the stack on its chain of dependent table loads, and the writer's
+    position advanced four times per sequence.
+    A sequence with 31 extra bits or more, the reference's own bound, ends
+    the batch before it and is encoded through the writer with two extra
+    flushes. Flushes only move whole bytes out of the container, so where
+    they fall does not change the stream, and bytes that do not fit are
+    dropped while the position still advances, so `close` reports the
+    overflow as it does for a flush; `fused_encoding_matches_the_reference_loop`
     checks every backend against a step-by-step port of
-    `ZSTD_encodeSequences_body`.
+    `ZSTD_encodeSequences_body` at every batch boundary and at capacities
+    around the stream's size.
+    On silesia.tar through `mzstd_compress` (lzbench build, one pinned
+    vCPU of a Ryzen 9 7950X VDS, 2026-11-12) the stage went from 98
+    instructions and 22 cycles per sequence to 80 and 18 (level 1: 991M to
+    795M instructions and 227M to 179M cycles per call, 9.9M sequences;
+    the reference's `ZSTD_encodeSequences` takes 1069M and 256M).
 - `literals::try_compress` reports a raw-literals fallback without copying
   it. If those raw bytes alone reach `block_size - min_gain`, entropy coding
   returns the raw-block decision immediately. This shortcut requires a
@@ -472,7 +531,7 @@ flowchart LR
     MF[match finder] --> SS["SeqStore: vectors, or a promoted block's FullBlock"]
     SS --> FC["fill_codes(backend): codes + extra-bit counts + CodeCounts, one pass"]
     FC --> ST["build_statistics: code_histogram -> select_encoding_type / build_ctable"]
-    FC --> EN["sequences::encode: codes + sequences -> extra-bit word, FSE states"]
+    FC --> EN["sequences::encode: batches of 64: prepare (extra-bit word, transforms), then FSE states + bit packing"]
     ST --> EN
     SS --> LIT["literals: hist::count, Huffman"]
     FC --> SB["split_block: extra bits from histograms x extra bits per code"]
@@ -655,9 +714,46 @@ reference's templates are:
   20 MB of `silesia.tar` this made levels -5, -1 and 1 8-10% faster; on
   Alice (152 KB) the branches alone were 4-7% slower, the per-block choice
   0-3% faster;
-- the loops hold `&Cell<u32>` references to the hash slots they will write,
-  which removes the bounds check on a table index carried across
-  iterations;
+- dfast's loop holds `&Cell<u32>` references to the hash slots it will
+  write, which removes the bounds check on a table index carried across
+  iterations. fast's loop holds none: it reads a position's candidate and
+  writes the position's index into the slot in one step (`enter`,
+  `Cell::replace`), for `ip0` and `ip1` together, where a search starts
+  and each time the loop's exit test has passed:
+
+  ```mermaid
+  sequenceDiagram
+      participant L as fast search loop
+      participant T as hash table
+      participant S as src
+      L->>S: probe_pair(ip0, step): windows at ip0 and ip2 (exit test)
+      L->>T: enter(word at ip0, index ip0): candidate0
+      L->>T: enter(word at ip1, index ip1): candidate1
+      loop until a match
+          L->>S: repcode at ip2, bytes of candidate0, bytes of candidate1
+          alt repcode or candidate0 matches
+              L-->>L: match, nothing left to write
+          else candidate1 matches
+              L->>T: slot of ip2 = ip2, if step <= 4
+          else none
+              L->>S: probe_window(next ip2): exit test first
+              L->>T: enter for the new ip0 and ip1
+          end
+      end
+  ```
+
+  The reference reads a position's slot and then writes it with no other
+  table access in between: `ip0`'s before a search and when it starts,
+  `ip1`'s after `ip0`'s candidate failed, and where a repcode or `ip0`'s
+  candidate ends the search first it writes `ip1`'s slot all the same. So
+  reading and writing in one step leaves the table as the reference
+  does; the one read no write follows, the next `ip0`'s before a failing
+  exit test, is why the exit test comes first here. The loop then carries
+  two candidates instead of a candidate, a slot reference and a hash, the
+  matches write nothing to the table themselves, and both candidates'
+  bytes load side by side (silesia.tar, 2026-11-12: 2.3% fewer
+  instructions per call at level 1, 1.5% at level -5 and 1.0% at level 2;
+  the search loop went from 58 to 53 instructions per two positions);
 - the exit tests share their bounds checks with the loads they guard:
   fast fetches the window at `ip2` with one 10-byte range check that is
   also its `ip2 + 1 < ilimit` test (`mem::probe_window`, `probe_pair`),
@@ -665,11 +761,20 @@ reference's templates are:
   test;
 - after a match, fast extends backwards with the reference's loop over
   single bytes (it rarely takes a step; cutting two slices first cost four
-  bounds tests per match), compares the first word of the forward length
-  inline with one bounds test (`mem::count_behind_simd`: the match lies
-  behind the searched position, so its word is inside the input whenever
-  the position's is), and reads `ip0 - 2` once for both the hash insert
-  and the first repcode compare;
+  bounds tests per match), compares the first two words of the forward
+  length inline with one bounds test (`mem::count_behind_simd`: the match
+  lies behind the searched position, so its sixteen bytes are inside the
+  input whenever the position's are; a third of the matches outlast the
+  first word and most of those end in the second, which the out-of-line
+  scan took about 50 instructions to find), and reads `ip0 - 2` once for
+  both the hash insert and the first repcode compare. The two words are
+  loaded and compared as two scalar words, not as one sixteen-byte value:
+  the match's length decides where the next search starts, so this count
+  is a link of the chain from one match to the next candidate, and
+  written over a `u128` it compiled to a vector XOR whose result reached
+  a general register later (2026-11-12, silesia.tar through
+  `mzstd_compress`, eight interleaved rounds: level 1 616 to 637 MB/s,
+  level -5 869 to 900);
 - the extDict variants use the same prefix offsets, reading only
   candidates below the prefix from the external segment by window index.
   fast's (`compress_block_ext_dict_mls`, `ZSTD_compressBlock_fast_extDict_generic`)
@@ -723,7 +828,7 @@ flowchart TD
     Y -- yes --> C1["BRANCHY: validity branch, then compare"]
     Y -- "no, or dfast" --> C2["fast: offset clamped into the history, match only if unclamped; dfast: stand-in word if invalid"]
     B -- no --> D["compress_scan::<.., false, ..>: offsets from the window base, clamp or stand-in"]
-    C1 --> E[probe: hash slots as Cell refs, window load = exit test]
+    C1 --> E["probe: window load = exit test; fast: enter (read candidate, write index) for ip0 and ip1; dfast: hash slots as Cell refs"]
     C2 --> E
     D --> E
     E --> F{"candidate word == probed word?"}
@@ -1020,6 +1125,54 @@ buffers are always large enough) into `EncodeError::Internal`.
 
 ## Known gaps
 
+- Measured 2026-11-12 (same host and lzbench build, silesia.tar, exact
+  instruction counts and sampled cycles per `mzstd_compress` call): after
+  the batched sequence encoder, the cursor for pre-split blocks, the
+  second inline count word and the search loop that enters `ip0` and
+  `ip1` together, level 1 executes 5049M instructions against the
+  reference's 4965M (5464M before) and level -5 3442M against 3311M
+  (3840M before), with the same branch misses (16.3M against 16.7M) and
+  first-level cache misses (139M against 140M). What is left is the
+  `fast` finder's path from a match to the next search, which reloads and
+  stores about 25 values and tests about a dozen bounds.
+- The finder's time follows a chain, not its instruction count. From one
+  match to the next the processor waits on: the forward count's two
+  loads, the word at the position where the match ends, its hash, the
+  table entry, the candidate's bytes, the compare and, when the candidate
+  matches, the mispredicted branch. Removing 2.3% of a level 1 call's
+  instructions from the search loop changed its speed by nothing
+  measurable; taking a vector register out of the forward count made it
+  3.5% faster. Measured and rejected on that basis (2026-11-12,
+  silesia.tar, eight interleaved rounds unless noted):
+  - the forward count before the backward extension, from the position
+    the search stopped at (as one count between two matches on the kind
+    of match, as a count in each arm, or as the two words loaded early
+    and handed to the count): each put about 21 more instructions on
+    every match (level 1: 5049M to 5256-5307M) and compressed 1-3%
+    slower;
+  - a prefetch of the next search's candidate as soon as the match's
+    length is known, from an early read of the table: no change (level 1
+    615 against 611 MB/s, level -5 860 against 857); the out-of-order
+    window already reaches the real loads by the time the count is done;
+  - the byte before each probed position carried in the probe window, so
+    the backward extension's first step needs one bounds test: 0.7% fewer
+    instructions at level -5, none at level 1, where the search loop then
+    reloaded its source pointer and length from the stack, and 2.6%
+    slower there.
+- Rejected the same day outside the finder: counting codes into two
+  alternating histograms in `fill_codes` (4 more instructions per
+  sequence, no fewer cycles: the loop is not bound by its increments),
+  skipping the sixteen compared bytes before the out-of-line count (15M
+  more instructions at level 1 from the changed register allocation), and
+  the sequence encoder as one loop or as two loops over the code and
+  sequence slices (98-110 instructions per sequence: with the writer or
+  four slice pointers live, the compiler kept two of the three states on
+  the stack).
+- At levels 5 to 12 the row finder executes the reference's instruction
+  count (level 8: 32.51G against 32.38G per call) with 5% more branch
+  misses (131M against 125M); lzbench measured 0.976, 0.990 and 1.049 of
+  its speed at levels 5, 8 and 11 on 2026-11-12, within that host's
+  run-to-run spread.
 - Measured 2026-11-08 (one pinned vCPU of a Ryzen 9 7950X VDS, native
   builds, lzbench master on silesia.tar, five interleaved repeats): levels
   3, 5 and 8 compress at a median 0.950, 0.963 and 0.962 of zstd 1.5.7's
@@ -1041,7 +1194,7 @@ buffers are always large enough) into `EncodeError::Internal`.
 - `fast` on inputs above 256 KiB (Silesia, levels -1 and 1) runs at a
   median 0.939-0.945x the reference, 0.93-0.96x on text
   (Silesia run of 2026-10-30, Ryzen 9 7950X, since replaced by
-  [lzbench](../docs/benchmarks/lzbench-2026-11-09.md)).
+  [lzbench](../docs/benchmarks/lzbench-2026-11-12.md)).
   Its search loop
   costs about the reference's instructions per position; a match costs
   about 127 instructions against the reference's 91 (Silesia dickens,

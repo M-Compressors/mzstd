@@ -92,7 +92,7 @@ python3 benchmarks/comparison/level_docs.py \
 python3 benchmarks/comparison/plot.py \
   --csv docs/benchmarks/encoder-comparison.csv \
   --output docs/benchmarks/encoders/charts \
-  --subtitle 'Ryzen 9 7950X (KVM); 50 samples; one vCPU; 2026-11-09'
+  --subtitle 'Ryzen 9 7950X (KVM); 50 samples; one vCPU; 2026-11-12'
 ```
 
 `level_docs.py` writes the index, 24 level pages and their detailed charts.
@@ -100,10 +100,10 @@ python3 benchmarks/comparison/plot.py \
 charts directory. All eight corpora contribute to the medians. `--main-csv`
 adds the main branch's series (see [main branch series](#main-branch-series)).
 The published encoder and decoder CSVs are the Criterion baseline
-`long-20261109` (2026-11-09), with their size manifests and raw Criterion
-samples in `benchmarks/encoder-comparison-2026-11-09/` and
-`benchmarks/decoder-comparison-2026-11-09/`. Other tenants loaded the host
-that day, so they use 50 samples, 3 s warmup and 6 s requested
+`long-20261112` (2026-11-12), with their size manifests and raw Criterion
+samples in `benchmarks/encoder-comparison-2026-11-12/` and
+`benchmarks/decoder-comparison-2026-11-12/`. Other tenants load the host,
+so they use 50 samples, 3 s warmup and 6 s requested
 measurement instead of the 20 samples, 0.5 s and 1 s that suffice on a
 quiet host; no main branch series was recorded. See the
 [encoder](benchmarks/encoder-comparison.md) and

@@ -8,7 +8,7 @@ resource boundaries or indexed access in addition to compression.
 
 ```toml
 [dependencies]
-mzstd = { version = "0.2.13", features = ["framed"] }
+mzstd = { version = "0.2.14", features = ["framed"] }
 ```
 
 The examples use std, compression, and decompression. Framing APIs may

@@ -39,14 +39,15 @@ graph TD
         Frame --> Block[block: BlockHeader, BlockDecoder]
         Block --> Literals[literals: LiteralsDecoder, Literals]
         Block --> Sequences[sequences: SequenceTables, execute]
-        Literals --> Huffman[huffman: HuffmanTable, X1 and pair rounds]
+        Literals --> Huffman[huffman: HuffmanTable, PairTable and LockstepRows, X1 and pair rounds]
         Huffman --> HufRef["huffman::reference: the reference's stream-end verdicts, TableKind"]
         Huffman --> Fse[fse: distributions, FseTable, SeqTable, weights]
         Sequences --> Fse
         Sequences --> Copy[copy: wildcopies, short-offset shuffles]
-        Huffman --> Bits[bits: BitContainer, Sentinel, Reverse / Forward readers]
-        Stream --> Ahead[ahead: WriteAhead, next block's output prefetch]
+        Huffman --> Bits[bits: BitContainer, Sentinel, Parked, Reverse / Forward readers]
+        Stream --> Ahead[ahead: WriteAhead and prefetch_write, next block's output prefetch]
         Huffman --> Ahead
+        Sequences --> Ahead
         Fse --> Bits
         Sequences --> Bits
     end
@@ -390,8 +391,9 @@ flowchart TD
 - As in the reference's `ZSTD_DDict`, **all** of a dictionary's bytes are
   history, the Zstandard format's magic number, ID and tables included;
   encoders only reference the content after the tables.
-- The Huffman table's pair rows are built when the dictionary is parsed, so
-  decoding reads the shared table without modifying it
+- The Huffman table's pair rows and its lockstep copy of the single rows
+  are built when the dictionary is parsed (`HuffmanTable::build_shared`),
+  so decoding reads the shared table without modifying it
   (`HuffmanTable::decode_streams_shared`).
 
 ### Frame start

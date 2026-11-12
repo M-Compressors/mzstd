@@ -2,6 +2,118 @@
 
 ## Unreleased
 
+## [v0.2.14](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.14) - 2026-11-12
+
+- **Faster large inputs in lzbench: sequence encoding, the `fast` finder,
+  decoding into uninitialized output and Huffman literals.** Profiled on
+  `silesia.tar` through `mzstd_compress` and `mzstd_decompress` as lzbench
+  builds them (`-C target-cpu=native`, Ryzen 9 7950X VDS); frames are
+  unchanged and byte-identical to zstd 1.5.7.
+  lzbench master `a6fa8aa` on `silesia.tar`, `-t8,8`, one pinned vCPU of
+  a shared host (2026-11-12), speed relative to zstd 1.5.7 in the same
+  run, fastest of three rounds, with 0.2.13 in the same rounds in
+  parentheses. Compression: 0.996 (0.957), 1.002 (0.958) and 0.993 (0.956)
+  at `--fast` 5, 3 and 1; 0.979 (0.963), 0.989 (0.952) and 1.011 (0.989)
+  at levels 1, 2 and 3; 0.976 (1.031) and 0.990 (0.962) at levels 5 and
+  8; 1.049 (1.030), 1.069 (0.984), 1.247 (1.167) and 1.124 (1.082) at
+  levels 11, 15, 18 and 22. From level 5 up single rounds differ by up to
+  33 points and only the sequence encoder changed, so those differences
+  are within noise. Decompression: 1.006 (0.929), 0.998 (0.924) and 0.987
+  (0.931) at `--fast` 5, 3 and 1; 0.956 (0.939), 0.947 (0.935) and 0.956
+  (0.940) at levels 1 to 3; 0.965 (0.959) and 0.950 (0.946) at levels 5
+  and 8; 0.959 (0.954), 0.957 (0.958), 0.966 (0.939) and 0.936 (0.895) at
+  levels 11 to 22. Compression at `--fast` 5 and 1 and at levels 1, 2, 5
+  and 8 remains behind zstd by up to 2.4%, and decompression from level 1
+  up by 3.4-6.4%. Raw output of every round in
+  `docs/benchmarks/lzbench-2026-11-12.md`.
+  - *Sequence encoder.* `entropy::sequences::encode` now works in batches
+    of 64 sequences and two loops. An out-of-line `prepare` gathers each
+    sequence's extra bits and the transforms its three codes select into a
+    stack record; the state loop then advances the three FSE states with
+    the new `CState::advance`, joins their bits with the extra bits and
+    packs them straight into the destination's next 520 bytes
+    (`BitWriter::room` and `advance`; a stack buffer and
+    `BitWriter::append` within 520 bytes of its end). The states and the
+    bit container stay in registers; before,
+    each state went through the stack on its chain of dependent table
+    loads. 98 instructions and 22 cycles per sequence became 80 and 18
+    (level 1: 227M to 179M cycles per call; the reference's
+    `ZSTD_encodeSequences` takes 256M). `SeqCodes::extra` reads masks from
+    one byte-indexed table (`seq_store::EXTRA`) instead of building them
+    from bit counts.
+  - *`fast` (levels -7 to 2).* Once a store holds the full-block
+    destinations, every block that fits them runs on the `SeqCursor`,
+    including the 64 KiB halves the pre-splitter cuts; only full 128 KiB
+    blocks did, and about a quarter of the finder's instructions ran in
+    the vector writer (level -5: 3840M to 3731M instructions per call).
+    The search loop reads a position's candidate and writes the
+    position's index into the hash slot in one step, for `ip0` and `ip1`
+    together and after its exit test, which leaves the table as the
+    reference does and the loop two candidates to carry instead of a
+    candidate, a slot and a hash (level 1: 2.3% fewer instructions).
+    `mem::count_behind_simd` compares a second word inline before the
+    out-of-line scan, as two scalar words: the match's length decides
+    where the next search starts, and a sixteen-byte compare in a vector
+    register delayed it (level 1 616 to 637 MB/s, level -5 869 to 900,
+    eight interleaved rounds).
+  - *Decoder.* The fixed-output sequence loop prefetches for writing one
+    line 128 KiB past each sequence's end (`ahead::prefetch_write`), while
+    a whole room follows the block's in the output
+    (`WriteAhead::covers`, `Executor<GROW, AHEAD>`), so the zeroing of the
+    next block's room finds its lines cached. Blocks with raw literals
+    had no loop that prefetched for them: at `--fast=5` the zeroing took
+    an eighth of the decode. Through `mzstd_decompress`, level -5 went
+    from 0.918 to 1.001 of zstd's speed, level 1 from 0.935 to 0.959 and
+    level 8 from 0.959 to 0.983 (best of twelve decodes, three interleaved
+    rounds).
+  - *Huffman literals.* In AVX-512 feature contexts (lzbench's
+    `-C target-cpu=native` on Zen 4 and Ice Lake or later) the four
+    streams are now decoded in lockstep, one lookup of every stream per
+    step, as the reference's assembly loops do: `pair_rounds_lockstep`
+    replaces the three-and-one `pair_rounds_serial`, and the new
+    `single_rounds_lockstep` serves single-symbol sections on every
+    backend. The compiler vectorized such loops into gathers, which is
+    why they were avoided; the rows are now read with atomic loads
+    (`PairTable`, and `LockstepRows`, an 8 KiB copy of the single rows
+    built on a table's first lockstep decode or by `build_shared`), which
+    are ordinary loads that cannot become a gather, each refill ends a
+    basic block (`Sentinel::reload_parked`), and the stream positions
+    stay in memory (`bits::Parked`) so that the bit containers keep the
+    registers. Through `mzstd_decompress`, relative to zstd: x-ray
+    (1 MiB, level 1) 0.770 to 0.829, dickens (2 MiB) 0.930 to 0.948,
+    samba (1 MiB) 0.974 to 0.994. A table shared before its copy was
+    built decodes single-symbol sections as before.
+  - Measured and not kept: the sequence encoder as one loop, a rotating
+    three-stream order for the AVX-512 Huffman pair loop, two alternating
+    code histograms in `fill_codes`, a second prefetched line per
+    sequence, dropping the literal loops' prefetch, and in `fast` the
+    forward count ahead of the backward extension, an early prefetch of
+    the next search's candidate and the preceding byte carried in the
+    probe window, and in the lockstep Huffman loops clamped refills,
+    parked output positions and narrow loads of a pair row's fields; see
+    the known gaps of `architecture/encoder-core.md` and
+    `architecture/decoder-performance.md`.
+  - *Small inputs are not faster, and tiny frames decode slightly
+    slower.* The cold comparison (inputs up to 1 MiB) is unchanged within
+    its noise: compression at a median 1.216x zstd's speed and
+    decompression at 1.521x, against 1.248x and 1.517x on 2026-11-09. A
+    cold `Decompressor::decompress` of an empty or 44-byte frame executes
+    31 more instructions, about 4% of the call (726 against 695 and 901
+    against 870): LLVM no longer inlines `decode_into` and `trim` into
+    it. `#[inline]` on both recovers 13 of the 31 and is not applied.
+- **Benchmarks rerun for 0.2.14 (2026-11-12).** The cold
+  comparison against zstd 1.5.7 is recorded again as `long-20261112`
+  (`docs/benchmarks/encoder-comparison.*`, `decoder-comparison.*`, the
+  per-level pages and charts, size manifests and Criterion samples under
+  `docs/benchmarks/{encoder,decoder}-comparison-2026-11-12/`), and lzbench
+  ran again on 0.2.14 and on 0.2.13
+  (`docs/benchmarks/lzbench-2026-11-12.md`). The README, the level ladder
+  of `docs/introduction.md`, `docs/benchmarks/README.md`,
+  `docs/benchmarking.md` and the known gaps in `architecture/` carry the
+  new figures. The 2026-11-09 records (`encoder-comparison-2026-11-09/`,
+  `decoder-comparison-2026-11-09/` and `lzbench-2026-11-09.md` under
+  `docs/benchmarks/`) are removed; their medians remain as the reference
+  column of the two comparison reports.
 - Reorganize the documentation website and the README for readers, matching
   the mbrotli book. The sidebar has five parts in reading order (Start here,
   Guides, Performance and correctness, How it works, Contributing) and folds

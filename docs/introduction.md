@@ -13,7 +13,7 @@
 
 ```toml
 [dependencies]
-mzstd = "0.2.13"
+mzstd = "0.2.14"
 ```
 
 ```rust
@@ -44,19 +44,19 @@ compressed size of the 211 MB Silesia corpus against its original size.
 <tr><th>Level</th><th>Compressed size</th><th class="num">Compress</th><th class="num wide">Decompress</th></tr>
 </thead>
 <tbody>
-<tr><td>-5</td><td class="size"><span class="track"><span class="fill" style="width: 48.61%">48.6%</span></span></td><td class="num">838 MB/s</td><td class="num wide">2828 MB/s</td></tr>
-<tr><td>1</td><td class="size"><span class="track"><span class="fill" style="width: 34.53%">34.5%</span></span></td><td class="num">626 MB/s</td><td class="num wide">1992 MB/s</td></tr>
-<tr><td>3</td><td class="size"><span class="track"><span class="fill" style="width: 31.20%">31.2%</span></span></td><td class="num">374 MB/s</td><td class="num wide">1784 MB/s</td></tr>
-<tr><td>8</td><td class="size"><span class="track"><span class="fill" style="width: 28.17%">28.2%</span></span></td><td class="num">103 MB/s</td><td class="num wide">1945 MB/s</td></tr>
-<tr><td>15</td><td class="size"><span class="track"><span class="fill" style="width: 26.83%">26.8%</span></span></td><td class="num">9.04 MB/s</td><td class="num wide">2014 MB/s</td></tr>
-<tr><td>22</td><td class="size"><span class="track"><span class="fill" style="width: 24.67%">24.7%</span></span></td><td class="num">2.27 MB/s</td><td class="num wide">1498 MB/s</td></tr>
+<tr><td>-5</td><td class="size"><span class="track"><span class="fill" style="width: 48.61%">48.6%</span></span></td><td class="num">886 MB/s</td><td class="num wide">3062 MB/s</td></tr>
+<tr><td>1</td><td class="size"><span class="track"><span class="fill" style="width: 34.53%">34.5%</span></span></td><td class="num">640 MB/s</td><td class="num wide">2039 MB/s</td></tr>
+<tr><td>3</td><td class="size"><span class="track"><span class="fill" style="width: 31.20%">31.2%</span></span></td><td class="num">379 MB/s</td><td class="num wide">1812 MB/s</td></tr>
+<tr><td>8</td><td class="size"><span class="track"><span class="fill" style="width: 28.17%">28.2%</span></span></td><td class="num">102 MB/s</td><td class="num wide">1941 MB/s</td></tr>
+<tr><td>15</td><td class="size"><span class="track"><span class="fill" style="width: 26.83%">26.8%</span></span></td><td class="num">8.71 MB/s</td><td class="num wide">2024 MB/s</td></tr>
+<tr><td>22</td><td class="size"><span class="track"><span class="fill" style="width: 24.67%">24.7%</span></span></td><td class="num">2.44 MB/s</td><td class="num wide">1524 MB/s</td></tr>
 </tbody>
 </table>
 </div>
 
-<p class="note">mzstd 0.2.12 in lzbench 2.4.1 on one thread of an AMD Ryzen 9 7950X VDS, fastest of three rounds. Your data and machine will differ.</p>
+<p class="note">mzstd 0.2.14 in lzbench 2.4.1 on one thread of an AMD Ryzen 9 7950X VDS, fastest of three rounds. Your data and machine will differ.</p>
 
-See the [lzbench run](benchmarks/lzbench-2026-11-09.md) for the command and raw
+See the [lzbench run](benchmarks/lzbench-2026-11-12.md) for the command and raw
 output, and [benchmark results](benchmarks/README.md) for every measured level
 against zstd 1.5.7, including the cases where mzstd is slower.
 

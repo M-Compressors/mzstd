@@ -201,8 +201,8 @@ impl SeqCodes {
     /// [`CODE_COUNT_SLOTS`].
     #[inline(always)]
     fn new(ll: u32, of: u32, ml: u32) -> Self {
-        let ll_bits = u32::from(LL_EXTRA_BITS[ll as usize & (CODE_COUNT_SLOTS - 1)]);
-        let ml_bits = u32::from(ML_EXTRA_BITS[ml as usize & (CODE_COUNT_SLOTS - 1)]);
+        let ll_bits = EXTRA.ll[ll as usize & (EXTRA_SLOTS - 1)].bits;
+        let ml_bits = EXTRA.ml[ml as usize & (EXTRA_SLOTS - 1)].bits;
         Self {
             ll: ll as u8,
             of: of as u8,
@@ -214,34 +214,59 @@ impl SeqCodes {
     /// The extra bits of `seq`, whose codes these are, as the sequences
     /// bitstream takes them: literal length, match length and offset, in
     /// that order from the least significant bit, with nothing above them.
+    ///
+    /// The tables are indexed by a whole byte, so no index is masked, and
+    /// the lengths are cut with a mask read from a table rather than built
+    /// from their bit counts.
     #[inline(always)]
     pub(crate) fn extra(self, seq: &SeqDef) -> u64 {
-        let ll_bits = u32::from(LL_EXTRA_BITS[usize::from(self.ll) & (CODE_COUNT_SLOTS - 1)]);
-        let ml_bits = u32::from(ML_EXTRA_BITS[usize::from(self.ml) & (CODE_COUNT_SLOTS - 1)]);
+        let ll = EXTRA.ll[usize::from(self.ll)];
+        let ml = EXTRA.ml[usize::from(self.ml)];
         let of = u32::from(self.of) & 31;
-        let low = |value: u32, bits: u32| u64::from(value) & ((1u64 << bits) - 1);
-        low(u32::from(seq.lit_length), ll_bits)
-            | low(u32::from(seq.ml_base), ml_bits) << ll_bits
-            | low(seq.off_base, of) << (ll_bits + ml_bits)
+        let lit_length = u64::from(u32::from(seq.lit_length) & ll.mask);
+        let ml_base = u64::from(u32::from(seq.ml_base) & ml.mask);
+        let off_base = u64::from(seq.off_base) & ((1 << of) - 1);
+        lit_length | ml_base << ll.bits | off_base << (ll.bits + ml.bits)
     }
 }
 
-/// `bits` padded to [`CODE_COUNT_SLOTS`] entries, so a code masked to six
-/// bits indexes it without a bounds check.
-const fn padded_bits<const N: usize>(bits: [u8; N]) -> [u8; CODE_COUNT_SLOTS] {
-    let mut out = [0u8; CODE_COUNT_SLOTS];
+/// Entries of the tables [`SeqCodes::extra`] reads: one per byte value,
+/// so a code indexes them without a bounds check.
+const EXTRA_SLOTS: usize = 256;
+
+/// The extra bits of one length code: their number and the mask that
+/// cuts them from a length.
+#[derive(Clone, Copy)]
+struct ExtraField {
+    mask: u32,
+    bits: u32,
+}
+
+/// [`ExtraField`]s per literal length and match length code, in one
+/// object so both are addressed from one base.
+struct ExtraFields {
+    ll: [ExtraField; EXTRA_SLOTS],
+    ml: [ExtraField; EXTRA_SLOTS],
+}
+
+/// The fields of `bits`, with none past the last code.
+const fn extra_fields<const N: usize>(bits: [u8; N]) -> [ExtraField; EXTRA_SLOTS] {
+    let mut out = [ExtraField { mask: 0, bits: 0 }; EXTRA_SLOTS];
     let mut i = 0;
     while i < N {
-        out[i] = bits[i];
+        out[i] = ExtraField {
+            mask: (1 << bits[i]) - 1,
+            bits: bits[i] as u32,
+        };
         i += 1;
     }
     out
 }
 
-/// Extra bits per literal length code.
-const LL_EXTRA_BITS: [u8; CODE_COUNT_SLOTS] = padded_bits(LL_BITS);
-/// Extra bits per match length code.
-const ML_EXTRA_BITS: [u8; CODE_COUNT_SLOTS] = padded_bits(ML_BITS);
+static EXTRA: ExtraFields = ExtraFields {
+    ll: extra_fields(LL_BITS),
+    ml: extra_fields(ML_BITS),
+};
 
 /// Number of entries in each [`CodeCounts`] histogram: every code fits in
 /// six bits, so a code masked to them indexes without a bounds check.
@@ -533,6 +558,13 @@ impl SeqStore {
     #[inline(always)]
     pub(crate) const fn has_full_block(&self) -> bool {
         self.full.is_some()
+    }
+
+    /// Whether the current block's entries are in the full-block
+    /// destinations.
+    #[cfg(test)]
+    pub(crate) const fn on_cursor(&self) -> bool {
+        self.full_counts.is_some()
     }
 
     /// Runs a full-block finder over the kept full-block destinations,
@@ -976,13 +1008,64 @@ mod tests {
     }
 
     #[test]
-    fn padded_extra_bits_extend_the_format_tables_with_zeros() {
-        // Evaluated at run time too, not only in the constants.
-        assert_eq!(padded_bits(LL_BITS), LL_EXTRA_BITS);
-        assert_eq!(LL_EXTRA_BITS[..LL_BITS.len()], LL_BITS);
-        assert!(LL_EXTRA_BITS[LL_BITS.len()..].iter().all(|&b| b == 0));
-        assert_eq!(ML_EXTRA_BITS[..ML_BITS.len()], ML_BITS);
-        assert!(ML_EXTRA_BITS[ML_BITS.len()..].iter().all(|&b| b == 0));
+    fn extra_fields_extend_the_format_tables_with_empty_fields() {
+        // Evaluated at run time too, not only in the static.
+        for (fields, bits) in [
+            (extra_fields(LL_BITS), &LL_BITS[..]),
+            (extra_fields(ML_BITS), &ML_BITS[..]),
+        ] {
+            for (code, field) in fields.iter().enumerate() {
+                let expected = bits.get(code).copied().map_or(0, u32::from);
+                assert_eq!(field.bits, expected, "code {code}");
+                assert_eq!(field.mask, (1 << expected) - 1, "code {code}");
+            }
+        }
+        for code in 0..EXTRA_SLOTS {
+            assert_eq!(EXTRA.ll[code].bits, extra_fields(LL_BITS)[code].bits);
+            assert_eq!(EXTRA.ll[code].mask, extra_fields(LL_BITS)[code].mask);
+            assert_eq!(EXTRA.ml[code].bits, extra_fields(ML_BITS)[code].bits);
+            assert_eq!(EXTRA.ml[code].mask, extra_fields(ML_BITS)[code].mask);
+        }
+    }
+
+    #[test]
+    fn extra_bits_are_the_low_bits_of_each_value_for_every_code() {
+        for ll in 0..=MAX_LL {
+            for ml in 0..=MAX_ML {
+                for of in [0u8, 1, 7, 16, 31] {
+                    let ll_bits = u32::from(LL_BITS[usize::from(ll)]);
+                    let ml_bits = u32::from(ML_BITS[usize::from(ml)]);
+                    let codes = SeqCodes::new(ll.into(), of.into(), ml.into());
+                    assert_eq!(
+                        u32::from(codes.extra_bits),
+                        ll_bits + ml_bits + u32::from(of)
+                    );
+                    // Every bit set: the result keeps exactly the low bits.
+                    let seq = SeqDef {
+                        off_base: u32::MAX,
+                        lit_length: u16::MAX,
+                        ml_base: u16::MAX,
+                    };
+                    assert_eq!(
+                        codes.extra(&seq),
+                        (1u64 << codes.extra_bits) - 1,
+                        "{ll} {ml} {of}"
+                    );
+                    // One field at a time lands at its place.
+                    let low = |bits: u32| (1u64 << bits) - 1;
+                    let only = |off_base, lit_length, ml_base| {
+                        codes.extra(&SeqDef {
+                            off_base,
+                            lit_length,
+                            ml_base,
+                        })
+                    };
+                    assert_eq!(only(0, u16::MAX, 0), low(ll_bits));
+                    assert_eq!(only(0, 0, u16::MAX), low(ml_bits) << ll_bits);
+                    assert_eq!(only(u32::MAX, 0, 0), low(of.into()) << (ll_bits + ml_bits));
+                }
+            }
+        }
     }
 
     #[test]

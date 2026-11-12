@@ -806,8 +806,8 @@ mod tests {
         for table in [example_table(), flat_table()] {
             let mut table = table;
             table.build_pairs();
-            let built = table.pairs.as_deref().expect("pair rows");
-            for (index, row) in built.iter().enumerate() {
+            let built = table.pairs.as_ref().expect("pair rows");
+            for (index, row) in built.rows().enumerate() {
                 let entry = pair(&table.rows, index, FAST_LOG);
                 assert_eq!(
                     (entry.sequence, entry.nb_bits, entry.length),
