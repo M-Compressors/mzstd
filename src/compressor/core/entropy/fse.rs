@@ -58,6 +58,17 @@ impl CTable {
     };
 }
 
+impl CTable {
+    /// The transform [`CState::advance`] takes for `symbol`.
+    ///
+    /// The index is masked to the table's size: a symbol the table was
+    /// built for is always in range.
+    #[inline(always)]
+    pub(crate) const fn transform(&self, symbol: u8) -> SymbolTransform {
+        self.symbol_tt[symbol as usize & (MAX_SYMBOLS - 1)]
+    }
+}
+
 impl Default for CTable {
     fn default() -> Self {
         Self::EMPTY
@@ -637,6 +648,25 @@ impl<'t> CState<'t> {
             i64::from(self.table.state_table[index as usize & ((1 << STATE_TABLE_LOG) - 1)]);
     }
 
+    /// `FSE_encodeSymbol` without the write: moves to the state the
+    /// symbol of `transform` leads to and returns the bits that leaves in
+    /// the stream with their number, at most [`STATE_TABLE_LOG`].
+    ///
+    /// A caller that encodes several states per step joins their bits
+    /// before it touches its writer, so the states' chains of dependent
+    /// table loads do not wait on the writer's bit position. The count is
+    /// masked to four bits, which changes nothing and tells the compiler
+    /// that it is a valid shift.
+    #[inline(always)]
+    pub(crate) fn advance(&mut self, transform: SymbolTransform) -> (u64, u32) {
+        let nb_bits_out = ((self.value + i64::from(transform.delta_nb_bits)) >> 16) as u32 & 15;
+        let bits = self.value as u64 & ((1 << nb_bits_out) - 1);
+        let index = (self.value >> nb_bits_out) + i64::from(transform.delta_find_state);
+        self.value =
+            i64::from(self.table.state_table[index as usize & ((1 << STATE_TABLE_LOG) - 1)]);
+        (bits, nb_bits_out)
+    }
+
     /// `FSE_flushCState`.
     pub(crate) fn flush(&self, writer: &mut BitWriter<'_>) {
         writer.add_bits(self.value as u64, self.table.table_log);
@@ -896,6 +926,45 @@ mod tests {
         state.encode(&mut writer, 7);
         state.flush(&mut writer);
         assert_eq!(writer.close(), 1);
+    }
+
+    #[test]
+    fn advancing_a_state_writes_what_encoding_a_symbol_writes() {
+        let norm = [16i16, 8, 5, 2, -1, 0];
+        let mut table = CTable::default();
+        table.build(&norm, 5, 5);
+        let mut single = CTable::default();
+        single.build_rle(3);
+        for (table, symbols) in [
+            (&table, &[0u8, 1, 4, 2, 0, 0, 3, 1, 4, 4, 0, 2][..]),
+            (&single, &[3u8, 3, 3][..]),
+        ] {
+            let mut expected = [0u8; 64];
+            let mut direct = BitWriter::new(&mut expected).expect("capacity");
+            let mut dst = [0u8; 64];
+            let mut writer = BitWriter::new(&mut dst).expect("capacity");
+            let first = u32::from(symbols[0]);
+            let mut encoded = CState::with_first_symbol(table, first);
+            let mut advanced = CState::with_first_symbol(table, first);
+            for &symbol in &symbols[1..] {
+                encoded.encode(&mut direct, u32::from(symbol));
+                direct.flush();
+                let (bits, count) = advanced.advance(table.transform(symbol));
+                assert!(count <= STATE_TABLE_LOG);
+                assert_eq!(bits >> count, 0, "nothing above the bits");
+                writer.add_bits_fast(bits, count);
+                writer.flush();
+                assert_eq!(advanced.value, encoded.value);
+            }
+            encoded.flush(&mut direct);
+            advanced.flush(&mut writer);
+            let size = direct.close();
+            assert_eq!(writer.close(), size);
+            assert_eq!(dst[..size], expected[..size]);
+        }
+        // A symbol past the transforms reads a masked slot, never out of
+        // bounds.
+        assert_eq!(table.transform(MAX_SYMBOLS as u8 + 1), table.transform(1));
     }
 
     #[test]

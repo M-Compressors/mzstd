@@ -91,25 +91,27 @@ the parallel streaming entry points.
 ### Our benchmarks
 
 Compression writes byte-identical frames to zstd 1.5.7 and reaches a median
-1.248× its speed across the comparison corpus; decompression reaches 1.517×.
+1.216× its speed across the comparison corpus; decompression reaches 1.521×.
 These medians include empty and tiny inputs. Alice text remains slower at
-some compression levels and at most decompression levels, and on the whole
-`silesia.tar` in lzbench both codecs still trail C by a few percent at most
-levels.
+some compression levels and at most decompression levels. On the whole
+`silesia.tar` in lzbench compression is within about 2% of C up to level 8
+and faster above it, and decompression is level with C at the fastest
+levels and 3-6% behind from level 1 up.
 
 <details>
 <summary>Compression benchmark results and methodology</summary>
 
 ![Compression speed and output size relative to zstd 1.5.7 across levels -5 to 22][bench-chart]
 
-**Recorded 2026-11-09 · mzstd 0.2.12 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
+**Recorded 2026-11-12 · mzstd 0.2.14 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
 Each value is the median of per-dataset ratios across eight equally weighted datasets,
 including empty and tiny inputs. A speed ratio above **1×** is faster than C; every
 frame is byte-identical to zstd's, so the size ratio is **1×** at every level. The
-median over all 192 dataset/level pairs is **1.248×**, with lower mean latency
-in 174 pairs (2026-10-30: 1.256×, 179 pairs). The 18 slower pairs are Alice at
-ten levels, cyclic Alice at four and random data at four (0.84–0.998×). The host
-was loaded during the run: medians are stable, single cells good to about ±10%.
+median over all 192 dataset/level pairs is **1.216×**, with lower mean latency
+in 174 pairs (2026-11-09: 1.248×, 174 pairs). The 18 slower pairs are Alice at
+nine levels, cyclic Alice at four, structured binary at two and random data at
+three (0.82–0.999×). Other tenants load the host: medians are stable, single
+cells good to about ±10%.
 
 The benchmark includes compressor construction, allocation, compression, and disposal.
 Results apply to the [recorded revision and machine][bench-levels]; [lzbench](#lzbench)
@@ -124,12 +126,12 @@ covers a whole large archive.
 
 ![Decompression speed relative to zstd 1.5.7 by source level][decoder-bench-chart]
 
-**Recorded 2026-11-09 · mzstd 0.2.12 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
+**Recorded 2026-11-12 · mzstd 0.2.14 · AMD Ryzen 9 7950X (KVM, host shared with other tenants) · cold one-shot APIs.**
 zstd C and mzstd decode identical C-written frames at source levels **-5 to 22**.
 All **384 cases** restore the original bytes. The median over all 192 pairs is
-**1.517×** (2026-10-30: 1.502×), faster in 151 pairs: much faster on empty and tiny
-frames and on random data, 1.45× on structured binary and 1.53× on run-length
-data, and 0.95× (Alice) and 0.94× (cyclic Alice) on compressible text.
+**1.521×** (2026-11-09: 1.517×), faster in 152 pairs: much faster on empty and tiny
+frames and on random data, 1.44× on structured binary and 1.58× on run-length
+data, and 0.91× (Alice) and 0.96× (cyclic Alice) on compressible text.
 Construction, allocation, decode and disposal are timed; C reads the output
 capacity from the frame header.
 
@@ -142,7 +144,7 @@ capacity from the frame header.
 #### lzbench
 
 <details>
-<summary>lzbench 2.4.1 results for mzstd 0.2.12 and zstd 1.5.7</summary>
+<summary>lzbench 2.4.1 results for mzstd 0.2.14 and zstd 1.5.7</summary>
 
 [lzbench](https://github.com/inikep/lzbench) is a long-running open-source
 in-memory benchmark: every codec is built from source into one binary with the
@@ -152,35 +154,38 @@ codecs built with `-march=native`), with this release's sources in place of
 the mzstd 0.2.11 it vendors, on the 211 MB `silesia.tar` of the
 [Silesia corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia),
 pinned to one thread of an AMD Ryzen 9 7950X VDS, with `-t8,8`, in three
-rounds on 2026-11-09. [Command, raw output of every round and the 0.2.11 run][lzbench-run].
+rounds on 2026-11-12. [Command, raw output of every round and the 0.2.13 run][lzbench-run].
 
-mzstd 0.2.12 against zstd 1.5.7; bold marks the faster result. Ratio is the
+mzstd 0.2.14 against zstd 1.5.7; bold marks the faster result. Ratio is the
 compressed size as a percentage of the input and matches for both: every frame
 is byte-identical.
 
 | Level | Compress mzstd | Compress zstd | Decompress mzstd | Decompress zstd | Ratio, % |
 | ----: | -------------: | ------------: | ---------------: | --------------: | -------: |
-| -22 | **2.27 MB/s** | 2.13 MB/s | 1498 MB/s | **1608 MB/s** | 24.67 |
-| -18 | **5.03 MB/s** | 4.28 MB/s | 1745 MB/s | **1858 MB/s** | 25.15 |
-| -15 | **9.04 MB/s** | 8.41 MB/s | 2014 MB/s | **2116 MB/s** | 26.83 |
-| -11 | 42.7 MB/s | **45.7 MB/s** | 1982 MB/s | **2082 MB/s** | 27.35 |
-| -8 | 103 MB/s | **107 MB/s** | 1945 MB/s | **2040 MB/s** | 28.17 |
-| -5 | 203 MB/s | **208 MB/s** | 1769 MB/s | **1858 MB/s** | 29.60 |
-| -3 | **374 MB/s** | 370 MB/s | 1784 MB/s | **1892 MB/s** | 31.20 |
-| -2 | 505 MB/s | **534 MB/s** | 1834 MB/s | **1966 MB/s** | 32.70 |
-| -1 | 626 MB/s | **658 MB/s** | 1992 MB/s | **2134 MB/s** | 34.53 |
-| --fast=1 | 682 MB/s | **720 MB/s** | 2504 MB/s | **2695 MB/s** | 41.01 |
-| --fast=3 | 763 MB/s | **812 MB/s** | 2673 MB/s | **2867 MB/s** | 44.63 |
-| --fast=5 | 838 MB/s | **893 MB/s** | 2828 MB/s | **3048 MB/s** | 48.61 |
+| -22 | **2.44 MB/s** | 2.17 MB/s | 1524 MB/s | **1628 MB/s** | 24.67 |
+| -18 | **4.95 MB/s** | 3.97 MB/s | 1804 MB/s | **1868 MB/s** | 25.15 |
+| -15 | **8.71 MB/s** | 8.15 MB/s | 2024 MB/s | **2115 MB/s** | 26.83 |
+| -11 | **44.6 MB/s** | 42.5 MB/s | 1975 MB/s | **2059 MB/s** | 27.35 |
+| -8 | 102 MB/s | **103 MB/s** | 1941 MB/s | **2043 MB/s** | 28.17 |
+| -5 | 205 MB/s | **210 MB/s** | 1806 MB/s | **1872 MB/s** | 29.60 |
+| -3 | **379 MB/s** | 375 MB/s | 1812 MB/s | **1896 MB/s** | 31.20 |
+| -2 | 536 MB/s | **542 MB/s** | 1872 MB/s | **1977 MB/s** | 32.70 |
+| -1 | 640 MB/s | **654 MB/s** | 2039 MB/s | **2132 MB/s** | 34.53 |
+| --fast=1 | 718 MB/s | **723 MB/s** | 2678 MB/s | **2712 MB/s** | 41.01 |
+| --fast=3 | **819 MB/s** | 817 MB/s | 2862 MB/s | **2868 MB/s** | 44.63 |
+| --fast=5 | 886 MB/s | **890 MB/s** | **3062 MB/s** | 3044 MB/s | 48.61 |
 
 **Summary:** byte-identical output at every level; the fastest of three
-rounds compresses 6.6-17.5% faster than zstd at levels 15, 18 and 22, at its
-speed at level 3 and 2.4-6.6% slower at the other levels, and decompresses
-4.7-7.2% slower at every level. Compression at level 2 and above moves by
-3-21% between rounds on this loaded host. Against 0.2.11 in the same
-rounds, relative to zstd, decompression gained 0.8-5 points at levels 1 to 22
-(level 1: 0.883 to 0.933), level 3 compression went from 0.973 to 1.011,
-and the `--fast` levels and levels 1 and 2 compress 0.8-2.4 points faster.
+rounds compresses 4.9-24.7% faster than zstd at levels 11, 15, 18 and 22,
+within about 1% of its speed at `--fast=3`, `--fast=5`, `--fast=1`, level 3
+and level 8, and 1.1-2.4% slower at levels 1, 2 and 5. It decompresses at
+zstd's speed at `--fast=5` and `--fast=3`, 1.3% slower at `--fast=1` and
+3.4-6.4% slower from level 1 up. Compression from level 5 up moves by up to
+33 points between rounds on this shared host. Against 0.2.13 in the same
+rounds, relative to zstd, decompression at the `--fast` levels went from
+0.92-0.93 to 0.99-1.01 and gained 1.2-1.7 points at levels 1 to 3, and
+compression gained 3.7-4.4 points at the `--fast` levels and 1.6-3.7 points
+at levels 1 to 3.
 lzbench compresses the whole archive as one frame, so it measures
 large-input throughput; the medians above also weight empty and tiny
 inputs, where mzstd is much faster.
@@ -313,7 +318,7 @@ conditions.
 [decoder-bench-chart]: ./docs/benchmarks/decoders/charts/overview.svg
 [decoder-bench-report]: ./docs/benchmarks/decoder-comparison.md
 [lzbench-commit]: https://github.com/inikep/lzbench/tree/a6fa8aa758932a02841c0cc68c07e5abf8870951
-[lzbench-run]: ./docs/benchmarks/lzbench-2026-11-09.md
+[lzbench-run]: ./docs/benchmarks/lzbench-2026-11-12.md
 [site]: https://m-compressors.github.io/mzstd/
 [start]: https://m-compressors.github.io/mzstd/docs/getting-started.html
 [guide]: https://m-compressors.github.io/mzstd/docs/

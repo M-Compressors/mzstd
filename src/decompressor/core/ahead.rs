@@ -9,7 +9,9 @@
 //! computes. Here the literal loops, which wait on their table lookups and
 //! leave memory bandwidth unused, instead prefetch for writing the lines
 //! the next block's room will cover, one per round: that room's zeroing,
-//! or a caller's slice written in place, then finds them cached.
+//! or a caller's slice written in place, then finds them cached. The
+//! sequence loop of a fixed output does the same once per sequence
+//! ([`prefetch_write`]), for blocks whose literals no loop decodes.
 //!
 //! A prefetch is a hint: it never faults, reads or writes no data and
 //! changes no result, so the addresses need not even be inside the
@@ -37,6 +39,28 @@ pub(crate) struct WriteAhead {
     end: *const u8,
 }
 
+/// Prefetches for writing the cache line of the byte `at` bytes after the
+/// start of `out`, wherever that is: inside `out` or in the same buffer
+/// past its end.
+///
+/// The sequence loop calls it once per sequence with an offset a block
+/// beyond its write position while the next block's whole room lies in
+/// the output ([`WriteAhead::covers`]), so the lines that room covers
+/// arrive while sequences execute; blocks whose literals are stored raw
+/// run no literal loop that could prefetch for them. Otherwise it passes
+/// its write position itself, a line it is about to write: an address
+/// past the output may be unmapped, where a hint costs a page walk for
+/// nothing.
+#[inline(always)]
+pub(crate) fn prefetch_write(out: &[u8], at: usize) {
+    // Miri cannot run the hint's inline assembly; a hint changes nothing
+    // it could check.
+    #[cfg(not(miri))]
+    branches::prefetch_write_data::<u8, 0>(out.as_ptr().wrapping_add(at));
+    #[cfg(miri)]
+    let _ = (out, at);
+}
+
 impl WriteAhead {
     /// Prefetches nothing.
     pub(crate) const NONE: Self = Self {
@@ -54,6 +78,13 @@ impl WriteAhead {
             next: base.wrapping_add(start),
             end: base.wrapping_add(end),
         }
+    }
+
+    /// Whether at least `len` bytes are left to prefetch: asked before
+    /// any step, whether the range holds a whole room of `len` bytes.
+    #[inline(always)]
+    pub(crate) fn covers(&self, len: usize) -> bool {
+        (self.end as usize).saturating_sub(self.next as usize) >= len && len != 0
     }
 
     /// Prefetches the next [`LINES`] cache lines for writing, if any is
@@ -106,6 +137,32 @@ mod tests {
         let done = ahead;
         ahead.step();
         assert_eq!(ahead, done);
+    }
+
+    #[test]
+    fn a_write_prefetch_changes_nothing_wherever_it_points() {
+        let bytes = [7u8; 16];
+        for at in [0, 15, 16, 1 << 17, usize::MAX] {
+            prefetch_write(&bytes, at);
+            prefetch_write(&bytes[..0], at);
+        }
+        assert_eq!(bytes, [7; 16]);
+    }
+
+    #[test]
+    fn a_range_covers_lengths_up_to_what_is_left_of_it() {
+        let bytes = [0u8; 4 * LINES * LINE];
+        let step = LINES * LINE;
+        let mut ahead = WriteAhead::within(bytes.as_ptr(), 8, 8 + 2 * step);
+        assert!(ahead.covers(1));
+        assert!(ahead.covers(2 * step));
+        assert!(!ahead.covers(2 * step + 1));
+        assert!(!ahead.covers(0));
+        ahead.step();
+        assert!(ahead.covers(step));
+        assert!(!ahead.covers(step + 1));
+        assert!(!WriteAhead::NONE.covers(1));
+        assert!(!WriteAhead::NONE.covers(0));
     }
 
     #[test]

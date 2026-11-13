@@ -389,8 +389,7 @@ impl LdmState {
                 // candidate.
                 let mut best: Option<(usize, usize, usize, u32)> = None;
                 let bucket = hash << params.bucket_size_log;
-                for slot in bucket..bucket + ents_per_bucket {
-                    let cur = self.hash_table[slot];
+                for &cur in &self.hash_table[bucket..bucket + ents_per_bucket] {
                     if cur.checksum != checksum || cur.offset <= lowest_index {
                         continue;
                     }

@@ -135,18 +135,23 @@ How the repository measures, tests, proves and publishes itself.
 - **Speed.** A `Backend` (`fearless_simd` level) is chosen once per codec
   and dispatched once per block. In the cold comparison against zstd 1.5.7
   ([benchmarks](../docs/benchmarks/README.md), Ryzen 9 7950X under KVM,
-  AVX-512, 2026-11-09, host loaded by other tenants) compression runs at a
-  median 1.248x the reference's speed, faster in 174 of 192 dataset/level
-  pairs, and decompression at 1.517x, faster in 151. These medians include
-  empty and tiny inputs. The encoder still trails on Alice at ten levels
-  (0.84-0.998x in that noisy run; 0.94-0.99x on 2026-10-30), and on the
-  whole `silesia.tar` in lzbench at most levels; `fast` executes about 127
-  instructions per match against the reference's 91
-  ([encoder core](encoder-core.md#known-gaps)). The decoder trails on
-  compressible text (Alice 0.948x and cyclic Alice 0.937x in the median)
-  and in lzbench at every level (0.92-0.96x of zstd): its four-stream
-  Huffman loop executes about 242 instructions per round against the
-  reference's 221
+  AVX-512, 2026-11-12, host shared with other tenants) compression runs at
+  a median 1.216x the reference's speed, faster in 174 of 192 dataset/level
+  pairs, and decompression at 1.521x, faster in 152. These medians include
+  empty and tiny inputs. The encoder still trails on Alice at nine levels
+  (0.82-0.97x in that noisy run), and on the whole `silesia.tar` in
+  lzbench by up to 2.4% at `--fast` 5 and 1 and at levels 1, 2, 5 and 8
+  (2026-11-12, fastest of three rounds: 0.996x, 1.002x and 0.993x at
+  `--fast` 5, 3 and 1, 0.979x, 0.989x and 1.011x at levels 1 to 3, 0.976x
+  and 0.990x at levels 5 and 8, 1.05-1.25x at levels 11 to 22): the
+  `fast` finder's path from a match to the next search still reloads and
+  stores about 25 values ([encoder core](encoder-core.md#known-gaps)).
+  The decoder trails on compressible text (Alice 0.911x and cyclic Alice
+  0.963x in the median); in lzbench it is level with zstd at `--fast` 5
+  and 3 (1.006x and 0.998x), at 0.987x at `--fast` 1 and behind from
+  level 1 up (0.947-0.965x at levels 1 to 8, 0.936-0.966x at levels 11
+  to 22): its four-stream Huffman loops, now in lockstep like the
+  reference's assembly loops, still take about 15% more cycles than those
   ([decoder fast paths](decoder-performance.md#known-gaps)).
 - **Parallel frames.** They decode anywhere, but they are not identical to
   the serial encoder's frames or to ZSTDMT's: segments are primed with their
