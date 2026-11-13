@@ -118,7 +118,7 @@ How the repository measures, tests, proves and publishes itself.
 
 | Specification | Scope |
 | --- | --- |
-| [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, and the libFuzzer adapters ClusterFuzzLite builds. |
+| [Fuzzing](fuzzing.md) | AFL targets, input layout, corpora, regressions and campaigns, the libFuzzer adapters ClusterFuzzLite builds, and how the C oracle stays a release build under fuzzing `CFLAGS`. |
 | [Formal verification](formal-verification.md) | Charon/Aeneas translation to Lean 4, the RFC 8878 transcription, function specifications, round trips, trusted base and the RFC coverage checklist. |
 | [CI](ci.md) | Workflows and the checks they run: fuzzing, Miri, AddressSanitizer and hotpath Cloud benchmarks. |
 | [Benchmarking](benchmarking.md) | The cold C-versus-mzstd comparison harness: corpus, preflight validation, Criterion sampling and the report and chart generators. |

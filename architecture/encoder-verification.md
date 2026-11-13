@@ -50,8 +50,11 @@ Index overflow correction normally needs gigabytes of input. Building with
 `MZSTD_OVERFLOW_CORRECT_FREQUENTLY=1` makes both sides run it as early as
 possible: mzstd through `window::OVERFLOW_CORRECT_FREQUENTLY`, and the C
 library through `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, which zstd-ffi's
-build script sets from the same variable. The same differential suites then
-cover the correction path:
+build script sets from the same variable. A fuzzing toolchain's
+`-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` does not turn it on, because
+the build script undefines that macro in the oracle (see
+[fuzzing](fuzzing.md#the-oracle-build-under-fuzzing-toolchains)). The same
+differential suites then cover the correction path:
 
 ```sh
 MZSTD_OVERFLOW_CORRECT_FREQUENTLY=1 CARGO_TARGET_DIR=target-ocf \

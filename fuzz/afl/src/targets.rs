@@ -431,6 +431,8 @@ pub fn reference_parameters(data: &[u8]) {
     let mut config = EncoderConfig::default();
     let mut comparable = true;
     let mut reference = Params::default();
+    let mut ldm_hash_log = 0;
+    let mut ldm_hash_rate_log = 0;
     for &(id, value) in &pairs {
         let ours = CParameter::try_from((id, value));
         let theirs = oracle::set_parameter(id, value);
@@ -440,12 +442,23 @@ pub fn reference_parameters(data: &[u8]) {
                 reference = reference.with(id, value);
                 // Tables sized by an explicit log would dwarf the input.
                 comparable &= !(matches!(id, 101..=103 | 161) && value > 20);
+                match id {
+                    161 => ldm_hash_log = value,
+                    164 => ldm_hash_rate_log = value,
+                    _ => {}
+                }
             }
             (Err(ConfigError::Unsupported { .. }), Ok(())) => comparable = false,
             (Err(_), Err(_)) => {}
             _ => panic!("({id}, {value}): {ours:?} vs {theirs:?}"),
         }
     }
+    // Without an explicit LDM hash log, `ZSTD_ldm_adjustParameters` derives
+    // it as `windowLog - hashRateLog` in unsigned arithmetic, and a rate
+    // above the window (at least 10, which is what the at most 256 bytes
+    // below shrink it to) wraps to the 2^30-entry maximum table, which both
+    // implementations allocate.
+    comparable &= ldm_hash_log != 0 || ldm_hash_rate_log <= 10;
     let input = &input[..input.len().min(256)];
     if comparable && let Ok(expected) = oracle::compress2(input, &reference) {
         let ours = Compressor::new(config)

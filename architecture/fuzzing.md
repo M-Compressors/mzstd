@@ -53,7 +53,7 @@ the payload, so every target shares one seed corpus.
 | `encoder_session` | A session driven by random chunks, flushes and output capacity, with calls alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
 | `compressor_lifecycle` | Reuse, `reconfigure` and `trim(ReleaseAll)` never change a frame. |
 | `parallel` | Parallel frames decode with the reference and are identical for 1–8 tasks run in reverse order, whether the batch borrows the input or reads it from a `SeekSource` through `prepare_source` with each task on a detached thread. A session (windows 1–4, an optional flush, calls alternating `process` and `process_uninit`, which must leave every byte past `produced` untouched) and the `ParallelEncoderWriter`/`ParallelEncoderReader` adapters (one executor thread each) decode; with a declared size, or an input within one segment, and no flush they equal the batch frame; the writer always equals the session driven with the same writes and flush. |
-| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default; `CParameter::try_from((id, value))` agrees with `ZSTD_CCtx_setParameter` on acceptance, and accepted lists compress to the reference's bytes. |
+| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default; `CParameter::try_from((id, value))` agrees with `ZSTD_CCtx_setParameter` on acceptance, and accepted lists compress to the reference's bytes, except lists whose tables would dwarf the input: an explicit hash, chain or LDM hash log above 20, or an LDM hash rate log above 10 without an LDM hash log, which `ZSTD_ldm_adjustParameters` wraps to a 2^30-entry table. |
 | `decompress` | Raw bytes: no panic; anything mzstd accepts, `ZSTD_decompressStream` accepts with the same output; `decompress_to_slice` agrees with `decompress`; `decompress_to_uninit` returns the same result and bytes as `decompress_to_slice` and leaves every byte past it untouched. |
 | `decode_streaming` | Two piece sizes, then a frame: a session, with calls alternating `process` and `process_uninit` (which must leave every byte past `produced` untouched), agrees with one-shot decoding and never over-reports progress. `decode_roundtrip` and `decode_dictionary` drive their sessions the same way. |
 | `decode_roundtrip` | Parameter header: frames the reference writes with that configuration decode to the payload, one-shot and in pieces. |
@@ -204,6 +204,27 @@ and reports a write into the band as `CAPACITY_OVERRUN`; mzstd returns
 such frames. A 5-minute run from the findings afterwards found no crashes
 (2,420 new corpus items), where 45 seconds had found 13 before.
 
+The ClusterFuzzLite run of 2026-11-13 reported two findings, neither in
+mzstd. `differential_c` failed on a level 6 `Lazy2` frame with
+`ZSTD_c_targetCBlockSize` 1500, where the reference wrote 55,891 bytes and
+mzstd 55,884. OSS-Fuzz images put `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`
+in `CFLAGS`, and with it zstd 1.5.7's superblock encoder drops the two
+fallbacks to a raw block that keep its output readable by zstd 1.3.4 and
+1.4.0 decoders, so the C oracle in CI was not the release library mzstd
+matches. The input reproduces locally only when built with that `CFLAGS`.
+zstd-ffi now force-includes `shim/production.h`, which undefines the macro
+in every translation unit (see
+[the oracle build under fuzzing toolchains](#the-oracle-build-under-fuzzing-toolchains)),
+and the input is kept as
+`regressions/differential_c/superblock-fuzzing-build-mode.bin`.
+`parameter_parsing` ran out of memory in `ZSTD_compress2`: LDM with
+`ZSTD_c_ldmHashRateLog` 17 and no LDM hash log on a 256-byte input, whose
+window shrinks to 10, makes `windowLog - hashRateLog` wrap, and the LDM hash
+log is clamped to 30 (an 8 GiB table). mzstd reproduces that arithmetic to
+stay byte-identical, so `reference_parameters` no longer compares such lists;
+the input is kept as
+`regressions/parameter_parsing/ldm-hash-rate-above-window.bin`.
+
 ## libFuzzer adapters and ClusterFuzzLite
 
 `fuzz/libfuzzer` is a cargo-fuzz package excluded from the root workspace,
@@ -290,6 +311,36 @@ cuts payloads to 64 KiB, the largest regression is under the 256 KiB payload
 cap, and libFuzzer guesses its default maximum input length from the
 corpus, so dropping the larger regressions would also stop it from generating
 inputs that span several blocks. No target has a dictionary.
+
+### The oracle build under fuzzing toolchains
+
+The image's `CFLAGS` carry `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`,
+which zstd reads to change behaviour: the superblock encoder skips its
+raw-block fallbacks, `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY` defaults to 1
+and the decoder stops checking dictionary IDs. `cc` appends `CFLAGS` after
+every flag a build script sets, so `zstd-ffi/build.rs` cannot cancel the
+macro with `-U`. It instead force-includes `shim/production.h` (`-include`,
+or `/FI` for MSVC) into the library, the seekable format and the shim. The
+preprocessor reads forced includes after all command-line definitions, so
+the header's `#undef` wins, and all units agree on the layout of contexts
+whose fields depend on the macro. `shim/zstd_shim.c` fails the build with
+`#error` if the macro is still defined. Only `MZSTD_OVERFLOW_CORRECT_FREQUENTLY`
+turns on frequent overflow correction, on both sides at once.
+
+```mermaid
+sequenceDiagram
+    participant Img as ClusterFuzzLite image
+    participant Cargo as cargo fuzz build
+    participant BS as zstd-ffi build.rs
+    participant CC as C compiler
+    Img->>Cargo: CFLAGS with -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    Cargo->>BS: run build script
+    BS->>CC: -include shim/production.h, -D..., then CFLAGS last
+    CC->>CC: apply -D/-U in order: macro defined
+    CC->>CC: forced include: #undef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    CC->>CC: compile zstd as the release library
+    Note over CC: zstd_shim.c: #error if the macro survived
+```
 
 The workflows that run these binaries are described in
 [CI](ci.md#clusterfuzzlite).

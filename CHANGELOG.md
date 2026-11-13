@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **The zstd oracle stays a release build under fuzzing toolchains.**
+  ClusterFuzzLite's `CFLAGS` define `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`,
+  which makes zstd 1.5.7 drop its raw-block fallbacks in `ZSTD_c_targetCBlockSize`
+  frames, run overflow correction on every block and skip the decoder's
+  dictionary ID check; `differential_c` then failed on a frame mzstd encodes
+  exactly like release zstd. `zstd-ffi`'s build script now force-includes
+  `shim/production.h`, which undefines the macro in every unit, and the shim
+  refuses to compile if it is still defined. The input is kept as
+  `fuzz/afl/regressions/differential_c/superblock-fuzzing-build-mode.bin`.
+- **`parameter_parsing` no longer allocates an 8 GiB LDM table.** An LDM hash
+  rate log above the window log with no LDM hash log wraps zstd's derived
+  hash log to 30 in both implementations; `reference_parameters` now skips
+  comparing such lists. The ClusterFuzzLite input is kept as
+  `fuzz/afl/regressions/parameter_parsing/ldm-hash-rate-above-window.bin`.
+
 ## [v0.2.14](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.14) - 2026-11-12
 
 - **Faster large inputs in lzbench: sequence encoding, the `fast` finder,

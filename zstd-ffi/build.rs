@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 const LIB: &str = "vendor/zstd/lib";
 const SEEKABLE: &str = "vendor/zstd/contrib/seekable_format";
+/// Header that keeps the oracle a release build under fuzzing `CFLAGS`.
+const PRODUCTION_HEADER: &str = "shim/production.h";
 
 fn c_sources(directory: &str) -> Vec<PathBuf> {
     let mut sources = fs::read_dir(directory)
@@ -22,8 +24,21 @@ fn c_sources(directory: &str) -> Vec<PathBuf> {
 /// portably. None of these changes compressed bytes: multithreading is opt-in
 /// per context, legacy support only widens what the decoder accepts, and the
 /// assembly decoder is an alternative to the C one with identical results.
+///
+/// Every unit also force-includes `shim/production.h`, which undefines
+/// `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`: fuzzing toolchains put it in
+/// `CFLAGS`, where it changes the reference's compressed bytes.
 fn configure(build: &mut cc::Build) {
+    let production = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join(PRODUCTION_HEADER);
+    let force_include = if build.get_compiler().is_like_msvc() {
+        "/FI"
+    } else {
+        "-include"
+    };
     build
+        .flag(force_include)
+        .flag(production)
         .include(LIB)
         .include(format!("{LIB}/common"))
         .define("ZSTD_LEGACY_SUPPORT", "0")

@@ -8,6 +8,13 @@
  * behaviour of its own.
  */
 
+/* build.rs force-includes production.h into every unit of the reference;
+ * this unit is compiled with the same flags, so it stops a build in which
+ * that include did not take effect. */
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+#error "the zstd oracle must be built as a release library; see production.h"
+#endif
+
 #define ZSTD_STATIC_LINKING_ONLY
 #define FSE_STATIC_LINKING_ONLY
 #define HUF_STATIC_LINKING_ONLY
