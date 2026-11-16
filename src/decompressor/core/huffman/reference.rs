@@ -690,7 +690,10 @@ mod tests {
         // literals and never reads it.
         let table = with_kind(example_table(), TableKind::Pairs);
         let symbols = message(&table, 6, 5);
-        assert_eq!(port(&table, &encode_four(&table, &symbols), 6, true), Ok(symbols));
+        assert_eq!(
+            port(&table, &encode_four(&table, &symbols), 6, true),
+            Ok(symbols)
+        );
     }
 
     #[test]
