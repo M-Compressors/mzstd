@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The reference Huffman port no longer overflows on eight pair-decoded
+  literals.** When the exact decoder rejected a one-stream section of exactly
+  eight literals decoded with pair rows (a dictionary's table reused by a
+  treeless block), `HUF_decodeStreamX2`'s port computed `end - 9` before
+  comparing it, which panics in builds with overflow checks; it now tests
+  `p + 9 < end`, as the reference's pointer comparison does. The general
+  four-stream path likewise no longer computes `oend - 7` for six or seven
+  literals. The ClusterFuzzLite
+  input is kept as
+  `fuzz/afl/regressions/decode_dictionary/cfl-pair-stream-eight-literals.bin`.
 - **The zstd oracle stays a release build under fuzzing toolchains.**
   ClusterFuzzLite's `CFLAGS` define `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`,
   which makes zstd 1.5.7 drop its raw-block fallbacks in `ZSTD_c_targetCBlockSize`
