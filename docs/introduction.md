@@ -13,7 +13,7 @@
 
 ```toml
 [dependencies]
-mzstd = "0.2.14"
+mzstd = "0.2.15"
 ```
 
 ```rust

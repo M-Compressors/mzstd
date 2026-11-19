@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [v0.2.15](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.15) - 2026-11-19
+
 - **The reference Huffman port no longer overflows on eight pair-decoded
   literals.** When the exact decoder rejected a one-stream section of exactly
   eight literals decoded with pair rows (a dictionary's table reused by a

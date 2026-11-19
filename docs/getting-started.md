@@ -8,14 +8,14 @@ Requires **Rust 1.89+**.
 ```sh
 cargo new zstd-demo
 cd zstd-demo
-cargo add mzstd@0.2.14
+cargo add mzstd@0.2.15
 ```
 
 Or add this to `Cargo.toml`:
 
 ```toml
 [dependencies]
-mzstd = "0.2.14"
+mzstd = "0.2.15"
 ```
 
 ## Compress and decompress
