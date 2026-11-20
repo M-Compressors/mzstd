@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update the optional `hotpath` profiling dependency to 0.32.0.
+
 ## [v0.2.15](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.15) - 2026-11-19
 
 - **The reference Huffman port no longer overflows on eight pair-decoded
