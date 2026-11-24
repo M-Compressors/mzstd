@@ -48,7 +48,7 @@
   the state update, as mzstd's already does (see
   `architecture/decoder-performance.md#sequences`), and there is nothing to
   port.
-- Update the optional `hotpath` profiling dependency to 0.32.0.
+- Update the optional `hotpath` profiling dependency to 0.33.0.
 
 ## [v0.2.15](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.15) - 2026-11-19
 
