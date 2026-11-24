@@ -56,7 +56,7 @@ pub enum InvalidDataKind {
     #[error("Huffman tree description")]
     HuffmanTable,
     /// A Huffman literal stream the reference decoder rejects: one that
-    /// does not end exactly at its first bit where zstd 1.5.7 checks that,
+    /// does not end exactly at its first bit where zstd checks that,
     /// one that reads too far into the bytes before it, or a malformed
     /// jump table.
     #[error("Huffman bitstream")]

@@ -1,7 +1,7 @@
 //! Raw Rust bindings to the vendored Zstandard C library, plus a small safe
 //! layer for tests and benchmarks.
 //!
-//! The bundled C source is zstd v1.5.7, compiled single-threaded without
+//! The bundled C source is zstd v1.6.0, compiled single-threaded without
 //! legacy-format support. This crate is the oracle `mzstd` is checked against:
 //! its raw functions keep the pointer-based semantics of the upstream API and
 //! require every buffer validity, lifetime and aliasing invariant documented in
@@ -23,7 +23,7 @@ extern crate alloc;
 use core::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void};
 
 /// Upstream zstd version vendored by this crate.
-pub const UPSTREAM_VERSION: &str = "1.5.7";
+pub const UPSTREAM_VERSION: &str = "1.6.0";
 
 /// `ZSTD_CONTENTSIZE_UNKNOWN`.
 pub const ZSTD_CONTENTSIZE_UNKNOWN: c_ulonglong = u64::MAX;

@@ -1,4 +1,4 @@
-//! Parallel compression against zstd 1.5.7's single-threaded encoder.
+//! Parallel compression against zstd 1.6.0's single-threaded encoder.
 //!
 //! One 16 MiB input is compressed in 1 MiB segments with four executor
 //! threads through a batch, a session and the parallel writer, after

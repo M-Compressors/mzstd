@@ -1,7 +1,7 @@
 # Benchmarking
 
 mzstd has two benchmark layers. The library's own Criterion benches
-(`benches/`) time warm contexts and streaming against zstd 1.5.7 for
+(`benches/`) time warm contexts and streaming against zstd 1.6.0 for
 development work. The implementation comparison (`benchmarks/comparison/`)
 times both libraries' cold one-shot APIs on a fixed corpus and produces the
 published reports in [`docs/benchmarks/`](../docs/benchmarks/README.md).
@@ -59,7 +59,7 @@ graph TD
         DecDocs --> Docs
     end
     Core --> Mzstd["mzstd (path dependency)"]
-    Core --> Ffi["zstd-ffi: zstd 1.5.7 C library"]
+    Core --> Ffi["zstd-ffi: zstd 1.6.0 C library"]
     Core --> Alice["testdata/alice29.txt"]
     Docs --> Out["docs/benchmarks/{encoders,decoders}/"]
     Plot --> Out
@@ -98,7 +98,7 @@ decoder cases per run (two implementations each).
 sequenceDiagram
     participant B as bench binary
     participant C as core::run / decoder::run
-    participant Z as zstd 1.5.7
+    participant Z as zstd 1.6.0
     participant M as mzstd
     participant Cr as Criterion
     participant R as report.py

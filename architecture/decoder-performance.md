@@ -3,7 +3,7 @@
 How `decompressor::core` regenerates blocks at speed: SIMD dispatch, the
 bit readers, the Huffman and sequence loops, the copies, and the output
 paths. Every fast path decodes exactly the bits the reference decoder
-(zstd 1.5.7) reads, in the same order, so it accepts and rejects the same
+(zstd 1.6.0) reads, in the same order, so it accepts and rejects the same
 streams as the straightforward port it replaced; only refill timing and
 copy granularity differ. The crate stays `forbid(unsafe_code)`: bounds are
 checked, and the code is shaped so the compiler can drop most of the
@@ -369,7 +369,18 @@ flowchart TD
   Constructing a count uses an exhaustive match, which compiles to range
   masking without the memory lookup that indexing an array of enum variants
   required. The sequence loop still holds references to rows and reads
-  fields as needed.
+  fields as needed: the next-state base and bit count are read at the state
+  update, not copied into locals with the rest of the row. zstd 1.6.0's
+  x86-64 `ZSTD_decodeSequence` took the same shape, which is the whole of
+  its decompression gain over 1.5.7 on this host: one silesia.tar decode
+  under callgrind ran 6.1% fewer instructions in
+  `ZSTD_decompressSequences` at level 1 (1300.8M to 1221.6M) and 6.2% at
+  level 19, a 1.5.7 build with only that change matched 1.6.0 to 0.03%,
+  and 1.6.0's `bitstream.h` and `size_t` wildcopy changed nothing. The
+  same experiment on mzstd (2026-11-24, `x86-64-v3`): copying the six
+  fields up front as 1.5.7 does costs 4.4% more instructions in
+  `SequenceTables::execute` at level 1 (1383.5M to 1447.0M) and 4.3% at
+  level 19, so there was nothing to port.
 - Basic sequence modes borrow immutable LL, OF and ML decoding rows built
   at compile time from the predefined distributions. A `TableView` carries
   the rows and initial-state width, whether the rows are static, owned by

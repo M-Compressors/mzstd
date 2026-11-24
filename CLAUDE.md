@@ -29,7 +29,7 @@ explicitly an upstream-vendor update.
 - Document every public item. Include `#Examples`, `# Errors`, `# Panics`, and `# Safety`
   sections where applicable, plus runnable examples for important APIs.
 - Do not use ready zstd dependencies.
-- The encoder's contract is byte identity with zstd 1.5.7 (`ZSTD_compress2`
+- The encoder's contract is byte identity with zstd 1.6.0 (`ZSTD_compress2`
   for one-shot calls, `ZSTD_compressStream2` for sessions). Any change to
   `compressor::core` must keep every differential test passing; port the
   reference's control flow rather than "improving" a heuristic.

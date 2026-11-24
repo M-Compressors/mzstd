@@ -12,7 +12,7 @@
 | `huffman-stream-ends/min-460c45ad.zst` | 3,787 | `97e8a85fedd8b4df7fb819954c3eda92b5b654a401fe70ab0a5f3960ab526fbb` | The same, from another find. |
 
 The `huffman-stream-ends` frames are single compressed blocks without a
-checksum whose four Huffman streams are not consumed exactly. zstd 1.5.7
+checksum whose four Huffman streams are not consumed exactly. zstd (1.5.7 and 1.6.0)
 accepts them through its fast four-stream decoder, which checks only the
 regenerated length; `tests/decoder_huffman_ends.rs` requires this decoder
 to produce the reference's bytes for them.

@@ -1,6 +1,6 @@
 # AFL fuzz targets
 
-This package fuzzes the mzstd encoder and decoder against zstd v1.5.7. It is
+This package fuzzes the mzstd encoder and decoder against zstd v1.6.0. It is
 excluded from the workspace because its binaries link AFL's runtime; the
 target bodies also replay the committed regression corpus through
 `cargo afl test`.

@@ -12,6 +12,7 @@ stable, single cells are good to about ±10%.
 | Compression speed and size, 384 cold cases | [Levels -5 to 22](encoders/README.md), [report](encoder-comparison.md) | [CSV](encoder-comparison.csv), [environment](encoder-comparison-environment.json), [size manifest](encoder-comparison-2026-11-12/sizes.csv), [Criterion samples](encoder-comparison-2026-11-12/criterion-samples.json.gz) |
 | Decompression speed on identical frames, 384 cold cases | [Source levels -5 to 22](decoders/README.md), [report](decoder-comparison.md) | [CSV](decoder-comparison.csv), [environment](decoder-comparison-environment.json), [size manifest](decoder-comparison-2026-11-12/sizes.csv), [Criterion samples](decoder-comparison-2026-11-12/criterion-samples.json.gz) |
 | lzbench on `silesia.tar`, one frame | [Report](lzbench-2026-11-12.md) | Raw output of every round in the report |
+| lzbench, zstd 1.6.0 update: before (1.5.7) and after (1.6.0) on `silesia.tar` | [Report](lzbench-2026-11-24.md) | Raw output of every round in the report |
 
 ## Compression
 
@@ -55,6 +56,11 @@ compression gained 3.7-4.4 points at the `--fast` levels and 1.6-3.7
 points at levels 1 to 3. Compression from level 5 up moves by up to 33
 points between rounds on this host.
 [Command, environment, raw output of every round](lzbench-2026-11-12.md).
+The [zstd 1.6.0 update run](lzbench-2026-11-24.md) (2026-11-24, i7-13700KF)
+compares mzstd before and after the update, each against the zstd it is
+byte-identical to: sizes match at every level (level 22 changes with
+1.6.0's LDM), and speed moves within the run-to-run noise (median ratios
+0.998 for compression and 0.994 for decompression).
 
 ## How to interpret the results
 

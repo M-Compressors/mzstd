@@ -100,10 +100,15 @@ impl LdmParams {
             }
         }
         if self.hash_log == 0 {
-            self.hash_log = self
-                .window_log
-                .wrapping_sub(self.hash_rate_log)
-                .clamp(params::HASHLOG_MIN, params::HASHLOG_MAX);
+            // A window no larger than the hash rate takes the smallest
+            // table (zstd 1.6.0); 1.5.7 wrapped the difference around and
+            // took the largest.
+            self.hash_log = if self.window_log <= self.hash_rate_log {
+                params::HASHLOG_MIN
+            } else {
+                (self.window_log - self.hash_rate_log)
+                    .clamp(params::HASHLOG_MIN, params::HASHLOG_MAX)
+            };
         }
         if self.min_match_length == 0 {
             self.min_match_length = LDM_MIN_MATCH_LENGTH;
@@ -1000,5 +1005,31 @@ mod tests {
         };
         explicit.adjust(&cparams);
         assert_eq!(explicit.hash_rate_log, cparams.window_log - 20);
+    }
+
+    #[test]
+    fn ldm_hash_log_of_a_window_within_the_hash_rate_is_the_minimum() {
+        let cparams = params::level_cparams(22, CONTENT_SIZE_UNKNOWN);
+        let mut small = LdmParams {
+            hash_rate_log: cparams.window_log,
+            ..LdmParams::default()
+        };
+        small.adjust(&cparams);
+        assert_eq!(small.hash_log, params::HASHLOG_MIN);
+        let mut larger = LdmParams {
+            hash_rate_log: cparams.window_log + 1,
+            ..LdmParams::default()
+        };
+        larger.adjust(&cparams);
+        assert_eq!(larger.hash_log, params::HASHLOG_MIN);
+        let mut regular = LdmParams {
+            hash_rate_log: 4,
+            ..LdmParams::default()
+        };
+        regular.adjust(&cparams);
+        assert_eq!(
+            regular.hash_log,
+            (cparams.window_log - 4).clamp(params::HASHLOG_MIN, params::HASHLOG_MAX)
+        );
     }
 }

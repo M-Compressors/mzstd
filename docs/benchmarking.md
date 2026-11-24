@@ -1,8 +1,9 @@
 # Benchmarks and profiling
 
 The independent [implementation comparison](../benchmarks/comparison/Cargo.toml)
-measures `mzstd` against zstd 1.5.7, the C library built from the vendored
-submodule by `zstd-ffi`. Browse the [benchmark results index](benchmarks/README.md)
+measures `mzstd` against the C library built from the vendored submodule by
+`zstd-ffi`: zstd 1.6.0 since the update from 1.5.7. The published results
+below were measured against 1.5.7. Browse the [benchmark results index](benchmarks/README.md)
 for one page per compression level, with medians across all eight datasets,
 vertical speed/size bars, and complete timings. The strongest mzstd comparisons
 appear first; the pages explain the ranking and retain every dataset.
@@ -52,7 +53,7 @@ the level set, no dictionary and no explicit flush.
 
 | Implementation | Version | Timed API |
 | --- | --- | --- |
-| zstd C | 1.5.7, pinned submodule | `ZSTD_createCCtx`, `ZSTD_CCtx_setParameter(level)`, `ZSTD_compress2` into a `ZSTD_compressBound` buffer, `ZSTD_freeCCtx` |
+| zstd C | 1.6.0, pinned submodule | `ZSTD_createCCtx`, `ZSTD_CCtx_setParameter(level)`, `ZSTD_compress2` into a `ZSTD_compressBound` buffer, `ZSTD_freeCCtx` |
 | mzstd | Local checkout | Construct `Compressor` for the level, then `compress` |
 
 This is **cold end-to-end compression**: configuration, construction, scratch and
@@ -134,7 +135,7 @@ the encoder comparison and accept the same Criterion overrides.
 
 | Decoder | Version | Timed API |
 | --- | --- | --- |
-| zstd C | 1.5.7, pinned submodule | `ZSTD_getFrameContentSize`, then `ZSTD_decompress` into an uninitialized buffer of exactly that size |
+| zstd C | 1.6.0, pinned submodule | `ZSTD_getFrameContentSize`, then `ZSTD_decompress` into an uninitialized buffer of exactly that size |
 | mzstd | Local checkout | Construct `Decompressor`, then `decompress` |
 
 This measures cold native APIs, including construction, allocation, decode and

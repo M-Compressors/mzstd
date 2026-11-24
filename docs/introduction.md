@@ -1,7 +1,7 @@
 # Zstandard compression and decompression in safe Rust
 
 <div class="landing">
-<p class="lede">mzstd is a port of the zstd 1.5.7 encoder that writes the same bytes, plus an independent Rust decoder. Reuse working memory between payloads, plug into <code>Read</code> and <code>Write</code>, drive either codec with your own buffers, and schedule parallel compression on your own threads.</p>
+<p class="lede">mzstd is a port of the zstd 1.6.0 encoder that writes the same bytes, plus an independent Rust decoder. Reuse working memory between payloads, plug into <code>Read</code> and <code>Write</code>, drive either codec with your own buffers, and schedule parallel compression on your own threads.</p>
 <div class="actions">
 <a class="primary" href="getting-started.md">Get started</a>
 <a href="README.md">Choose your API</a>
@@ -77,7 +77,7 @@ against zstd 1.5.7, including the cases where mzstd is slower.
 ## What you can rely on
 
 - **Byte-identical encoder.** For the same input and parameters, serial
-  compression writes exactly the bytes of zstd 1.5.7. See
+  compression writes exactly the bytes of zstd 1.6.0. See
   [what is claimed and how it is checked](correctness.md).
 - **Safe implementation, not a C wrapper.** Production code forbids `unsafe`;
   SIMD goes through `fearless_simd`. The reference C library is only a test

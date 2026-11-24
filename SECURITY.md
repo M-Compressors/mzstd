@@ -25,7 +25,7 @@ Please report privately anything that lets untrusted input cause:
 - decoded output that silently differs from the original data without an
   error, for example when a checksum should have been verified.
 
-An encoder output that differs from zstd 1.5.7 but still decodes correctly is a
+An encoder output that differs from zstd 1.6.0 but still decodes correctly is a
 correctness bug rather than a vulnerability; open a regular issue with the
 "Output differs from zstd" template.
 

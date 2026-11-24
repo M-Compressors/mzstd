@@ -527,14 +527,15 @@ fn output_capacity_boundaries_agree_with_the_reference() {
     }
 }
 
-/// zstd 1.5.7 writes past a destination somewhat smaller than a
-/// target-block frame (see `zstd-ffi/tests/oracle_capacity_overrun.rs`):
-/// at every capacity where the reference overruns, mzstd stays inside the
-/// buffer and fails with `OutputTooSmall`, and at every other capacity
-/// it matches the reference. The 1,273-byte input reproduces the
-/// `output_capacity` fuzz finding of 2026-11-09.
+/// zstd 1.5.7 wrote past a destination somewhat smaller than a
+/// target-block frame (see `zstd-ffi/tests/oracle_capacity_overrun.rs`),
+/// where mzstd stays inside the buffer and fails with `OutputTooSmall`.
+/// zstd 1.6.0 checks the room as mzstd does (#4981), so at every capacity
+/// the two agree and the reference never writes into the guard band. The
+/// 1,273-byte input reproduces the `output_capacity` fuzz finding of
+/// 2026-11-09.
 #[test]
-fn capacities_the_reference_overruns_fail_with_output_too_small() {
+fn capacities_the_reference_overran_fail_with_output_too_small() {
     let config = config(4, MAX)
         .with_checksum(true)
         .with_content_size(false)
@@ -573,7 +574,7 @@ fn capacities_the_reference_overruns_fail_with_output_too_small() {
             }
         }
     }
-    assert!(overruns > 0, "the inputs reach the reference's overrun");
+    assert_eq!(overruns, 0, "zstd 1.6.0 no longer overruns");
 }
 
 // ---- streaming --------------------------------------------------------

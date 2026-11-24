@@ -2,7 +2,7 @@
 
 C ABI for [mzstd](https://crates.io/crates/mzstd): one-shot and streaming
 Zstandard compression and decompression into caller-owned buffers,
-byte-identical to zstd 1.5.7's `ZSTD_compress` and `ZSTD_compressStream2`.
+byte-identical to zstd 1.6.0's `ZSTD_compress` and `ZSTD_compressStream2`.
 
 ## Build
 

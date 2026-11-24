@@ -1,4 +1,4 @@
-//! Framed containers against zstd 1.5.7's contrib seekable format.
+//! Framed containers against zstd 1.6.0's contrib seekable format.
 //!
 //! Each case compresses identical bytes at the same level with 64 KiB
 //! frames: `FramedCompressor::compress_into` with one reused owner (one

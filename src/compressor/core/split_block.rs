@@ -213,7 +213,7 @@ impl SeqStore {
         let long_length = match self.long_length {
             LongLength::None => LongLength::None,
             LongLength::Literal(pos) | LongLength::Match(pos)
-                if (pos as usize) < start || pos as usize > end =>
+                if (pos as usize) < start || pos as usize >= end =>
             {
                 LongLength::None
             }
@@ -267,6 +267,11 @@ fn derive_splits_helper(
     };
     if first_size + second_size < original_size {
         derive_splits_helper(engine, original, splits, start, mid);
+        // A block of many short matches can fill the split budget inside
+        // the first half (zstd 1.6.0); 1.5.7 wrote past its split array.
+        if splits.len() >= MAX_NB_BLOCK_SPLITS {
+            return;
+        }
         splits.push(mid as u32);
         derive_splits_helper(engine, original, splits, mid, end);
     }
@@ -441,4 +446,94 @@ fn split_block_internal(
     }
     engine.prev.rep = reps.d;
     Ok(c_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compressor::core::params::Strategy;
+    use crate::compressor::core::seq_store::SeqDef;
+
+    /// Four sequences of one literal and a three-byte repeat match, one of
+    /// them long (zstd's `test_blockSplitter_longLengthBoundaries`).
+    fn store_with_long_length(long_length: LongLength) -> SeqStore {
+        let literals = 4 + if matches!(long_length, LongLength::Literal(_)) {
+            0x10000
+        } else {
+            0
+        };
+        SeqStore::from_parts(
+            alloc::vec![
+                SeqDef {
+                    off_base: 1,
+                    lit_length: 1,
+                    ml_base: 0,
+                };
+                4
+            ],
+            alloc::vec![0; literals],
+            long_length,
+            4,
+            literals,
+        )
+    }
+
+    #[test]
+    fn chunks_keep_a_long_length_only_inside_their_range() {
+        for long_length in [LongLength::Literal(2), LongLength::Match(2)] {
+            let original = store_with_long_length(long_length);
+            for start in 0..=4 {
+                for end in start..=4 {
+                    let chunk = original.chunk(start, end);
+                    let expected = match long_length {
+                        _ if !(start..end).contains(&2) => LongLength::None,
+                        LongLength::Literal(pos) => LongLength::Literal(pos - start as u32),
+                        LongLength::Match(pos) => LongLength::Match(pos - start as u32),
+                        LongLength::None => LongLength::None,
+                    };
+                    assert_eq!(chunk.long_length, expected, "[{start}, {end})");
+                    assert_eq!(chunk.nb_seq(), end - start);
+                }
+            }
+        }
+    }
+
+    /// zstd's `FUZ_blockSplitHash`.
+    const fn split_hash(mut x: u32) -> u32 {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^ (x >> 16)
+    }
+
+    #[test]
+    fn many_short_matches_stop_at_the_split_budget() {
+        // zstd's `test_blockSplitLimit`: 38,400 three-byte matches over
+        // zeroes in groups of 150 with distinct offset codes make enough
+        // dyadic splits worthwhile to exhaust the budget in the first half.
+        let sequences = (0..38_400u32)
+            .map(|i| {
+                let code = 3 + split_hash(i / 150) % 10;
+                SeqDef {
+                    off_base: offset_to_offbase((1 << code) + i % 4),
+                    lit_length: if i == 0 { 12_800 } else { 0 },
+                    ml_base: 0,
+                }
+            })
+            .collect();
+        let original = SeqStore::from_parts(
+            sequences,
+            alloc::vec![0; 12_800],
+            LongLength::None,
+            128_000 / 3,
+            128_000,
+        );
+        let mut engine = Engine::new();
+        engine.applied.cparams.strategy = Strategy::BtUltra2;
+        let mut splits = Vec::new();
+        derive_splits_helper(&mut engine, &original, &mut splits, 0, original.nb_seq());
+        assert_eq!(splits.len(), MAX_NB_BLOCK_SPLITS);
+        assert!(splits.is_sorted());
+    }
 }

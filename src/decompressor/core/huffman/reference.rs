@@ -1,6 +1,6 @@
 //! The reference decoder's verdict on literal streams that are not consumed
 //! exactly: a port of the stream decoders of zstd 1.5.7's
-//! `huf_decompress.c`, run only after the exact decoder has rejected a
+//! `huf_decompress.c`, whose x86-64 verdicts 1.6.0 keeps, run only after the exact decoder has rejected a
 //! section.
 //!
 //! RFC 8878 requires each Huffman stream to end exactly at its first bit,

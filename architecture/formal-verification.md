@@ -7,7 +7,7 @@ RFC 8878. The Rust source of selected items is translated into Lean by
 prove properties of that translation against a transcription of the RFC.
 
 The specification is the RFC, never the C library. The encoder's contract of
-byte identity with zstd 1.5.7 stays with the differential tests; the proofs
+byte identity with zstd 1.6.0 stays with the differential tests; the proofs
 show something different and independent of it: that what both sides of the
 codec compute is what RFC 8878 prescribes, that the encoder writes fields the
 RFC's decoding reads back to the values it meant, and that the translated

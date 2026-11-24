@@ -53,7 +53,7 @@ the payload, so every target shares one seed corpus.
 | `encoder_session` | A session driven by random chunks, flushes and output capacity, with calls alternating `process` and `process_uninit`, equals `ZSTD_compressStream2` driven the same way (`compress_stream_with_output`). |
 | `compressor_lifecycle` | Reuse, `reconfigure` and `trim(ReleaseAll)` never change a frame. |
 | `parallel` | Parallel frames decode with the reference and are identical for 1–8 tasks run in reverse order, whether the batch borrows the input or reads it from a `SeekSource` through `prepare_source` with each task on a detached thread. A session (windows 1–4, an optional flush, calls alternating `process` and `process_uninit`, which must leave every byte past `produced` untouched) and the `ParallelEncoderWriter`/`ParallelEncoderReader` adapters (one executor thread each) decode; with a declared size, or an input within one segment, and no flush they equal the batch frame; the writer always equals the session driven with the same writes and flush. |
-| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default; `CParameter::try_from((id, value))` agrees with `ZSTD_CCtx_setParameter` on acceptance, and accepted lists compress to the reference's bytes, except lists whose tables would dwarf the input: an explicit hash, chain or LDM hash log above 20, or an LDM hash rate log above 10 without an LDM hash log, which `ZSTD_ldm_adjustParameters` wraps to a 2^30-entry table. |
+| `parameter_parsing` | Header decoding never panics; window logs are accepted exactly in `10..=31`, and `0` restores the default; `CParameter::try_from((id, value))` agrees with `ZSTD_CCtx_setParameter` on acceptance, and accepted lists compress to the reference's bytes, except lists whose tables would dwarf the input: an explicit hash, chain or LDM hash log above 20. |
 | `decompress` | Raw bytes: no panic; anything mzstd accepts, `ZSTD_decompressStream` accepts with the same output; `decompress_to_slice` agrees with `decompress`; `decompress_to_uninit` returns the same result and bytes as `decompress_to_slice` and leaves every byte past it untouched. |
 | `decode_streaming` | Two piece sizes, then a frame: a session, with calls alternating `process` and `process_uninit` (which must leave every byte past `produced` untouched), agrees with one-shot decoding and never over-reports progress. `decode_roundtrip` and `decode_dictionary` drive their sessions the same way. |
 | `decode_roundtrip` | Parameter header: frames the reference writes with that configuration decode to the payload, one-shot and in pieces. |
@@ -125,7 +125,7 @@ trained dictionary at several levels (also read as raw content, and with a
 behave as none; this seed caught the first encoder mismatch) and the
 rejections: raw bytes as the Zstandard format and a truncated dictionary.
 `regressions/decompress/huffman-stream-end-*.bin` are frames whose Huffman
-streams are not consumed exactly and which zstd 1.5.7 accepts through its
+streams are not consumed exactly and which zstd (1.5.7 and 1.6.0) accepts through its
 fast four-stream path (found by a downstream crate's fuzzer, four of them
 cut down to their literals and zeroed byte by byte); the target now
 decodes them and compares the bytes with the reference's. The
@@ -202,13 +202,15 @@ and reports a write into the band as `CAPACITY_OVERRUN`; mzstd returns
 `zstd-ffi/tests/oracle_capacity_overrun.rs` covers the oracle, and
 `tests/compressor_target_block.rs` compares mzstd at every capacity of
 such frames. A 5-minute run from the findings afterwards found no crashes
-(2,420 new corpus items), where 45 seconds had found 13 before.
+(2,420 new corpus items), where 45 seconds had found 13 before. zstd 1.6.0
+fixed the overrun itself (#4981): the reference now fails at those
+capacities, and the guard band remains as a check.
 
 The ClusterFuzzLite run of 2026-11-13 reported two findings, neither in
 mzstd. `differential_c` failed on a level 6 `Lazy2` frame with
 `ZSTD_c_targetCBlockSize` 1500, where the reference wrote 55,891 bytes and
 mzstd 55,884. OSS-Fuzz images put `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`
-in `CFLAGS`, and with it zstd 1.5.7's superblock encoder drops the two
+in `CFLAGS`, and with it zstd's superblock encoder (1.5.7 and 1.6.0) drops the two
 fallbacks to a raw block that keep its output readable by zstd 1.3.4 and
 1.4.0 decoders, so the C oracle in CI was not the release library mzstd
 matches. The input reproduces locally only when built with that `CFLAGS`.
@@ -221,9 +223,12 @@ and the input is kept as
 `ZSTD_c_ldmHashRateLog` 17 and no LDM hash log on a 256-byte input, whose
 window shrinks to 10, makes `windowLog - hashRateLog` wrap, and the LDM hash
 log is clamped to 30 (an 8 GiB table). mzstd reproduces that arithmetic to
-stay byte-identical, so `reference_parameters` no longer compares such lists;
+stay byte-identical, so `reference_parameters` no longer compared such lists;
 the input is kept as
-`regressions/parameter_parsing/ldm-hash-rate-above-window.bin`.
+`regressions/parameter_parsing/ldm-hash-rate-above-window.bin`. zstd 1.6.0
+takes the smallest LDM table there instead (`ZSTD_ldm_adjustParameters`,
+#4626), as mzstd now does, so these lists are compared again and the input
+replays as a byte-identity check.
 
 ## libFuzzer adapters and ClusterFuzzLite
 

@@ -66,7 +66,7 @@ output delivered before final validation can be partial. I/O adapters return
 
 - [API reference on docs.rs](https://docs.rs/mzstd)
 - [Compatibility and validation](correctness.md): what is byte-identical to
-  zstd 1.5.7, and how it is checked
+  zstd 1.6.0, and how it is checked
 - [Benchmark results](benchmarks/README.md) for every measured level, with raw data
 - [Architecture](../architecture/README.md): how the implementation works
 - [Development](development.md) and [benchmarking](benchmarking.md) for

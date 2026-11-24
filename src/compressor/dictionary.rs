@@ -116,7 +116,7 @@ impl<'a> DictionaryBuilder<'a> {
     /// `ZSTD_CDict`. Overrides [`Self::with_config`].
     ///
     /// Compressing with such a dictionary follows `ZSTD_CCtx_refCDict`
-    /// rather than `ZSTD_CCtx_loadDictionary`, which differ in zstd 1.5.7:
+    /// rather than `ZSTD_CCtx_loadDictionary`, which differ in the reference:
     ///
     /// - the compressor's own level is ignored, and the default level's
     ///   parameters stand in for it when sizing the window; the other
@@ -217,7 +217,7 @@ pub(crate) fn dictionary_key(requested: &RequestedParams) -> RequestedParams {
 /// when its configuration equals the dictionary's apart from the frame
 /// options (checksum, content size).
 ///
-/// Frames are byte-identical to zstd 1.5.7's `ZSTD_compress2` and
+/// Frames are byte-identical to zstd 1.6.0's `ZSTD_compress2` and
 /// `ZSTD_compressStream2` after `ZSTD_CCtx_loadDictionary_advanced` with the
 /// same bytes and content type.
 ///

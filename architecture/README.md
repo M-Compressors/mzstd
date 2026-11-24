@@ -2,7 +2,7 @@
 
 These specifications describe mzstd as it is implemented today: module and
 ownership boundaries, public APIs, data flow, state machines, errors and known
-gaps. `zstd-ffi/vendor/zstd` (zstd v1.5.7) is the reference implementation,
+gaps. `zstd-ffi/vendor/zstd` (zstd v1.6.0) is the reference implementation,
 and [`doc/zstd_compression_format.md`](../zstd-ffi/vendor/zstd/doc/zstd_compression_format.md)
 in that tree is the format specification.
 To use the crate, read the [guides](../docs/README.md) instead; for checks and
@@ -53,7 +53,7 @@ graph TD
     DCore --> Shared
     IO --> Encode
     IO --> Decode
-    Ref["zstd-ffi: zstd 1.5.7 + oracle + corpus"] -. tests, benches, fuzzing .-> Root
+    Ref["zstd-ffi: zstd 1.6.0 + oracle + corpus"] -. tests, benches, fuzzing .-> Root
     CABI["mzstd-ffi: C ABI crate, one-shot and sessions"] --> Root
     Fuzz["fuzz/afl (excluded package)"] -.-> Root
     Fuzz -.-> Ref
@@ -88,7 +88,7 @@ From the public `Compressor` down to the engine, match finders and entropy codin
 | [Target compressed block size](target-block-size.md) | `ZSTD_c_targetCBlockSize`: the superblock path that cuts a block into sub-blocks near a compressed size. |
 | [Dictionaries](dictionaries.md) | Raw and Zstandard-format dictionaries on the encoder side: `PreparedDictionary`, parameter modes, attach / copy / load and entropy loading. |
 | [Parallel compression](parallel-compression.md) | Frame plans, overlap-primed segments, scoped batches, windowed streaming sessions with task queues, the parallel `std::io` adapters, errors and panic safety. |
-| [Encoder verification](encoder-verification.md) | Byte-identity oracles, test suites and the overflow-correction build mode. |
+| [Encoder verification](encoder-verification.md) | Byte-identity oracles, the output changes of the zstd 1.6.0 reference and their tests, test suites and the overflow-correction build mode. |
 
 ## Decompression
 

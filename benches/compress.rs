@@ -1,4 +1,4 @@
-//! mzstd's encoder against zstd 1.5.7 through equivalent calls.
+//! mzstd's encoder against zstd 1.6.0 through equivalent calls.
 //!
 //! Each case compresses the same bytes at the same level with
 //! `Compressor::compress_to_slice` and `ZSTD_compress2` into preallocated

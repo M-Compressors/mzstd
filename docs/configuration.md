@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Speed and size depend on your data. The
 [benchmark pages](benchmarks/README.md) show both for every measured level.
-Serial output is byte-identical to zstd 1.5.7 at every level, so compressed
+Serial output is byte-identical to zstd 1.6.0 at every level, so compressed
 sizes match the reference.
 
 ## Encoder settings

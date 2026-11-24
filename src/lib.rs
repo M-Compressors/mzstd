@@ -1,13 +1,13 @@
 //! Safe Rust Zstandard ([RFC 8878][rfc]) codecs.
 //!
-//! The encoder is a port of the reference implementation, zstd 1.5.7, and
+//! The encoder is a port of the reference implementation, zstd 1.6.0, and
 //! writes the same bytes it does; the decoder reads every frame RFC 8878
 //! defines, with or without a dictionary.
 //!
 //! # Byte identity
 //!
 //! For the same input and parameters, single-threaded compression produces
-//! exactly the bytes of zstd 1.5.7: one-shot compression matches
+//! exactly the bytes of zstd 1.6.0: one-shot compression matches
 //! `ZSTD_compress2`, and an encoder session matches `ZSTD_compressStream2`
 //! driven with the same input chunks, output capacities and operations. The
 //! contract covers compression levels -131072 to 22, the explicit

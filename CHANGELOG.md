@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Reference updated to zstd 1.6.0.** The vendored submodule and the
+  `zstd-ffi` oracle move from 1.5.7 to 1.6.0, and single-threaded encoding
+  is byte-identical to 1.6.0's `ZSTD_compress2` and `ZSTD_compressStream2`.
+  Frames change where 1.6.0's do:
+  - **Long distance matching.** The gear hash keeps what a reset feeds it
+    (1.5.7 discarded it), which moves LDM's split points: every frame
+    compressed with LDM differs from 0.2.15's. A hash log derived for a
+    window no larger than the hash rate is now the minimum, 6, instead of
+    the maximum.
+  - **Dictionaries at btopt and above.** A Zstandard-format dictionary's
+    literal and match length tables are built over the whole alphabet, and
+    a symbol costing at least the price scale seeds a frequency of 1
+    (`ZSTD_freqFromBitCost`), so the first block's prices change for
+    dictionaries whose tables leave out codes or whose Huffman codes reach
+    12 bits.
+  - **Block splitting** stops at 196 splits after the first half of a
+    range too, for blocks of many short matches.
+  - A prepared fast or dfast dictionary larger than 2^24 - 2 bytes whose
+    repeat offsets reach past the suffix it keeps is now
+    `DictionaryError::Corrupted`, as 1.6.0 refuses to create the CDict.
+
+  LDM includes level 22 on inputs over 64 MiB or of unknown size, where
+  its 2^27 window turns LDM on by default. The decoder needed no change:
+  1.6.0's streaming decoder now drops a dictionary once the frame's output
+  reaches the window, the rule mzstd already applied.
+
+  The oracle's `targetCBlockSize` overrun into short destinations is fixed
+  in 1.6.0 (#4981): `oracle_capacity_overrun` and
+  `capacities_the_reference_overran_fail_with_output_too_small` now require
+  that no capacity overruns and that mzstd agrees with the reference at
+  every one. The `parameter_parsing` fuzz target compares LDM hash rates
+  above the window again, which 1.5.7 sized as 2^30-entry tables.
+
+  lzbench on `silesia.tar` (i7-13700KF, one pinned core, `-t8,8`, fastest
+  of two to five interleaved rounds; `docs/benchmarks/lzbench-2026-11-24.md`):
+  mzstd's sizes equal zstd's at every level before and after, and level 22
+  changes from 52,284,290 to 52,284,094 bytes with 1.6.0's LDM. mzstd after
+  over mzstd before has median speed ratios of 0.998 for compression and
+  0.994 for decompression over levels -5 to 22, within the 2-5% median
+  spread between rounds of one binary; the unchanged decoder moved by up to
+  10% between the two binaries. zstd 1.6.0 decompresses about 2% faster
+  than 1.5.7 here, so mzstd's median ratio to the reference fell from 0.961
+  to 0.928: 1.6.0's sequence decoder now reads the FSE next-state fields at
+  the state update, as mzstd's already does (see
+  `architecture/decoder-performance.md#sequences`), and there is nothing to
+  port.
 - Update the optional `hotpath` profiling dependency to 0.32.0.
 
 ## [v0.2.15](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.15) - 2026-11-19

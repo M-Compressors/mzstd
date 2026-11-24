@@ -2,7 +2,7 @@
 
 **Zstandard (RFC 8878) compression and decompression in safe Rust.**
 
-A port of the zstd 1.5.7 encoder that writes the same bytes, plus an independent
+A port of the zstd 1.6.0 encoder that writes the same bytes, plus an independent
 Rust decoder. Reuse working memory between payloads, integrate directly with
 `std::io::Read` and `std::io::Write`, drive either codec incrementally, and opt into
 caller-scheduled parallel compression when a workload benefits from it.
@@ -46,7 +46,7 @@ memory reuse, streaming and feature selection.
 ## Why mzstd?
 
 - **Byte-identical encoder.** For the same input and parameters,
-  single-threaded compression writes exactly the bytes of zstd 1.5.7:
+  single-threaded compression writes exactly the bytes of zstd 1.6.0:
   one-shot calls match `ZSTD_compress2`, and sessions match
   `ZSTD_compressStream2` driven with the same chunks, output capacities and
   flushes. This holds for levels -131072 to 22, the explicit compression
@@ -90,8 +90,8 @@ the parallel streaming entry points.
 
 ### Our benchmarks
 
-Compression writes byte-identical frames to zstd 1.5.7 and reaches a median
-1.216× its speed across the comparison corpus; decompression reaches 1.521×.
+Compression writes byte-identical frames to zstd 1.6.0. Measured against
+1.5.7, it reaches a median 1.216× its speed across the comparison corpus; decompression reaches 1.521×.
 These medians include empty and tiny inputs. Alice text remains slower at
 some compression levels and at most decompression levels. On the whole
 `silesia.tar` in lzbench compression is within about 2% of C up to level 8
@@ -197,7 +197,7 @@ Results available [here](https://github.com/powturbo/TurboBench).
 
 ## Compatibility
 
-Single-threaded compression is byte-identical to zstd **1.5.7**: one-shot calls match
+Single-threaded compression is byte-identical to zstd **1.6.0**: one-shot calls match
 `ZSTD_compress2`, and sessions match `ZSTD_compressStream2` driven with the same
 chunks, output capacities, flushes and pledged size. Parallel compression writes
 valid, deterministic Zstandard frames, but not the bytes of zstd's multithreaded
@@ -216,7 +216,7 @@ Not supported:
 
 ## Verification
 
-- Differential tests against zstd 1.5.7 (built from the vendored submodule by
+- Differential tests against zstd 1.6.0 (built from the vendored submodule by
   `zstd-ffi`). They cover every level on a standard corpus, thousands of
   random advanced-parameter configurations, streaming schedules with flushes
   and wrapped windows, LDM, short destinations, and a build mode that forces
@@ -281,7 +281,7 @@ The same pages live in [`docs/`](docs/README.md) and
 Bug reports, differential test cases, fuzz findings and pull requests are
 welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks a
 change must pass, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). If
-compression output differs from zstd 1.5.7, open an issue with the
+compression output differs from zstd 1.6.0, open an issue with the
 [Output differs from zstd][mismatch] template.
 
 Report security vulnerabilities privately as described in

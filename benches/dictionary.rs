@@ -1,4 +1,4 @@
-//! Compression with a dictionary against zstd 1.5.7's `ZSTD_compress2` after
+//! Compression with a dictionary against zstd 1.6.0's `ZSTD_compress2` after
 //! `ZSTD_CCtx_loadDictionary`.
 //!
 //! A dictionary is trained with the reference on JSON-like records; inputs

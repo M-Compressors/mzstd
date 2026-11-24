@@ -1,4 +1,4 @@
-//! Decoding framed containers against zstd 1.5.7's decoders.
+//! Decoding framed containers against zstd 1.6.0's decoders.
 //!
 //! One container per input, written by `FramedCompressor` at level 3 with
 //! 64 KiB chunks (one resource), is checked to decode to its input through

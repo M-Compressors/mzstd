@@ -152,6 +152,22 @@ impl Gear {
         }
     }
 
+    /// `ZSTD_ldm_gear_reset`: feeds `data` into the rolling hash without
+    /// recording split points.
+    ///
+    /// zstd 1.6.0 keeps the hash it computes; 1.5.7 discarded it and left
+    /// the state unchanged, so frames with long distance matching differ
+    /// between the two versions.
+    const fn reset(&mut self, data: &[u8]) {
+        let mut hash = self.rolling;
+        let mut n = 0;
+        while n < data.len() {
+            hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+            n += 1;
+        }
+        self.rolling = hash;
+    }
+
     /// `ZSTD_ldm_gear_feed`: records split points into `splits`, stopping
     /// when the batch is full; returns how many bytes were consumed and how
     /// many splits were recorded.
@@ -361,9 +377,8 @@ impl LdmState {
         if ((end - start) as usize) < min_match_length as usize {
             return Ok((iend - anchor) as usize);
         }
-        // `ZSTD_ldm_gear_reset` is not ported: it hashes into a local and
-        // leaves the state unchanged, here and after a match below.
         let mut gear = Gear::new(params);
+        gear.reset(prefix.slice(start, start + min_match_length));
         ip += i64::from(min_match_length);
 
         while ip < ilimit {
@@ -430,6 +445,9 @@ impl LdmState {
                 self.insert_entry(hash, new_entry, params.bucket_size_log);
                 anchor = i64::from(split) + forward as i64;
                 if anchor > ip + hashed {
+                    gear.reset(
+                        prefix.slice((anchor - i64::from(min_match_length)) as u32, anchor as u32),
+                    );
                     ip = anchor - hashed;
                     break;
                 }
@@ -611,6 +629,31 @@ mod tests {
         assert_eq!(splits[0], 1);
         assert_eq!(splits[BATCH_SIZE - 1], BATCH_SIZE as u32);
         assert_eq!(gear.feed(&data[..10], &mut splits), (10, 10));
+    }
+
+    #[test]
+    fn gear_reset_keeps_the_hash_of_the_fed_bytes() {
+        let params = LdmParams {
+            hash_rate_log: 7,
+            min_match_length: 64,
+            ..LdmParams::default()
+        };
+        let data: Vec<u8> = (0..64u32).map(|i| (i * 37 % 251) as u8).collect();
+        let mut reset = Gear::new(&params);
+        reset.reset(&data);
+        let expected = data.iter().fold(u64::from(u32::MAX), |hash, &byte| {
+            (hash << 1).wrapping_add(GEAR_TAB[usize::from(byte)])
+        });
+        assert_eq!(reset.rolling, expected);
+        // Feeding the same bytes reaches the same state, splits aside.
+        let mut fed = Gear::new(&params);
+        let mut splits = [0u32; BATCH_SIZE];
+        let _ = fed.feed(&data, &mut splits);
+        assert_eq!(fed.rolling, reset.rolling);
+        // An empty reset leaves the state unchanged.
+        let before = reset.rolling;
+        reset.reset(&[]);
+        assert_eq!(reset.rolling, before);
     }
 
     fn seq(offset: u32, lit_length: u32, match_length: u32) -> RawSeq {

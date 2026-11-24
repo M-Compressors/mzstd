@@ -1,6 +1,6 @@
 # Optimal parser and long distance matching
 
-`compressor::core::opt` is zstd 1.5.7's `zstd_opt.c`: the `btopt`,
+`compressor::core::opt` is zstd 1.6.0's `zstd_opt.c`: the `btopt`,
 `btultra` and `btultra2` strategies (levels 16 to 22 by default), their
 binary-tree match finder and their price model. `compressor::core::ldm` is
 `zstd_ldm.c`. `compressor::core::opt_count` holds the match-length kernels
@@ -219,6 +219,30 @@ from `opt_count` (both segments). Its backward length is a byte loop, as in
 the reference. The rolling hash is a serial dependency chain (each step
 shifts the previous state), so it stays scalar.
 
+`Gear::reset` (`ZSTD_ldm_gear_reset`) feeds the `minMatchLength` bytes
+before the first position of a chunk, and the bytes before an anchor after
+a match, into the hash without recording splits, and keeps the result.
+zstd 1.5.7 computed that hash and discarded it, so the state after a reset
+was the state before it; 1.6.0 stores it, which moves every later split
+point and so changes the sequences, and the frames, of every LDM
+compression.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init: Gear::new (rolling = 0xFFFFFFFF)
+    Init --> Primed: reset(first minMatchLength bytes), hash kept
+    Primed --> Feeding: feed(chunk) records up to 64 splits
+    Feeding --> Feeding: batch full, feed the rest
+    Feeding --> Primed: match past the hashed bytes: reset(bytes before the anchor)
+    Feeding --> [*]: chunk end
+```
+
+`LdmParams::adjust` (`ZSTD_ldm_adjustParameters`) derives a zero hash log
+from the window and the hash rate: `windowLog - hashRateLog` clamped to
+`6..=30`, or the minimum `6` when the window is no larger than the hash rate
+(zstd 1.6.0). zstd 1.5.7 wrapped that unsigned difference around and took
+the maximum, a 2^30-entry table for a small window.
+
 ## Dictionaries
 
 ### Attached dictionaries (dictMatchState)
@@ -282,7 +306,7 @@ flowchart TD
     R["rescale_freqs"] --> F{"litLengthSum == 0?"}
     F -- no --> S["scale_stats: downscale running statistics"]
     F -- yes --> V{"symbol_costs Huffman table Valid?"}
-    V -- yes --> D["seed_from_dictionary: literal 2^(11 - HUF bits), sequence codes 2^(10 - FSE max bits), 1 for a zero cost; prices dynamic even for blocks of 8 bytes or less"]
+    V -- yes --> D["seed_from_dictionary: freq_from_bit_cost, literal 2^(11 - HUF bits), sequence codes 2^(10 - FSE max bits), 1 for a cost of 0 or at least the scale; prices dynamic even for blocks of 8 bytes or less"]
     V -- no --> N["seed_without_dictionary: literal histogram of src, fixed sequence frequencies; predefined prices for blocks of 8 bytes or less"]
     S --> B["set_base_prices, rebuild_tables"]
     D --> B
@@ -291,8 +315,14 @@ flowchart TD
 
 The bit costs come from `huf::CTable::symbol_nb_bits`
 (`HUF_getNbBitsFromCTable`) and `fse::CTable::max_nb_bits`
-(`FSE_getMaxNbBits`). Shifts wrap their count modulo 32, as the unchecked C
-shift does on common targets, so a malformed table cannot panic.
+(`FSE_getMaxNbBits`). `freq_from_bit_cost` is zstd 1.6.0's
+`ZSTD_freqFromBitCost`: `2^(scale - cost)` for `0 < cost < scale`, and `1`
+otherwise. A cost at or above the scale arises from absent FSE symbols
+(`tableLog + 1` bits, as the dictionary's length tables are built over the
+whole alphabet, see [dictionaries](dictionaries.md)) and from Huffman
+tables of 12 bits, which the reader accepts although the literal scale is
+11. zstd 1.5.7 shifted by the negative difference there (undefined in C);
+1.6.0 and mzstd take the minimum frequency.
 
 ## Invariants
 

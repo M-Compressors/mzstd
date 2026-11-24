@@ -1,7 +1,7 @@
 //! Incremental compression and decompression through session handles.
 //!
 //! An encoder handle writes one frame at a time, byte-identical to zstd
-//! 1.5.7's `ZSTD_compressStream2` given the same inputs, output capacities and
+//! 1.6.0's `ZSTD_compressStream2` given the same inputs, output capacities and
 //! operations; a decoder handle reads any sequence of Zstandard and skippable
 //! frames, as `ZSTD_decompressStream` does. Handles keep their buffers between
 //! frames, so a reset is much cheaper than a new handle.

@@ -485,15 +485,15 @@ const BLOCK_SIZE_MAX: usize = 1 << 17;
 
 /// `ZSTD_compress2` into a destination of exactly `capacity` bytes.
 ///
-/// zstd 1.5.7 does not always stay inside that destination: with
+/// zstd 1.5.7 did not always stay inside that destination: with
 /// `ZSTD_c_targetCBlockSize`, `ZSTD_compressSubBlock_literal` and
-/// `ZSTD_compressSubBlock_sequences` copy the Huffman and FSE table
+/// `ZSTD_compressSubBlock_sequences` copied the Huffman and FSE table
 /// descriptions without checking the room left, and the writers after
-/// them then see a wrapped-around capacity. The destination is therefore
-/// followed by a guard band large enough for a whole frame plus one
-/// discarded block attempt, and a call that writes into it, or reports
-/// more than `capacity` bytes, fails with [`CAPACITY_OVERRUN`] instead of
-/// corrupting the heap.
+/// them then saw a wrapped-around capacity. zstd 1.6.0 checks the room
+/// (#4981). The destination is still followed by a guard band large enough
+/// for a whole frame plus one discarded block attempt, and a call that
+/// writes into it, or reports more than `capacity` bytes, fails with
+/// [`CAPACITY_OVERRUN`] instead of corrupting the heap.
 ///
 /// # Errors
 ///

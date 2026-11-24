@@ -1,4 +1,4 @@
-//! Standalone end-to-end comparison of mzstd with the zstd 1.5.7 C library.
+//! Standalone end-to-end comparison of mzstd with the zstd 1.6.0 C library.
 //!
 //! Both implementations run through their cold one-shot APIs on identical
 //! bytes and levels; every case is validated before any timing starts.

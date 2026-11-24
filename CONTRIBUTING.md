@@ -12,7 +12,7 @@ Security issues are reported privately; see [SECURITY.md](SECURITY.md).
   approach before you invest time in it.
 - Read [`architecture/README.md`](architecture/README.md). It describes how the
   code is organized and is kept current with every change.
-- The encoder's contract is **byte identity with zstd 1.5.7**: one-shot calls
+- The encoder's contract is **byte identity with zstd 1.6.0**: one-shot calls
   must match `ZSTD_compress2`, and sessions must match `ZSTD_compressStream2`
   driven with the same chunks, output capacities, and flushes. Changes to
   `compressor::core` port the reference's control flow; a heuristic that
@@ -29,7 +29,7 @@ cd mzstd
 
 If you already cloned without submodules, run
 `git submodule update --init --recursive`. The `zstd-ffi` crate builds zstd
-1.5.7 from the vendored submodule as the test and benchmark oracle, so a C
+1.6.0 from the vendored submodule as the test and benchmark oracle, so a C
 compiler is required. The minimum supported Rust version is 1.89.
 
 ## Code guidelines

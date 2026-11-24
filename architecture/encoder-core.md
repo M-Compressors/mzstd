@@ -1,6 +1,6 @@
 # Encoder core
 
-`compressor::core` is a port of zstd 1.5.7's `lib/compress` restricted to
+`compressor::core` is a port of zstd 1.6.0's `lib/compress` restricted to
 what mzstd exposes: no multithreading, no external sequence producers.
 Dictionaries (`cdict`, the dictMatchState finders and the window's
 dictionary segment) are described in [dictionaries](dictionaries.md). Its one obligation is byte identity: for the same parameters,
@@ -518,6 +518,29 @@ adapters. Lookahead depths, cache updates and parsing heuristics are unchanged.
   feature-enabled paths keep the reference's sample-count rounding,
   thresholds and split positions; tests compare every backend with a plain
   reference loop and cover the largest chunk products.
+- `split_block`'s `derive_splits_helper` (`ZSTD_deriveBlockSplitsHelper`)
+  halves a range of sequences while the two halves' estimated sizes beat
+  the whole. It stops at `MAX_NB_BLOCK_SPLITS` (196) splits both when it
+  enters a range and, as in zstd 1.6.0, after the first half returns: a
+  128 KiB block of 3-byte matches can fill the budget inside its first
+  half, and the midpoint is then neither recorded nor its second half
+  searched (1.5.7 recorded it, writing past its split array). A chunk
+  `[start, end)` (`ZSTD_deriveSeqStoreChunk`) keeps the long length only
+  when `start <= pos < end`; 1.6.0 tightened the end bound from `<=`, which
+  wrote the long length's code one past the chunk without changing a frame.
+
+```mermaid
+flowchart TD
+    H["derive_splits_helper(start, end)"] --> C{"end - start < 300 or 196 splits?"}
+    C -- yes --> R[return]
+    C -- no --> E["estimate whole, first half, second half"]
+    E --> W{"halves smaller?"}
+    W -- no --> R
+    W -- yes --> L["recurse into [start, mid)"]
+    L --> F{"196 splits?"}
+    F -- yes --> R
+    F -- no --> P["record mid, recurse into [mid, end)"]
+```
 - After a block, `prev` and `next` swap (`confirm_block_state`) unless the
   block was stored raw or RLE, which keeps the previous entropy tables and
   demotes repeat-mode state as the reference does.

@@ -5,7 +5,7 @@ side (parsing into `DecodeDictionary`, frame-start setup, dictionary
 history) is in [decompressor](decompressor.md#dictionaries).
 
 A dictionary is history both sides agree on before a frame starts. mzstd
-reads dictionaries in both forms zstd 1.5.7 does: raw content, and the
+reads dictionaries in both forms zstd 1.6.0 does: raw content, and the
 Zstandard dictionary format (magic number `0xEC30A437`, a 32-bit ID, entropy
 tables, three repeat offsets, content). Compression with a dictionary is
 byte-identical to the reference's `ZSTD_CCtx_loadDictionary_advanced`
@@ -117,8 +117,30 @@ sequenceDiagram
         I->>E: Huffman table, OF/ML/LL FSE tables, repeat offsets
         E-->>I: header size, repeat modes (Valid only for complete tables)
         I->>L: content after the header
+        opt tfp = CDict
+            I->>I: repeat offsets within the loaded suffix, else Corrupted
+        end
     end
 ```
+
+`load_c_entropy` is `ZSTD_loadCEntropy`. The offset, match length and
+literal length FSE tables are built over their whole alphabets (`MAX_OFF`,
+`MAX_ML`, `MAX_LL`), whatever the largest symbol the dictionary describes:
+`read_ncount` leaves the counts past it zero, so an absent symbol gets the
+transform of a zero-probability symbol (`tableLog + 1` bits). The optimal
+parser seeds its first block from every symbol's cost
+([optimal parser](optimal-parser.md#statistics-from-dictionary-entropy-tables)), and zstd 1.6.0
+reads those defined costs; 1.5.7 built the length tables up to the largest
+described symbol and read whatever the rest of the table held. The repeat
+modes are unchanged: a table that leaves out a symbol the block needs is
+still `Check`, and its cost check still fails on that symbol. Repeat
+offsets must be non-zero and within the content (`ZSTD_checkDictionaryRepCodes`).
+A prepared dictionary (`tfp = CDict`) checks them again against the bytes
+its window kept: a dictionary beyond 2^24 - 2 bytes of content keeps only that
+suffix for tagged (fast and dfast) tables, and a repeat offset into the
+dropped prefix makes the dictionary `Corrupted`, as zstd 1.6.0 refuses
+to create the CDict. A context that loads the dictionary itself
+(`tfp = CCtx`) keeps up to the full index space and skips the second check.
 
 `load_dictionary_content` is `ZSTD_loadDictionaryContent`: it truncates a
 huge dictionary to a suffix (index space; 2^24 for tagged tables; then what

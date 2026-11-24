@@ -1,6 +1,6 @@
 # Encoder verification
 
-The encoder's contract is byte identity with zstd 1.5.7. The reference is
+The encoder's contract is byte identity with zstd 1.6.0. The reference is
 built from the vendored submodule by `zstd-ffi` and is used only in tests,
 benchmarks and fuzzing. `zstd_ffi::oracle` wraps it in safe functions, and
 `zstd_ffi::corpus` generates reproducible inputs.
@@ -8,7 +8,7 @@ benchmarks and fuzzing. `zstd_ffi::oracle` wraps it in safe functions, and
 ```mermaid
 flowchart LR
     Corpus[corpus: text, binary, mixed, random, vendored golden files] --> Ours[mzstd]
-    Corpus --> Ref["zstd 1.5.7 (zstd-ffi)"]
+    Corpus --> Ref["zstd 1.6.0 (zstd-ffi)"]
     Params[levels / advanced parameters / call schedule] --> Ours
     Params --> Ref
     Ours --> Cmp{bytes equal?}
@@ -44,6 +44,30 @@ flowchart LR
 | `mzstd-ffi/tests/c_abi.rs` | The C ABI matches `ZSTD_compress`, including short destinations. |
 | fuzz targets | See [fuzzing](fuzzing.md). |
 
+## Reference version
+
+The oracle is whatever `zstd-ffi/vendor/zstd` pins (`zstd_ffi::UPSTREAM_VERSION`,
+checked by `ZSTD_versionNumber` in `zstd-ffi/tests/smoke.rs`). The move from
+1.5.7 to 1.6.0 changed single-threaded output in these places, each ported
+and covered by a test that fails against the old behaviour (the last row is a
+reference fix that mzstd already matched):
+
+| 1.6.0 change | Frames affected | mzstd | Test |
+| --- | --- | --- | --- |
+| `ZSTD_ldm_gear_reset` keeps its hash | every LDM frame | `ldm::Gear::reset` | `lazy::tests::every_backend_matches_the_reference_with_long_distance_matching`, `advanced_tests`, `ldm::tests::gear_reset_keeps_the_hash_of_the_fed_bytes` |
+| LDM hash log for `windowLog <= hashRateLog` | LDM with a small window and explicit hash rate | `cctx::LdmParams::adjust` | `cctx::tests::ldm_hash_log_of_a_window_within_the_hash_rate_is_the_minimum` |
+| dictionary LL/ML tables over the full alphabet | btopt+ with a dictionary whose length tables leave out codes | `cdict::load_c_entropy` | `cdict::tests::partial_length_tables_price_absent_symbols_like_the_reference` |
+| `ZSTD_freqFromBitCost` | btopt+ with a dictionary whose Huffman codes reach 12 bits | `opt::freq_from_bit_cost` | `cdict::tests::literal_codes_deeper_than_the_price_scale_take_the_minimum_frequency` |
+| repeat offsets checked against a CDict's kept suffix | fast/dfast dictionaries over 2^24 - 2 bytes | `cdict::insert_dictionary` | `cdict::tests::repeat_offsets_past_a_truncated_dictionary_are_corrupted` |
+| block split budget checked after the first half | blocks with more than 196 profitable splits | `split_block::derive_splits_helper` | `split_block::tests::many_short_matches_stop_at_the_split_budget` |
+| chunk long length bound `< end` | none (code one past the chunk) | `SeqStore::chunk` | `split_block::tests::chunks_keep_a_long_length_only_inside_their_range` |
+| sub-block writers check the room left (#4981) | `targetCBlockSize` into a destination smaller than the frame: 1.5.7 wrote past it, 1.6.0 fails or stores the block | already `superblock` (no change) | `compressor_target_block::capacities_the_reference_overran_fail_with_output_too_small`, `oracle_capacity_overrun` |
+
+The rest of 1.6.0's `lib/compress` changes are multithreading, the
+sequence-producer and `compressSequences*` APIs (not ported), memory
+estimates, error checks for inputs mzstd's API cannot form, and SIMD
+(SVE2, NEON, RVV) kernels whose results equal the scalar ones.
+
 ## Overflow correction mode
 
 Index overflow correction normally needs gigabytes of input. Building with
@@ -77,11 +101,14 @@ public functions as missed even though tests call them.
 
 ## Destinations the reference overruns
 
-zstd 1.5.7 does not always stay inside the destination of a one-shot call.
+zstd 1.5.7 did not always stay inside the destination of a one-shot call.
 With `ZSTD_c_targetCBlockSize`, `ZSTD_compress2` compresses straight into
-the caller's buffer, and the sub-block writer copies the Huffman and FSE
+the caller's buffer, and the sub-block writer copied the Huffman and FSE
 table descriptions without checking the room left; the writers after it
-then see a wrapped-around capacity. `oracle::compress2_capacity` therefore
+then saw a wrapped-around capacity. zstd 1.6.0 checks the room before each
+copy (#4981) and returns `dstSize_tooSmall`, which
+`ZSTD_compressBlock_targetCBlockSize_body` turns into a stored block or a
+failure, as mzstd's `superblock` always did. `oracle::compress2_capacity` still
 allocates the capacity plus a guard band of `ZSTD_compressBound(len)` and
 one block, fills it with a marker byte, passes only the capacity to the
 reference, and reports `CAPACITY_OVERRUN` when the band changed or the
@@ -100,11 +127,14 @@ flowchart TD
     F -->|no| H["Ok(frame)"]
 ```
 
-mzstd never writes past its destination; at every capacity the reference
-overruns it returns `EncodeError::OutputTooSmall`
+mzstd never writes past its destination. At every capacity 1.5.7 overran
+it returns `EncodeError::OutputTooSmall`, and 1.6.0 now fails there too, so
+the two agree at every capacity and no capacity overruns
 (`tests/compressor_target_block.rs`,
-`capacities_the_reference_overruns_fail_with_output_too_small`), so the
-comparisons treat an overrun as the reference failing.
+`capacities_the_reference_overran_fail_with_output_too_small`, and
+`zstd-ffi/tests/oracle_capacity_overrun.rs`). The comparisons still treat
+an overrun as the reference failing, so a regression in the reference shows
+up as a test failure rather than heap corruption.
 
 ## Known gaps
 
@@ -112,9 +142,6 @@ comparisons treat an overrun as the reference failing.
   show that the reference's own heuristics are good.
 - Inputs above a few megabytes are covered only by the parallel tests and
   the overflow-correction mode, not by the level matrix.
-- Where zstd 1.5.7 overruns a target-block destination, there is no
-  reference result to compare with; only mzstd's `OutputTooSmall` is
-  checked there.
 
 ## OpenZL integration
 

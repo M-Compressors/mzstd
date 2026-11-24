@@ -1,11 +1,11 @@
 name: Output differs from zstd
-description: Single-threaded compression wrote different bytes than zstd 1.5.7 for the same input and parameters.
+description: Single-threaded compression wrote different bytes than zstd 1.6.0 for the same input and parameters.
 labels: ["bug", "byte-identity"]
 body:
   - type: markdown
     attributes:
       value: |
-        mzstd's single-threaded encoder must match zstd 1.5.7 byte for byte:
+        mzstd's single-threaded encoder must match zstd 1.6.0 byte for byte:
         one-shot calls match `ZSTD_compress2`, and sessions match
         `ZSTD_compressStream2` driven with the same chunks, output capacities
         and flushes.

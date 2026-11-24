@@ -1,11 +1,12 @@
-//! `oracle::compress2_capacity` with destinations zstd 1.5.7 overruns.
+//! `oracle::compress2_capacity` with destinations zstd 1.5.7 overran.
 //!
-//! With `ZSTD_c_targetCBlockSize`, the reference's sub-block writer copies
+//! With `ZSTD_c_targetCBlockSize`, zstd 1.5.7's sub-block writer copied
 //! table descriptions without checking the room left, so `ZSTD_compress2`
-//! into a destination somewhat smaller than the frame writes past it. The
+//! into a destination somewhat smaller than the frame wrote past it. The
 //! output-capacity fuzz target found the heap corruption this caused
-//! (2026-11-09); the oracle now keeps a guard band after the destination
-//! and reports the overrun as an error.
+//! (2026-11-09), and the oracle keeps a guard band after the destination
+//! that reports an overrun as an error. zstd 1.6.0 checks the room (#4981):
+//! these destinations now fail with `Destination buffer is too small`.
 
 use zstd_ffi::oracle::{self, CAPACITY_OVERRUN, Params};
 use zstd_ffi::{ZSTD_c_checksumFlag, ZSTD_c_contentSizeFlag, ZSTD_c_targetCBlockSize, corpus};
@@ -37,13 +38,16 @@ fn sweep(input: &[u8], params: &Params) -> usize {
 }
 
 #[test]
-fn an_overrun_of_a_target_block_frame_is_reported_not_written() {
+fn target_block_frames_stay_inside_short_destinations() {
     let input = corpus::text(1_300, 7);
-    let overruns: usize = [1340, 2048, 131_072]
-        .into_iter()
-        .map(|target| sweep(&input, &target_block_params(target)))
-        .sum();
-    assert!(overruns > 0, "zstd 1.5.7 overruns these destinations");
+    for target in [1340, 2048, 131_072] {
+        // zstd 1.5.7 overran some of these capacities for every target.
+        assert_eq!(
+            sweep(&input, &target_block_params(target)),
+            0,
+            "target {target}"
+        );
+    }
 }
 
 #[test]

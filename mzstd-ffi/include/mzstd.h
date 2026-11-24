@@ -43,7 +43,7 @@ typedef enum {
  * output_len is left untouched). mzstd_compress_bound(input_len) bytes are
  * always enough. input may be NULL when input_len is 0.
  *
- * The frame is byte-identical to ZSTD_compress(level) from zstd 1.5.7, and
+ * The frame is byte-identical to ZSTD_compress(level) from zstd 1.6.0, and
  * a smaller output fails exactly when ZSTD_compress fails: at least 18 bytes
  * (the largest frame header) and some slack past the frame are needed.
  */
@@ -136,7 +136,7 @@ mzstd_result mzstd_encoder_reset(mzstd_encoder *encoder,
 
 /*
  * One ZSTD_compressStream2 step: the same inputs, output capacities and
- * operations give byte-identical frames to zstd 1.5.7. Repeat MZSTD_FLUSH
+ * operations give byte-identical frames to zstd 1.6.0. Repeat MZSTD_FLUSH
  * or MZSTD_END, with the unconsumed input, while it reports
  * MZSTD_NEEDS_OUTPUT. Treat only the produced bytes of output as written;
  * scratch bytes past them may change too. Input that contradicts the

@@ -526,6 +526,9 @@ impl CTable {
     ///
     /// Like the reference it reads whatever transform the symbol holds: one
     /// past the largest symbol of the last build keeps an older table's.
+    /// Dictionary tables, the only ones the optimal parser prices this
+    /// way, are built over the whole alphabet (zstd 1.6.0), so every symbol
+    /// it reads has a transform of the current build.
     pub(crate) fn max_nb_bits(&self, symbol: u32) -> u32 {
         self.symbol_tt
             .get(symbol as usize)

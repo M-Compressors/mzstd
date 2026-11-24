@@ -1,5 +1,5 @@
 #![cfg(feature = "decompression")]
-//! Dictionary decoding, differential against the reference (zstd 1.5.7):
+//! Dictionary decoding, differential against the reference (zstd 1.6.0):
 //! frames the reference writes with raw-content and trained dictionaries
 //! decode to their input through every entry point, dictionary IDs are
 //! checked as `ZSTD_decodeFrameHeader` checks them, and dictionaries are

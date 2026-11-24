@@ -283,19 +283,10 @@ impl OptState {
     /// `ZSTD_rescaleFreqs`'s first-block statistics from a dictionary's
     /// entropy tables: each symbol's frequency is `2^(scale - bits)` for
     /// the bits its code costs (literals scaled to 2K, sequence symbols to
-    /// 1K), and `1` for a symbol without a code.
-    ///
-    /// The reference asserts that no code is longer than the scale; a
-    /// malformed table past that shifts as its unchecked `1 << n` does on
-    /// common targets (the count taken modulo 32) instead of failing.
+    /// 1K), and `1` for a symbol without a code or one costing at least the
+    /// scale ([`freq_from_bit_cost`]).
     fn seed_from_dictionary(&mut self, tables: &Tables) {
-        let frequency = |bit_cost: u32, scale_log: u32| {
-            if bit_cost != 0 {
-                1u32.wrapping_shl(scale_log.wrapping_sub(bit_cost))
-            } else {
-                1
-            }
-        };
+        let frequency = freq_from_bit_cost;
         if self.compressed_literals() {
             let mut sum = 0u32;
             for (literal, freq) in (0..=MAX_LIT).zip(self.lit_freq.iter_mut()) {
@@ -510,6 +501,21 @@ fn grow_positions(table: &mut Vec<Optimal>, end: usize) -> &mut [Optimal] {
         table.resize(end, Optimal::default());
     }
     table
+}
+
+/// `ZSTD_freqFromBitCost`: the frequency a dictionary gives a symbol whose
+/// code costs `bit_cost` bits on a `2^scale_log` scale.
+///
+/// Absent symbols cost `tableLog + 1` and dictionary Huffman tables may be
+/// deeper than the scale, so a cost at or above it keeps the minimum
+/// frequency of `1`, as a zero cost does.
+const fn freq_from_bit_cost(bit_cost: u32, scale_log: u32) -> u32 {
+    debug_assert!(scale_log < 31);
+    if bit_cost > 0 && bit_cost < scale_log {
+        1 << (scale_log - bit_cost)
+    } else {
+        1
+    }
 }
 
 /// `ZSTD_bitWeight`.
@@ -2133,6 +2139,17 @@ mod tests {
     use crate::Backend;
     use crate::shared::format::BLOCK_SIZE_MAX;
     use alloc::vec;
+
+    #[test]
+    fn dictionary_frequencies_floor_at_one_outside_the_scale() {
+        assert_eq!(freq_from_bit_cost(0, 10), 1);
+        assert_eq!(freq_from_bit_cost(1, 10), 512);
+        assert_eq!(freq_from_bit_cost(9, 10), 2);
+        // At or past the scale: absent symbols, or deep Huffman codes.
+        assert_eq!(freq_from_bit_cost(10, 10), 1);
+        assert_eq!(freq_from_bit_cost(12, 11), 1);
+        assert_eq!(freq_from_bit_cost(40, 11), 1);
+    }
 
     /// The reference's `ZSTD_litLengthPrice`, from the frequencies.
     fn reference_lit_length_price(os: &OptState, lit_length: u32, opt_level: u32) -> i32 {

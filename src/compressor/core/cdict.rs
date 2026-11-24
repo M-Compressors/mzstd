@@ -293,11 +293,12 @@ pub(crate) fn load_c_entropy(bs: &mut BlockState, dict: &[u8]) -> Result<usize, 
     if matchlength.table_log > ML_FSE_LOG {
         return Err(corrupted);
     }
-    bs.entropy.fse.matchlength.build(
-        &matchlength.counts,
-        matchlength.max_symbol,
-        matchlength.table_log,
-    );
+    // The optimal parser reads every symbol's cost, absent ones included;
+    // `read_ncount` leaves the counts past `max_symbol` zero.
+    bs.entropy
+        .fse
+        .matchlength
+        .build(&matchlength.counts, MAX_ML, matchlength.table_log);
     bs.entropy.fse.matchlength_repeat =
         dict_ncount_repeat(&matchlength.counts, matchlength.max_symbol, MAX_ML);
     pos += matchlength.size;
@@ -306,10 +307,11 @@ pub(crate) fn load_c_entropy(bs: &mut BlockState, dict: &[u8]) -> Result<usize, 
     if litlength.table_log > LL_FSE_LOG {
         return Err(corrupted);
     }
+    // As above, costs for the full symbol range.
     bs.entropy
         .fse
         .litlength
-        .build(&litlength.counts, litlength.max_symbol, litlength.table_log);
+        .build(&litlength.counts, MAX_LL, litlength.table_log);
     bs.entropy.fse.litlength_repeat =
         dict_ncount_repeat(&litlength.counts, litlength.max_symbol, MAX_LL);
     pos += litlength.size;
@@ -332,15 +334,21 @@ pub(crate) fn load_c_entropy(bs: &mut BlockState, dict: &[u8]) -> Result<usize, 
         offcode.max_symbol,
         offcode_max.min(MAX_OFF),
     );
-    if bs
-        .rep
+    check_repcodes(&bs.rep, content_size)?;
+    debug_assert_eq!(bs.rep.len(), REP_NUM);
+    Ok(pos)
+}
+
+/// `ZSTD_checkDictionaryRepCodes`: every repeat offset must be non-zero
+/// and within the `content_size` addressable bytes.
+fn check_repcodes(rep: &[u32; REP_NUM], content_size: u64) -> Result<(), DictionaryError> {
+    if rep
         .iter()
         .any(|&rep| rep == 0 || u64::from(rep) > content_size)
     {
-        return Err(corrupted);
+        return Err(DictionaryError::Corrupted);
     }
-    debug_assert_eq!(bs.rep.len(), REP_NUM);
-    Ok(pos)
+    Ok(())
 }
 
 /// `ZSTD_compress_insertDictionary`: loads the dictionary segment of
@@ -387,6 +395,13 @@ pub(crate) fn insert_dictionary(
                 dtlm,
                 tfp,
             );
+            if tfp == FillPurpose::CDict {
+                // A large dictionary keeps only a suffix (at most 2^24 - 2
+                // bytes for tagged tables): repeat offsets past it would
+                // reach before the window (zstd 1.6.0).
+                let loaded = ms.window.end_index() - ms.window.low_limit;
+                check_repcodes(&bs.rep, u64::from(loaded))?;
+            }
             Ok(id)
         }
     }
@@ -508,8 +523,22 @@ mod tests {
     fn dictionary(of: &[u8], ml: &[u8], ll: &[u8], reps: [u32; 3], content: usize) -> Vec<u8> {
         let mut count = [3u32; 256];
         count[0] = 900;
+        dictionary_with_literals(&count, 11, of, ml, ll, reps, content)
+    }
+
+    /// [`dictionary`] with the literal statistics `count` coded in at most
+    /// `max_nb_bits` bits.
+    fn dictionary_with_literals(
+        count: &[u32; 256],
+        max_nb_bits: u32,
+        of: &[u8],
+        ml: &[u8],
+        ll: &[u8],
+        reps: [u32; 3],
+        content: usize,
+    ) -> Vec<u8> {
         let mut table = CTable::default();
-        let log = table.build(&count, 255, 11).expect("builds");
+        let log = table.build(count, 255, max_nb_bits).expect("builds");
         let mut huffman = [0u8; 300];
         let size = table.write(&mut huffman, 255, log).expect("writes");
         let mut out = crate::dictionary::MAGIC_DICTIONARY.to_le_bytes().to_vec();
@@ -594,5 +623,119 @@ mod tests {
             assert_eq!(load(&dict).err(), corrupted.clone().err());
         }
         assert!(load(&dictionary(&of, &ml, &ll, [1, 4, 100], 100)).is_ok());
+    }
+
+    #[test]
+    fn partial_length_tables_price_absent_symbols_like_the_reference() {
+        use crate::compressor::core::dict_tests::{check, request};
+        use zstd_ffi::corpus;
+        // Literal and match length tables that leave out the longer codes:
+        // the optimal parser seeds its first block from every symbol's
+        // cost, absent ones included (zstd 1.6.0 builds the tables over the
+        // full alphabet).
+        let dict = dictionary(
+            &flat_ncount(32, 6),
+            &flat_ncount(12, 6),
+            &flat_ncount(10, 6),
+            [1, 4, 8],
+            20_000,
+        );
+        let pattern: Vec<u8> = (0..60_000usize).map(|i| (i * 7 % 251) as u8).collect();
+        let inputs = [corpus::text(9_000, 5), pattern, corpus::binary(30_000, 6)];
+        for level in [16, 17, 18, 19, 22] {
+            for pref in [
+                AttachPref::ForceAttach,
+                AttachPref::ForceCopy,
+                AttachPref::ForceLoad,
+            ] {
+                check(
+                    &request(level, None, pref),
+                    &dict,
+                    DictionaryContent::Zstd,
+                    &inputs,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_offsets_past_a_truncated_dictionary_are_corrupted() {
+        use crate::compressor::core::dict_tests::{check, dict_params, request};
+        // Tagged (fast and dfast) dictionary tables keep the last
+        // 2^24 - 2 bytes; a repeat offset into the dropped prefix is
+        // refused when the dictionary is prepared, as the reference refuses
+        // to create its CDict.
+        let content = (1 << 24) + 64;
+        let dict = dictionary(
+            &flat_ncount(32, 6),
+            &flat_ncount(53, 7),
+            &flat_ncount(36, 7),
+            [1, 4, 1 << 24],
+            content,
+        );
+        let input = alloc::vec![b'z'; 4096];
+        for level in [1, 3] {
+            let requested = request(level, None, AttachPref::Default);
+            assert_eq!(
+                CDict::new(Box::from(&dict[..]), DictionaryContent::Zstd, &requested).err(),
+                Some(DictionaryError::Corrupted),
+                "level {level}"
+            );
+            let params = dict_params(&requested, &dict, DictionaryContent::Zstd);
+            assert!(zstd_ffi::oracle::compress2(&input, &params).is_err());
+        }
+        // Untagged tables keep the whole content: the offset is in range.
+        check(
+            &request(5, None, AttachPref::Default),
+            &dict,
+            DictionaryContent::Zstd,
+            &[input],
+        );
+        // An offset within the kept suffix is accepted by tagged tables too.
+        let near = dictionary(
+            &flat_ncount(32, 6),
+            &flat_ncount(53, 7),
+            &flat_ncount(36, 7),
+            [1, 4, (1 << 24) - 2],
+            content,
+        );
+        check(
+            &request(1, None, AttachPref::Default),
+            &near,
+            DictionaryContent::Zstd,
+            &[alloc::vec![b'z'; 4096]],
+        );
+    }
+
+    #[test]
+    fn literal_codes_deeper_than_the_price_scale_take_the_minimum_frequency() {
+        use crate::compressor::core::dict_tests::{check, request};
+        use zstd_ffi::corpus;
+        // Geometric literal statistics give the rarest bytes 12-bit codes,
+        // one past the optimal parser's 2K literal scale.
+        let count: [u32; 256] = core::array::from_fn(|i| match i {
+            0..12 => 1 << (12 - i),
+            _ => 1,
+        });
+        let dict = dictionary_with_literals(
+            &count,
+            12,
+            &flat_ncount(32, 6),
+            &flat_ncount(53, 7),
+            &flat_ncount(36, 7),
+            [1, 4, 8],
+            20_000,
+        );
+        let mut table = CTable::default();
+        assert_eq!(table.build(&count, 255, 12).expect("builds"), 12);
+        let inputs = [corpus::text(9_000, 5), corpus::binary(30_000, 6)];
+        for level in [16, 19, 22] {
+            check(
+                &request(level, None, AttachPref::Default),
+                &dict,
+                DictionaryContent::Zstd,
+                &inputs,
+            );
+        }
     }
 }

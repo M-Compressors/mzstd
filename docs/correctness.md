@@ -9,7 +9,7 @@ format primitives, rather than the entire codec. For commands, see
 
 | Surface | Claim | Oracle |
 | --- | --- | --- |
-| Serial one-shot encoding, levels -131072–22 | Byte identity for equivalent input, parameters, and dictionary | zstd 1.5.7 `ZSTD_compress2` |
+| Serial one-shot encoding, levels -131072–22 | Byte identity for equivalent input, parameters, and dictionary | zstd 1.6.0 `ZSTD_compress2` |
 | Serial sessions | Byte identity with the same chunks, capacities, flushes, parameters, and pledged size | `ZSTD_compressStream2` |
 | Decoding | Standard Zstandard frames, concatenated/skippable frames, raw/trained dictionaries, checksums, and configured limits | Independent Rust decoder, C differential tests, upstream golden vectors |
 | Parallel encoding | Valid deterministic frames for fixed input/configuration/segment size | Rust API comparisons and reference decoding; no ZSTDMT byte identity |
@@ -23,7 +23,7 @@ need memory-tool checks. The separate `mzstd-ffi` crate provides a C ABI.
 
 ## Output compatibility
 
-Single-threaded one-shot compression is byte-identical to zstd **1.5.7**
+Single-threaded one-shot compression is byte-identical to zstd **1.6.0**
 `ZSTD_compress2` with equivalent input, parameters, and dictionary. Sessions
 match `ZSTD_compressStream2` driven with the same chunks, output capacities,
 flushes, and pledged size. Different schedules are not interchangeable byte

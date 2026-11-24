@@ -9,7 +9,7 @@ body:
         unsafety, a panic or unbounded resource use on untrusted input), do not
         file it here; follow [SECURITY.md](https://github.com/M-Compressors/mzstd/blob/main/SECURITY.md).
 
-        If compressed output differs from zstd 1.5.7 but still decodes, use the
+        If compressed output differs from zstd 1.6.0 but still decodes, use the
         "Output differs from zstd" template instead.
   - type: textarea
     id: description

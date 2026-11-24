@@ -3,7 +3,7 @@
 OpenZL v0.3.0 drives zstd through a fixed set of calls
 (`encode_zstd_binding.c`, `decode_zstd_binding.c`, `common_zstd.c`). This
 specification maps each call to the mzstd API that reproduces it byte for
-byte, and records the zstd 1.5.7 behaviours that shape the mapping. mzstd
+byte, and records the zstd 1.6.0 behaviours (unchanged from 1.5.7) that shape the mapping. mzstd
 itself knows nothing about OpenZL: every item is a general zstd feature, and
 the "node" in the tests is a Rust transcription of the binding.
 
@@ -98,7 +98,7 @@ without `ZSTD_MULTITHREAD`):
 
 ```mermaid
 flowchart TD
-    Pair["(id, value)"] --> Known{"id defined by zstd 1.5.7?"}
+    Pair["(id, value)"] --> Known{"id defined by zstd 1.6.0?"}
     Known -->|no| Unknown["ConfigError::UnknownParameter"]
     Known -->|yes| Kind{"kind"}
     Kind -->|"level (100)"| Clamp["clamp to -131072..=22, 0 -> default"]
@@ -149,7 +149,7 @@ types (`Option<u32>` for the numeric ones). Facts worth keeping in mind:
 
 ## Dictionaries: `refCDict` versus `loadDictionary`
 
-zstd 1.5.7 treats a dictionary differently depending on how it reaches the
+zstd 1.6.0 treats a dictionary differently depending on how it reaches the
 context, and OpenZL uses the `ZSTD_CDict` route:
 
 ```mermaid

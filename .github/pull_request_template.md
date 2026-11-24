@@ -4,7 +4,7 @@
 
 ## Byte identity
 
-<!-- For changes to compression: confirm output still matches zstd 1.5.7, or
+<!-- For changes to compression: confirm output still matches zstd 1.6.0, or
      explain why this path is outside the guarantee. Otherwise write "N/A". -->
 
 ## Performance

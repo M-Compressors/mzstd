@@ -13,7 +13,7 @@ fn oracle_round_trips_through_every_entry_point() {
         oracle::decompress_stream(&one_shot, 7, None).unwrap(),
         input
     );
-    assert_eq!(unsafe { zstd_ffi::ZSTD_versionNumber() }, 10507);
+    assert_eq!(unsafe { zstd_ffi::ZSTD_versionNumber() }, 10600);
 }
 
 #[test]

@@ -11,7 +11,7 @@ adapters; `crate::dictionary` owns the public dictionary types; the private
 `fearless_simd` kernels on the `Backend` chosen when the decoder is built;
 the fast paths are described in [decoder fast paths](decoder-performance.md).
 
-The reference this decoder is checked against is zstd 1.5.7, vendored in
+The reference this decoder is checked against is zstd 1.6.0, vendored in
 `zstd-ffi/vendor/zstd`; the format text is
 [`zstd_compression_format.md`](../zstd-ffi/vendor/zstd/doc/zstd_compression_format.md).
 How it is verified is described in
@@ -533,8 +533,8 @@ Invariants each layer relies on:
 ## Huffman stream ends
 
 RFC 8878 calls a Huffman stream faulty unless decoding it consumes every
-bit exactly. zstd 1.5.7 (`huf_decompress.c`) does not always check that,
-and this decoder accepts exactly what it accepts:
+bit exactly. zstd 1.5.7 and 1.6.0 (`huf_decompress.c`) do not always check that,
+and this decoder accepts exactly what they accept:
 
 - **Fast four-stream path.** `HUF_decompress4X{1,2}_usingDTable_internal_fast`
   runs for four streams when the tree is at most 11 bits deep (its table
@@ -629,10 +629,14 @@ deliberate exceptions:
 - **Huffman depth.** Trees of 12 bits are accepted, as by the reference,
   although RFC 8878 caps literal codes at 11 bits.
 - **Dictionary reach.** A dictionary's content is reachable only from
-  blocks that start within the frame's first window. The reference's
-  one-shot decoder lets any offset reach it, and its streaming decoder until
-  its ring buffer first wraps, which is never before the end of the first
-  window. Reference encoders never reference a dictionary later.
+  blocks that start while the frame's output is below its window. Since
+  zstd 1.6.0 the reference's streaming decoder applies the same rule: from
+  the first block that starts once `decodedSize >= windowSize`,
+  `ZSTD_checkContinuity` cuts the external segment to what is left of the
+  window, which for a contiguous history is nothing (1.5.7 kept it until its
+  ring buffer first wrapped). The reference's one-shot decoder still lets
+  any offset reach it. Reference encoders never reference a dictionary
+  later.
 - **Dictionary acceptance** matches `ZSTD_DCtx_loadDictionary_advanced`
   exactly: empty bytes are no dictionary, raw content is never rejected,
   and Zstandard-format bytes are rejected where `ZSTD_loadDEntropy` rejects
@@ -661,6 +665,13 @@ stateDiagram-v2
 
 ## Known gaps
 
+- **AArch64 Huffman verdicts.** On AArch64, zstd 1.6.0's double-symbol
+  fast loop decodes the four streams evenly (`HUF_4X2_4WAY`); on x86-64,
+  and in 1.5.7 everywhere, the fourth stream runs on its own schedule
+  (once per round and inside the reloads). The reference port follows the
+  x86-64 schedule. Its verdicts on streams that are
+  not consumed exactly have not been compared with an AArch64 build of the
+  reference.
 - **Dictionaries.** Only one dictionary per operation: there is no
   selection among several by frame ID (`ZSTD_d_refMultipleDDicts`), and
   `DecodeDictionary` always copies its bytes (no `ZSTD_dlm_byRef`). A

@@ -1,4 +1,4 @@
-//! mzstd's decoder against zstd 1.5.7 on identical frames.
+//! mzstd's decoder against zstd 1.6.0 on identical frames.
 //!
 //! Frames are written by the reference at several levels (and with LDM and a
 //! 2^27 window for one case), checked to decode to their input through both

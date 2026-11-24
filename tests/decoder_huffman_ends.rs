@@ -1,8 +1,8 @@
 #![cfg(feature = "decompression")]
 //! Huffman literal streams whose ends the reference decoder does not check.
 //!
-//! zstd 1.5.7's fast four-stream Huffman decoder validates only the
-//! regenerated length: a stream may stop short of its first bit or read on
+//! zstd's fast four-stream Huffman decoder (1.5.7 and 1.6.0) validates only
+//! the regenerated length: a stream may stop short of its first bit or read on
 //! into the bytes before it. The frames in `testdata/huffman-stream-ends`
 //! are fuzz finds (two as found, four cut down to their literals and
 //! zeroed byte by byte) that `ZSTD_decompress` accepts for that reason.

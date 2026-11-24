@@ -135,7 +135,7 @@ pub enum MzstdResult {
 /// misaligned `output_len`, which is left untouched. An output of
 /// [`mzstd_compress_bound`]`(input_len)` bytes is always large enough.
 ///
-/// The frame is byte-identical to the one zstd 1.5.7's `ZSTD_compress`
+/// The frame is byte-identical to the one zstd 1.6.0's `ZSTD_compress`
 /// writes at the same level: content size recorded, no checksum. A smaller
 /// output fails exactly when `ZSTD_compress` fails: the encoder needs room
 /// for the largest frame header (18 bytes) and some slack past the frame, so

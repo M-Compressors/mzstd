@@ -1,7 +1,7 @@
 # Decoder verification
 
 How the [decompressor](decompressor.md) is checked against RFC 8878 and the
-zstd 1.5.7 reference. Unit tests sit beside each private `core` module;
+zstd 1.6.0 reference. Unit tests sit beside each private `core` module;
 integration tests in `tests/decoder_*.rs` drive the public API against the
 reference through the `zstd-ffi` oracle (`zstd_ffi::oracle`).
 
@@ -28,7 +28,7 @@ graph TD
         Dict[decoder_dictionary: raw and trained dictionaries, IDs, entropy reuse, dictionary acceptance]
     end
     Ref --> Dict
-    Ref[zstd 1.5.7 via zstd-ffi] --> Oracle
+    Ref[zstd 1.6.0 via zstd-ffi] --> Oracle
     Ref --> Golden
     Ref --> Corrupt
     Ref --> Ends

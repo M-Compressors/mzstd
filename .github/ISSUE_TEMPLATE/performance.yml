@@ -1,5 +1,5 @@
 name: Performance regression
-description: mzstd is slower than zstd 1.5.7, or slower than an earlier mzstd release, on a workload.
+description: mzstd is slower than zstd 1.6.0, or slower than an earlier mzstd release, on a workload.
 labels: ["performance"]
 body:
   - type: textarea

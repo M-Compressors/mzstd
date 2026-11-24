@@ -1,5 +1,5 @@
 #![cfg(feature = "decompression")]
-//! Differential tests: frames written by the reference encoder (zstd 1.5.7)
+//! Differential tests: frames written by the reference encoder (zstd 1.6.0)
 //! must decode to their input through every decoder entry point, and agree
 //! with the reference decoder.
 
