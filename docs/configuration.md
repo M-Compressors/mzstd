@@ -74,11 +74,11 @@ The default feature set is `std`, `compression`, and `decompression`.
 
 | Configuration | Dependency |
 | --- | --- |
-| Default std encoder + decoder | `mzstd = "0.2.15"` |
-| Encoder only | `mzstd = { version = "0.2.15", default-features = false, features = ["std", "compression"] }` |
-| Decoder only | `mzstd = { version = "0.2.15", default-features = false, features = ["std", "decompression"] }` |
-| Framing containers | `mzstd = { version = "0.2.15", features = ["framed"] }` |
-| Alloc-backed codecs without std | `mzstd = { version = "0.2.15", default-features = false, features = ["no_std", "compression", "decompression"] }` |
+| Default std encoder + decoder | `mzstd = "0.2.16"` |
+| Encoder only | `mzstd = { version = "0.2.16", default-features = false, features = ["std", "compression"] }` |
+| Decoder only | `mzstd = { version = "0.2.16", default-features = false, features = ["std", "decompression"] }` |
+| Framing containers | `mzstd = { version = "0.2.16", features = ["framed"] }` |
+| Alloc-backed codecs without std | `mzstd = { version = "0.2.16", default-features = false, features = ["no_std", "compression", "decompression"] }` |
 
 | Feature | Default | Enables |
 | --- | --- | --- |

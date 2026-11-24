@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [v0.2.16](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.16) - 2026-11-24
+
 - **Reference updated to zstd 1.6.0.** The vendored submodule and the
   `zstd-ffi` oracle move from 1.5.7 to 1.6.0, and single-threaded encoding
   is byte-identical to 1.6.0's `ZSTD_compress2` and `ZSTD_compressStream2`.
