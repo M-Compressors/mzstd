@@ -392,6 +392,31 @@ mod tests {
                 limit: 0x0800_0000
             })
         ));
+        // Exponent 31, mantissa 7: 3.75 GiB passes only an unbounded limit;
+        // exponent 32 passes none.
+        let unbounded = DecodeLimits::default().with_unbounded_window();
+        let widest = FrameHeader::parse(&[0x00, (21 << 3) | 7]).expect("valid");
+        assert!(matches!(
+            frame.begin(
+                widest,
+                &limits.with_max_window_log(31).expect("valid"),
+                None
+            ),
+            Err(DecodeError::WindowLimitExceeded {
+                window_size: 0xF000_0000,
+                limit: 0x8000_0000
+            })
+        ));
+        frame.begin(widest, &unbounded, None).expect("unbounded");
+        assert_eq!(frame.block_max(), BLOCK_SIZE_MAX);
+        let beyond = FrameHeader::parse(&[0x00, 22 << 3]).expect("valid");
+        assert!(matches!(
+            frame.begin(beyond, &unbounded, None),
+            Err(DecodeError::WindowLimitExceeded {
+                window_size: 0x1_0000_0000,
+                limit: DecodeLimits::UNBOUNDED_WINDOW_SIZE
+            })
+        ));
         let empty = FrameHeader::parse(&[0x20, 0]).expect("valid");
         frame.begin(empty, &limits, None).expect("valid");
         assert_eq!(frame.block_max(), 0);

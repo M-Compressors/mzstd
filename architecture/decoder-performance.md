@@ -453,8 +453,8 @@ holds 32 more bytes after them, and copied otherwise.
 Release-mode `usize` additions may wrap, so `out[i..i + 16]` normally
 costs an overflow test and a bounds test. The sequence executor cuts the
 output to start at `max(history_start, op - window)` — no valid match
-reaches further back — so every index is below `2^31 + 2^19`
-(compile-time asserted against `DecodeLimits::MAX_WINDOW_LOG`), and
+reaches further back — so every index is below `0xF000_0000 + 2^20`
+(compile-time asserted against `DecodeLimits::UNBOUNDED_WINDOW_SIZE`), and
 `copy::idx` masks operands to 32 bits. The masked sums provably do not
 wrap, which lets the compiler relate the executor's room tests to the
 copies' bounds checks and drop many of them. The masks never change a

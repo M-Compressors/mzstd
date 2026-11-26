@@ -52,6 +52,9 @@ pub enum FrameMode {
 /// 2^23 bytes, and `--ultra` or long-distance mode up to 2^27. A
 /// single-segment frame's window is its content size.
 ///
+/// [`Self::with_unbounded_window`] lifts the window limit to what the
+/// format can declare, as the reference's one-shot decoder does.
+///
 /// Input and output budgets are off by default. They count compressed bytes
 /// accepted and decompressed bytes regenerated over one whole operation,
 /// across all its frames.
@@ -73,7 +76,8 @@ pub enum FrameMode {
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeLimits {
-    window_log: u8,
+    /// Largest accepted window in bytes.
+    window: u64,
     input: Option<u64>,
     output: Option<u64>,
 }
@@ -86,9 +90,13 @@ impl DecodeLimits {
     pub const MAX_WINDOW_LOG: u8 = 31;
     /// Default window log: 128 MiB.
     pub const DEFAULT_WINDOW_LOG: u8 = 27;
+    /// Largest window a frame header can declare that the reference
+    /// decodes: exponent 31 with mantissa 7, 3.75 GiB
+    /// (`ZSTD_WINDOWLOG_MAX` in `ZSTD_getFrameHeader`).
+    pub const UNBOUNDED_WINDOW_SIZE: u64 = (1 << 31) + 7 * (1 << 28);
     /// The default limits: a 2^27-byte window and no byte budgets.
     pub const DEFAULT: Self = Self {
-        window_log: Self::DEFAULT_WINDOW_LOG,
+        window: 1 << Self::DEFAULT_WINDOW_LOG,
         input: None,
         output: None,
     };
@@ -103,8 +111,50 @@ impl DecodeLimits {
         if log < Self::MIN_WINDOW_LOG || log > Self::MAX_WINDOW_LOG {
             return Err(DecodeConfigError::WindowLog { log });
         }
-        self.window_log = log;
+        self.window = 1 << log;
         Ok(self)
+    }
+
+    /// Accepts every window a frame header can declare up to
+    /// [`Self::UNBOUNDED_WINDOW_SIZE`], past the largest
+    /// [`Self::with_max_window_log`] allows: a window exponent of 31 with
+    /// any mantissa, as the reference's one-shot decoders
+    /// (`ZSTD_decompressDCtx`, `ZSTD_decompress_usingDDict`) do, which
+    /// ignore `ZSTD_d_windowLogMax`. The reference's streaming decoder
+    /// stops at 2^31 bytes, the most [`Self::with_max_window_log`] allows.
+    ///
+    /// The window bounds the history a session keeps, up to twice its
+    /// size, so lift it only where frames come from trusted encoders or
+    /// output goes into a buffer the caller sized: one-shot decoding into
+    /// a slice keeps no history, and [`crate::Decompressor::decompress`]
+    /// sizes its output from the frame's content size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mzstd::{DecodeLimits, DecoderConfig, Decompressor};
+    ///
+    /// let limits = DecodeLimits::default().with_unbounded_window();
+    /// assert_eq!(limits.max_window_size(), DecodeLimits::UNBOUNDED_WINDOW_SIZE);
+    /// assert_eq!(limits.max_window_log(), DecodeLimits::MAX_WINDOW_LOG);
+    ///
+    /// // A frame of three raw bytes declaring a 3.75 GiB window (window
+    /// // byte 0xaf: exponent 31, mantissa 7) and a four-byte content size.
+    /// let frame = [
+    ///     0x28, 0xb5, 0x2f, 0xfd, 0x80, 0xaf, 3, 0, 0, 0, 0x19, 0, 0, b'a', b'b', b'c',
+    /// ];
+    /// let mut strict = Decompressor::new(
+    ///     DecoderConfig::default().with_limits(DecodeLimits::default().with_max_window_log(31)?),
+    /// );
+    /// assert!(strict.decompress(&frame).is_err());
+    /// let mut decoder = Decompressor::new(DecoderConfig::default().with_limits(limits));
+    /// assert_eq!(decoder.decompress(&frame)?, b"abc");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub const fn with_unbounded_window(mut self) -> Self {
+        self.window = Self::UNBOUNDED_WINDOW_SIZE;
+        self
     }
 
     /// Sets the compressed input budget; `None` disables it.
@@ -121,16 +171,19 @@ impl DecodeLimits {
         self
     }
 
-    /// The largest accepted window, as a power of two.
+    /// The exponent of the largest accepted window: the log
+    /// [`Self::with_max_window_log`] set, and [`Self::MAX_WINDOW_LOG`]
+    /// after [`Self::with_unbounded_window`].
     #[must_use]
     pub const fn max_window_log(&self) -> u8 {
-        self.window_log
+        // At most 2^32 - 1 bytes, so the exponent fits.
+        self.window.ilog2() as u8
     }
 
     /// The largest accepted window in bytes.
     #[must_use]
     pub const fn max_window_size(&self) -> u64 {
-        1 << self.window_log
+        self.window
     }
 
     /// The compressed input budget.

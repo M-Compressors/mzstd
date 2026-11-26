@@ -56,7 +56,7 @@ mzstd_result mzstd_compress(const uint8_t *input, size_t input_len,
  *
  * On entry *output_len is the capacity of output; on return it is the number
  * of bytes written on MZSTD_OK and 0 otherwise. An empty input decodes to
- * nothing. Windows up to 2 GiB are accepted. output may be uninitialized;
+ * nothing. Windows up to 3.75 GiB are accepted. output may be uninitialized;
  * on MZSTD_OK no byte after the result is written.
  */
 mzstd_result mzstd_decompress(const uint8_t *input, size_t input_len,

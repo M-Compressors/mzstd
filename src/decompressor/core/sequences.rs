@@ -97,12 +97,11 @@ const _: () = assert!(
 );
 
 // The output is indexed with 32-bit masks (`copy::idx`): a block's offsets
-// reach at most a window back, windows are at most `2^MAX_WINDOW_LOG`
+// reach at most a window back, windows are at most `UNBOUNDED_WINDOW_SIZE`
 // bytes, and a sequence's lengths come from baselines plus at most 16 extra
-// bits, so every index stays far below `INDEX_LIMIT`.
-const _: () = assert!(
-    (1u64 << DecodeLimits::MAX_WINDOW_LOG) + 8 * (BLOCK_SIZE_MAX as u64) < INDEX_LIMIT as u64
-);
+// bits, so every index stays below `INDEX_LIMIT`.
+const _: () =
+    assert!(DecodeLimits::UNBOUNDED_WINDOW_SIZE + 8 * (BLOCK_SIZE_MAX as u64) < INDEX_LIMIT as u64);
 const _: () = assert!(
     LL_BASE[MAX_LL as usize] < (1 << 17)
         && ML_BASE[MAX_ML as usize] < (1 << 17)
@@ -821,7 +820,7 @@ impl SequenceTables {
         } = target;
         // Valid matches never reach before `base`: offsets are bounded by
         // the history and by the window. Cutting the buffer there keeps
-        // every index below 2^32 (windows are at most 2^31 bytes), which
+        // every index below 2^32 (windows are at most 3.75 GiB), which
         // the copies' index masks rely on.
         let window = usize::try_from(context.window).unwrap_or(usize::MAX);
         let base = context.history_start.max(op.saturating_sub(window));

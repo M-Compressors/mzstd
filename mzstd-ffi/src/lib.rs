@@ -208,8 +208,9 @@ pub unsafe extern "C" fn mzstd_compress(
 /// their content size, but nothing requires it; the caller must know or
 /// bound the result.
 ///
-/// Every window size the format allows, up to 2 GiB, is accepted: the output
-/// buffer bounds the memory the call uses. `output` may be uninitialized;
+/// Every window size the format allows, up to 3.75 GiB (a window exponent
+/// of 31), is accepted, as `ZSTD_decompress` accepts it: the output buffer
+/// bounds the memory the call uses. `output` may be uninitialized;
 /// on success no byte after the result is written.
 ///
 /// # Errors

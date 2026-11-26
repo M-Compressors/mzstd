@@ -126,6 +126,26 @@ fn reference_frames_with_checksums_and_long_windows_decompress() {
 }
 
 #[test]
+fn windows_decode_exactly_when_zstd_decompress_accepts_them() {
+    // A frame of one raw block and no content size, declaring each window
+    // of exponent 31 (2 GiB to 3.75 GiB), then exponent 32.
+    for window in (21u8 << 3)..=(22 << 3) {
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window, 0x19, 0x00, 0x00];
+        frame.extend_from_slice(b"abc");
+        let theirs = oracle::decompress(&frame, 3);
+        let (status, ours) = decompress(&frame, 3);
+        assert_eq!(theirs.is_ok(), window >> 3 == 21, "{window:#x}");
+        match theirs {
+            Ok(expected) => {
+                assert_eq!(status, MzstdResult::Ok, "{window:#x}");
+                assert_eq!(ours, expected);
+            }
+            Err(_) => assert_eq!(status, MzstdResult::Error, "{window:#x}"),
+        }
+    }
+}
+
+#[test]
 fn concatenated_and_skippable_frames_decode_in_order() {
     let a = compress(b"first ", 128, 1).1;
     let b = compress(b"second", 128, 22).1;

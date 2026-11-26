@@ -292,6 +292,51 @@ fn window_limits_match_the_reference_streaming_limit() {
     );
 }
 
+#[test]
+fn unbounded_windows_match_the_reference_one_shot_decoder() {
+    let input = text(100_000, 5);
+    let params = Params::level(3).with(zstd_ffi::ZSTD_c_windowLog, 17);
+    let frame = stream_unknown_size(&params, &input);
+    assert_eq!(frame[4] & 0x20, 0, "the frame has a window descriptor");
+    let unbounded = DecodeLimits::default().with_unbounded_window();
+    let widest = DecodeLimits::default()
+        .with_max_window_log(DecodeLimits::MAX_WINDOW_LOG)
+        .expect("valid");
+    // Exponent 31 with each mantissa, 2 GiB to 3.75 GiB, then exponent 32.
+    for window in (21u8 << 3)..=(22 << 3) {
+        let mut wide = frame.clone();
+        wide[5] = window;
+        let declared = (1u64 << (10 + (window >> 3))) / 8 * (8 + u64::from(window & 7));
+        // `ZSTD_decompress` checks only the exponent; the streaming
+        // decoder, at its widest `ZSTD_d_windowLogMax`, the size.
+        let one_shot = oracle::decompress(&wide, input.len());
+        let streamed = oracle::decompress_stream(&wide, 1 << 20, Some(31));
+        assert_eq!(one_shot.is_ok(), window >> 3 == 21, "{window:#x}");
+        assert_eq!(streamed.is_ok(), window == 21 << 3, "{window:#x}");
+
+        let mut decoder = Decompressor::new(unbounded.into());
+        let ours = decoder.decompress(&wide);
+        assert_eq!(ours.as_ref().ok(), one_shot.as_ref().ok(), "{window:#x}");
+        let mut slice = vec![0u8; input.len()];
+        let sliced = decoder.decompress_to_slice(&wide, &mut slice);
+        assert_eq!(sliced.ok(), one_shot.as_ref().ok().map(Vec::len));
+        let session = decode_fixed(&mut decoder, &wide, 4096, 4096);
+        assert_eq!(session.as_ref().ok(), one_shot.as_ref().ok(), "{window:#x}");
+        if one_shot.is_err() {
+            assert!(matches!(
+                ours,
+                Err(DecodeError::WindowLimitExceeded {
+                    window_size,
+                    limit: DecodeLimits::UNBOUNDED_WINDOW_SIZE,
+                }) if window_size == declared
+            ));
+        }
+
+        let strict = Decompressor::new(widest.into()).decompress(&wide);
+        assert_eq!(strict.ok(), streamed.ok(), "{window:#x}");
+    }
+}
+
 /// The full matrix: every level, larger inputs, long-distance matching and
 /// `--ultra` windows. Too slow for the unoptimized reference.
 #[test]

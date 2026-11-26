@@ -372,14 +372,10 @@ pub(crate) fn decompress(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<usiz
     Ok(decoder.decompress_to_uninit(src, dst)?)
 }
 
-/// Decoder limits of the C ABI: the widest window the format allows, and no
-/// input or output budget beyond the buffers themselves.
-const LIMITS: DecodeLimits = {
-    match DecodeLimits::DEFAULT.with_max_window_log(DecodeLimits::MAX_WINDOW_LOG) {
-        Ok(limits) => limits,
-        Err(_) => DecodeLimits::DEFAULT,
-    }
-};
+/// Decoder limits of the C ABI's one-shot call: every window the format
+/// allows, as `ZSTD_decompress` accepts them, and no input or output budget
+/// beyond the buffers themselves.
+const LIMITS: DecodeLimits = DecodeLimits::DEFAULT.with_unbounded_window();
 
 /// zstd's `ZSTD_compressBound`, or zero when it overflows.
 pub(crate) const fn compress_bound(input_len: usize) -> usize {
@@ -604,7 +600,10 @@ mod tests {
 
     #[test]
     fn the_widest_window_is_accepted() {
-        assert_eq!(LIMITS.max_window_size(), 1 << DecodeLimits::MAX_WINDOW_LOG);
+        assert_eq!(
+            LIMITS.max_window_size(),
+            DecodeLimits::UNBOUNDED_WINDOW_SIZE
+        );
     }
 
     #[test]

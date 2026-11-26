@@ -115,7 +115,9 @@ classDiagram
     }
     class DecodeLimits {
         +DEFAULT
+        +UNBOUNDED_WINDOW_SIZE
         +with_max_window_log(u8) Result
+        +with_unbounded_window()
         +with_max_input_bytes(Option)
         +with_max_output_bytes(Option)
         +max_window_size() u64
@@ -170,9 +172,17 @@ classDiagram
     trailing skippable frame, or a stream of only skippable frames, as
     complete empty members, and a skippable frame before a Zstandard frame
     as its own member.
-- **`DecodeLimits`**: the window limit (default `2^27`, the reference's
-  `ZSTD_WINDOWLOG_LIMIT_DEFAULT`; `10..=31`) and optional input and output
-  byte budgets over a whole operation.
+- **`DecodeLimits`**: the window limit in bytes (default `2^27`, the
+  reference's `ZSTD_WINDOWLOG_LIMIT_DEFAULT`; `2^10..=2^31` through
+  `with_max_window_log`, as the reference's streaming `ZSTD_d_windowLogMax`
+  allows) and optional input and output byte budgets over a whole
+  operation. `with_unbounded_window` raises the limit to
+  `UNBOUNDED_WINDOW_SIZE` (`0xF000_0000`, exponent 31 with mantissa 7), the
+  widest window `ZSTD_getFrameHeader` accepts and so the reference's
+  one-shot rule; `max_window_log` then reports 31. `FrameDecoder::begin`
+  compares the frame's declared window size against the limit in every
+  API, and the sequence executor's 32-bit indices are asserted to fit
+  `UNBOUNDED_WINDOW_SIZE` plus the block slack.
 - **One-shot.** `decompress` returns a new vector; `decompress_into`
   appends and returns the appended range, truncating back on error;
   `decompress_to_slice` fills a caller slice and reports `OutputTooSmall`
@@ -630,9 +640,11 @@ deliberate exceptions:
 - **Empty input** is `UnexpectedEndOfInput`; `ZSTD_decompress` returns an
   empty result.
 - **Window limit.** The limit applies to one-shot calls too (the
-  reference's one-shot API has none beyond `2^31`), and the default limit
-  is exactly `2^27`, where the reference's streaming default is
-  `2^27 + 1` bytes.
+  reference's one-shot API ignores `ZSTD_d_windowLogMax` and accepts any
+  window of exponent at most 31, up to 3.75 GiB; `with_unbounded_window`
+  matches that, and `mzstd-ffi`'s one-shot `mzstd_decompress` uses it),
+  and the default limit is exactly `2^27`, where the reference's streaming
+  default is `2^27 + 1` bytes.
 - **Huffman depth.** Trees of 12 bits are accepted, as by the reference,
   although RFC 8878 caps literal codes at 11 bits.
 - **Dictionary reach.** A dictionary's content is reachable only from

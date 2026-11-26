@@ -26,7 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The window log accepts 10–31. Input/output budgets count the whole operation,
+The window log accepts 10–31, as the reference's streaming
+`ZSTD_d_windowLogMax` does. `DecodeLimits::with_unbounded_window()` accepts
+every window a frame can declare (up to 3.75 GiB), as the reference's
+one-shot `ZSTD_decompress` does; use it only where the output buffer, not
+the frame, bounds memory. Input/output budgets count the whole operation,
 including concatenated frames; they are not process-memory ceilings.
 `FrameMode::Single` stops a session after one Zstandard or skippable frame.
 One-shot decoding rejects trailing bytes in that mode. `FrameHeaderInfo` inspects

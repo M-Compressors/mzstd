@@ -4,6 +4,14 @@
 
 ## [v0.2.17](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.17) - 2026-11-26
 
+- **`DecodeLimits::with_unbounded_window`** and
+  `DecodeLimits::UNBOUNDED_WINDOW_SIZE` accept every window a frame header
+  can declare, up to 3.75 GiB (exponent 31 with any mantissa), as the
+  reference's one-shot decoders do, which ignore `ZSTD_d_windowLogMax`.
+  `with_max_window_log(31)` still stops at 2 GiB, the reference's streaming
+  limit. `mzstd-ffi`'s `mzstd_decompress` now uses the unbounded limit, as
+  `ZSTD_decompress` does: frames declaring a window above 2 GiB decode
+  instead of failing.
 - **Dictionary decoding matches zstd 1.6.0's history.** A Zstandard-format
   dictionary's magic number, ID, entropy tables and repeat offsets are no
   longer history: a match reaching past the first content byte is now
