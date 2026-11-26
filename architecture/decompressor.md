@@ -375,22 +375,29 @@ flowchart TD
     Layout -->|Zstd requested, no magic| E1[NotZstdFormat]
     Layout -->|magic + ID| Load["DecoderEntropy::load (ZSTD_loadDEntropy): Huffman tree, OF / ML / LL FSE tables, 3 repeat offsets"]
     Load -->|malformed table, log too large, rep 0 or beyond the content after it| E2[Corrupted]
-    Load --> ZParts[id, DecoderEntropy with pair rows prebuilt]
+    Load --> ZParts[id, DecoderEntropy with pair rows prebuilt, header length]
     RawParts --> Parts[DecodeParts]
     ZParts --> Parts
     Parts --> Owned["DecodeDictionary: Box of bytes + DecodeParts"]
-    Owned -->|DictionaryRef::view| View["DictView: content = all bytes, id, Option of entropy"]
+    Owned -->|DictionaryRef::view| View["DictView: content = bytes after the header, id, Option of entropy"]
 ```
 
 - `parse_decode_parts(bytes, content)` (crate-private, in
-  `dictionary::decode`) returns `DecodeParts { id, entropy }` without
+  `dictionary::decode`) returns `DecodeParts { id, entropy, header_len }` without
   holding the bytes; `DecodeParts::view(bytes)` pairs them with whatever
   owns them. `DecodeDictionary` is one such owner; `PreparedDictionary`
   (with `compression`) is the other, and `DictionaryRef::Prepared` views
   its bytes the same way.
-- As in the reference's `ZSTD_DDict`, **all** of a dictionary's bytes are
-  history, the Zstandard format's magic number, ID and tables included;
-  encoders only reference the content after the tables.
+- History is the content alone: all the bytes of raw content, and for
+  the Zstandard format the bytes after the magic number, ID, entropy
+  tables and repeat offsets (`header_len`, the reference's
+  `ZSTD_DDict::dictHeaderSize`). `DecodeParts::view` cuts the bytes there
+  and `DecodeDictionary::content_len` counts what is left. Since zstd
+  1.6.0 (#4991) `ZSTD_copyDDictParameters` starts `prefixStart` and
+  `virtualStart` after the header, as `ZSTD_decompress_insertDictionary`
+  already did, so a match reaching into it is `InvalidDataKind::Offset`
+  (`corruption_detected` in the reference); 1.5.7 kept the header as
+  history.
 - The Huffman table's pair rows and its lockstep copy of the single rows
   are built when the dictionary is parsed (`HuffmanTable::build_shared`),
   so decoding reads the shared table without modifying it

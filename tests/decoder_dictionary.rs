@@ -582,6 +582,111 @@ fn repeat_offsets_at(bytes: &[u8]) -> usize {
         .expect("ZDICT's repeat offsets")
 }
 
+/// A frame that names no dictionary, with a 1 KiB window and one last
+/// compressed block: no literals and a single sequence, every table RLE,
+/// matching three bytes `offset` back from the frame's first byte.
+fn one_match_frame(offset: usize) -> Vec<u8> {
+    // An offset value above 3 is the offset plus 3. With RLE tables the
+    // stream holds only the offset's extra bits under the padding bit,
+    // which together spell the value itself.
+    let value = u32::try_from(offset + 3).expect("a small offset");
+    let code = u8::try_from(value.ilog2()).expect("below 32");
+    let stream = value.to_le_bytes();
+    // Raw literals of size zero, one sequence, RLE modes, then the
+    // literal length, offset and match length codes (match length 3).
+    let mut block = vec![0, 1, 0x54, 0, code, 0];
+    block.extend_from_slice(&stream[..usize::from(code / 8) + 1]);
+    let size = u32::try_from(block.len()).expect("a short block");
+    // Last, compressed.
+    let header = 1 | (2 << 1) | (size << 3);
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&block);
+    frame
+}
+
+#[test]
+fn matches_reach_a_zstd_dictionary_content_but_not_its_tables() {
+    let bytes = trained();
+    let content = &bytes[repeat_offsets_at(bytes) + 12..];
+    let dictionary = DecodeDictionary::new(bytes, DictionaryContent::Zstd).expect("valid");
+    assert_eq!(dictionary.content_len(), content.len());
+    let reference = Dictionary {
+        bytes: bytes.to_vec(),
+        content_type: zstd_ffi::ZSTD_dct_fullDict,
+    };
+    let mut decoder = Decompressor::default();
+    // The content's first byte is the farthest a match reaches.
+    let first = one_match_frame(content.len());
+    assert_eq!(
+        oracle::decompress_with_dictionary(&first, 3, &reference).expect("within the content"),
+        content[..3]
+    );
+    assert_eq!(
+        decoder
+            .decompress_with_dictionary(&dictionary, &first)
+            .expect("within the content"),
+        content[..3]
+    );
+    // One byte further is the repeat offsets: zstd 1.6.0 rejects matches
+    // into the header and tables, as far as the dictionary's first byte.
+    for offset in [content.len() + 1, bytes.len(), bytes.len() + 1] {
+        let frame = one_match_frame(offset);
+        assert!(
+            oracle::decompress_with_dictionary(&frame, 3, &reference).is_err(),
+            "{offset}"
+        );
+        assert!(
+            matches!(
+                decoder.decompress_with_dictionary(&dictionary, &frame),
+                Err(DecodeError::InvalidData {
+                    kind: InvalidDataKind::Offset
+                })
+            ),
+            "{offset}"
+        );
+        let failure = decoder
+            .start_with_dictionary(&dictionary)
+            .process(&frame, &mut [0; 64], DecodeOperation::Finish)
+            .expect_err("into the tables");
+        assert_eq!(failure.produced, 0, "{offset}");
+    }
+    // Read as raw content, the same bytes are history down to the first.
+    let raw = DecodeDictionary::new(bytes, DictionaryContent::Raw).expect("raw");
+    let frame = one_match_frame(bytes.len());
+    assert_eq!(
+        decoder
+            .decompress_with_dictionary(&raw, &frame)
+            .expect("within the content"),
+        bytes[..3]
+    );
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn prepared_dictionaries_decode_from_their_content_alone() {
+    let bytes = trained();
+    let content_len = bytes.len() - repeat_offsets_at(bytes) - 12;
+    let prepared = mzstd::dictionary::DictionaryBuilder::new(bytes)
+        .with_content(DictionaryContent::Zstd)
+        .build()
+        .expect("valid");
+    let mut decoder = Decompressor::default();
+    let first = one_match_frame(content_len);
+    assert_eq!(
+        decoder
+            .decompress_with_dictionary(&prepared, &first)
+            .expect("within the content"),
+        bytes[bytes.len() - content_len..][..3]
+    );
+    assert!(matches!(
+        decoder.decompress_with_dictionary(&prepared, &one_match_frame(content_len + 1)),
+        Err(DecodeError::InvalidData {
+            kind: InvalidDataKind::Offset
+        })
+    ));
+}
+
 /// Whether mzstd and the reference agree on accepting `bytes` as
 /// `content`.
 fn assert_same_verdict(bytes: &[u8], content: DictionaryContent, label: &str) -> bool {

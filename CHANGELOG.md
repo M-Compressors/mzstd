@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## [v0.2.17](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.17) - 2026-11-26
+
+- **Dictionary decoding matches zstd 1.6.0's history.** A Zstandard-format
+  dictionary's magic number, ID, entropy tables and repeat offsets are no
+  longer history: a match reaching past the first content byte is now
+  `InvalidDataKind::Offset`, as 1.6.0's `ZSTD_DDict` rejects it (#4991),
+  for `DecodeDictionary` and `PreparedDictionary` alike, and
+  `DecodeDictionary::content_len` counts the content alone. 0.2.16 kept
+  1.5.7's behavior, which the `decode_dictionary` ClusterFuzzLite target
+  caught; frames that encoders write never reference the header, so their
+  decoding is unchanged.
+
 ## [v0.2.16](https://github.com/M-Compressors/mzstd/releases/tag/v0.2.16) - 2026-11-24
 
 - **Reference updated to zstd 1.6.0.** The vendored submodule and the

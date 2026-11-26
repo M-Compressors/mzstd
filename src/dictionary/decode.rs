@@ -22,18 +22,23 @@ pub(crate) struct DecodeParts {
     pub(crate) id: u32,
     /// Entropy tables and repeat offsets of a Zstandard-format dictionary.
     pub(crate) entropy: Option<DecoderEntropy>,
+    /// Bytes before the content: the magic number, ID and entropy section
+    /// of a Zstandard-format dictionary, zero for raw content
+    /// (`ZSTD_DDict::dictHeaderSize`).
+    pub(crate) header_len: usize,
 }
 
 impl DecodeParts {
     /// The decoder's view of the dictionary whose bytes are `bytes`, the
     /// ones these parts were parsed from.
     ///
-    /// All of `bytes` precede every frame as history, the format's header
-    /// and tables included: the reference's `ZSTD_DDict` does the same, and
-    /// encoders only reference the content after the tables.
+    /// Only the content after a Zstandard-format dictionary's header and
+    /// tables precedes every frame as history, as `ZSTD_copyDDictParameters`
+    /// sets it up: since zstd 1.6.0 a match reaching into the header is
+    /// corrupt, as it is after `ZSTD_decompress_insertDictionary`.
     pub(crate) fn view<'a>(&'a self, bytes: &'a [u8]) -> DictView<'a> {
         DictView {
-            content: bytes,
+            content: &bytes[self.header_len..],
             id: self.id,
             entropy: self.entropy.as_ref(),
         }
@@ -62,23 +67,23 @@ pub(crate) fn parse_decode_parts(
     bytes: &[u8],
     content: DictionaryContent,
 ) -> Result<DecodeParts, DictionaryError> {
+    let raw = DecodeParts {
+        id: 0,
+        entropy: None,
+        header_len: 0,
+    };
     if bytes.is_empty() {
-        return Ok(DecodeParts {
-            id: 0,
-            entropy: None,
-        });
+        return Ok(raw);
     }
     match layout(bytes, content)? {
-        Layout::Raw => Ok(DecodeParts {
-            id: 0,
-            entropy: None,
-        }),
+        Layout::Raw => Ok(raw),
         Layout::Zstd { id } => {
-            let (entropy, _) =
+            let (entropy, header_len) =
                 DecoderEntropy::load(bytes).map_err(|_| DictionaryError::Corrupted)?;
             Ok(DecodeParts {
                 id,
                 entropy: Some(entropy),
+                header_len,
             })
         }
     }
@@ -195,9 +200,9 @@ impl DecodeDictionary {
         DictionaryId::new(self.parts.id)
     }
 
-    /// Bytes that precede every frame as history: all of them, the
-    /// Zstandard format's header and tables included, as in the reference
-    /// decoder.
+    /// Bytes that precede every frame as history: all of them for raw
+    /// content, and those after the header and entropy tables for the
+    /// Zstandard format, as in the reference decoder since zstd 1.6.0.
     ///
     /// # Examples
     ///
@@ -209,7 +214,7 @@ impl DecodeDictionary {
     /// ```
     #[must_use]
     pub fn content_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() - self.parts.header_len
     }
 
     /// Heap bytes the dictionary holds: its copy of the bytes and its
@@ -378,9 +383,11 @@ mod tests {
         let bytes = crate::decompressor::test_dictionary([1, 2, 3], b"content");
         let dictionary = DecodeDictionary::new(&bytes, DictionaryContent::Zstd).expect("valid");
         assert_eq!(dictionary.id().map(u32::from), Some(7));
-        assert_eq!(dictionary.content_len(), bytes.len());
+        assert_eq!(dictionary.content_len(), b"content".len());
         assert!(dictionary.retained_bytes() > bytes.len());
         let view = DictionaryRef::from(&dictionary).view();
+        // History is the content alone, without the header and tables.
+        assert_eq!(view.content, b"content");
         assert_eq!(view.id, 7);
         assert_eq!(view.entropy.map(|entropy| entropy.reps), Some([1, 2, 3]));
         let debug = alloc::format!("{dictionary:?}");
